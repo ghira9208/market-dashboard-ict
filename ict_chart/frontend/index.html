@@ -539,52 +539,72 @@ class RectanglePrimitive {
  * zOrder 'bottom' keeps it behind the real candlestick series regardless
  * of attach order — this is backdrop, not foreground.
  * ------------------------------------------------------------------- */
-class GhostCandleRenderer {
-  constructor(x1, x2, yOpen, yClose, yHigh, yLow, color) {
-    this._x1 = x1; this._x2 = x2;
-    this._yOpen = yOpen; this._yClose = yClose; this._yHigh = yHigh; this._yLow = yLow;
-    this._color = color;
+// A SINGLE primitive holding EVERY ghost-candle tile, not one primitive
+// PER tile (the original design here, and the standard lightweight-
+// charts primitive pattern every other overlay type in this file still
+// uses). Confirmed directly as a real, severe cost: a real 5m chart with
+// several layers plus an active backfill tier produces up to 4,500 tiles
+// (see _MAX_TOTAL_TILES in app.py/crypto_app.py) — as 4,500 SEPARATE
+// primitives, each with its OWN update() (6 coordinate-conversion calls)
+// and draw() (its OWN useBitmapCoordinateSpace context setup), lightweight-
+// charts has to invoke all of that per-primitive machinery 4,500 times on
+// EVERY repaint — not just when the data changes (a separate bug, already
+// fixed above), but on every live price tick's series.update() AND every
+// single pan/zoom/crosshair frame, since a canvas pane has no way to
+// redraw only "what changed" the way a DOM diff would. Watching Activity
+// Monitor during exactly this scenario showed the chart's own renderer
+// process spiking to 600% CPU — consistent with thousands of individual
+// per-primitive call chains stacking up every frame. Batching into ONE
+// primitive keeps the exact same number of actual canvas draw operations
+// (still one fillRect pair per tile) but pays the per-primitive dispatch/
+// coordinate-space-setup overhead ONCE per repaint instead of 4,500 times.
+class GhostCandleBatchRenderer {
+  constructor(items) {
+    this._items = items; // [{x1, x2, yOpen, yClose, yHigh, yLow, color}, ...]
   }
   draw(target) {
     target.useBitmapCoordinateSpace((scope) => {
-      if (this._x1 === null || this._x2 === null || this._yOpen === null || this._yLow === null) return;
       const ctx = scope.context;
-      const hb = positionsBox(this._x1, this._x2, scope.horizontalPixelRatio);
-      const vBody = positionsBox(this._yOpen, this._yClose, scope.verticalPixelRatio);
-      ctx.fillStyle = this._color;
-      ctx.fillRect(hb.position, vBody.position, hb.length, Math.max(vBody.length, scope.verticalPixelRatio));
-      const midX = Math.round(hb.position + hb.length / 2 - scope.horizontalPixelRatio / 2);
-      const vWick = positionsBox(this._yHigh, this._yLow, scope.verticalPixelRatio);
-      ctx.fillRect(midX, vWick.position, Math.max(1, Math.round(scope.horizontalPixelRatio)), vWick.length);
+      for (const it of this._items) {
+        if (it.x1 === null || it.x2 === null || it.yOpen === null || it.yLow === null) continue;
+        const hb = positionsBox(it.x1, it.x2, scope.horizontalPixelRatio);
+        const vBody = positionsBox(it.yOpen, it.yClose, scope.verticalPixelRatio);
+        ctx.fillStyle = it.color;
+        ctx.fillRect(hb.position, vBody.position, hb.length, Math.max(vBody.length, scope.verticalPixelRatio));
+        const midX = Math.round(hb.position + hb.length / 2 - scope.horizontalPixelRatio / 2);
+        const vWick = positionsBox(it.yHigh, it.yLow, scope.verticalPixelRatio);
+        ctx.fillRect(midX, vWick.position, Math.max(1, Math.round(scope.horizontalPixelRatio)), vWick.length);
+      }
     });
   }
 }
 
-class GhostCandlePaneView {
-  constructor(source) {
-    this._source = source;
-    this._x1 = null; this._x2 = null; this._yOpen = null; this._yClose = null; this._yHigh = null; this._yLow = null;
-  }
+class GhostCandleBatchPaneView {
+  constructor(source) { this._source = source; this._items = []; }
   update() {
     const series = this._source.series, timeScale = this._source.chart.timeScale();
-    this._x1 = timeScale.timeToCoordinate(this._source.t0);
-    this._x2 = timeScale.timeToCoordinate(this._source.t1);
-    this._yOpen = series.priceToCoordinate(this._source.open);
-    this._yClose = series.priceToCoordinate(this._source.close);
-    this._yHigh = series.priceToCoordinate(this._source.high);
-    this._yLow = series.priceToCoordinate(this._source.low);
+    // Still one timeToCoordinate/priceToCoordinate call PER tile (that
+    // part of the cost is irreducible — each tile really does sit at its
+    // own place on the axis) — what's gone is the other 4,499 primitives'
+    // worth of separate update() DISPATCH, not the coordinate math itself.
+    this._items = this._source.tiles.map((t) => ({
+      x1: timeScale.timeToCoordinate(t.t0),
+      x2: timeScale.timeToCoordinate(t.t1),
+      yOpen: series.priceToCoordinate(t.open),
+      yClose: series.priceToCoordinate(t.close),
+      yHigh: series.priceToCoordinate(t.high),
+      yLow: series.priceToCoordinate(t.low),
+      color: t.color,
+    }));
   }
-  renderer() {
-    return new GhostCandleRenderer(this._x1, this._x2, this._yOpen, this._yClose, this._yHigh, this._yLow, this._source.color);
-  }
+  renderer() { return new GhostCandleBatchRenderer(this._items); }
   zOrder() { return 'bottom'; }
 }
 
-class GhostCandlePrimitive {
-  constructor(t0, t1, open, high, low, close, color) {
-    this.t0 = t0; this.t1 = t1; this.open = open; this.high = high; this.low = low; this.close = close;
-    this.color = color;
-    this._paneViews = [new GhostCandlePaneView(this)];
+class GhostCandleBatchPrimitive {
+  constructor(tiles) {
+    this.tiles = tiles;
+    this._paneViews = [new GhostCandleBatchPaneView(this)];
   }
   attached({ chart, series }) { this.chart = chart; this.series = series; }
   detached() { this.chart = undefined; this.series = undefined; }
@@ -604,7 +624,7 @@ class GhostCandlePrimitive {
  * RectangleRenderer's extendToEdge path already reads), so bars stay
  * proportional to each other at any zoom/pane-width instead of drifting
  * the way a fixed pixel width would. zOrder 'bottom' keeps every bar
- * behind the real candlestick series, same as GhostCandlePrimitive above
+ * behind the real candlestick series, same as GhostCandleBatchPrimitive above
  * — this is background context, never allowed to hide a candle's own
  * body. Python pre-sorts nothing here (bucket order doesn't matter for
  * drawing), and pre-computes each bucket's own fill color (POC bucket
@@ -1251,14 +1271,18 @@ function applyOverlays(overlays) {
   if (_overlayArrayChanged('ghost_candles', overlays.ghost_candles)) {
     activeGhostCandles.forEach((g) => candleSeries.detachPrimitive(g));
     activeGhostCandles = [];
+    // ONE batch primitive holding every tile, not one primitive PER tile —
+    // see GhostCandleBatchRenderer's own docstring for why (up to 4,500
+    // separate primitives measured live pegging the renderer at 600% CPU).
     // Attached first specifically so it sits under everything else added
     // this same pass too (zOrder 'bottom' already keeps it under the real
     // candles; this ordering keeps it under FVG/OB rectangles as well).
-    (overlays.ghost_candles || []).forEach((g) => {
-      const ghost = new GhostCandlePrimitive(g.t0, g.t1, g.open, g.high, g.low, g.close, g.color);
-      candleSeries.attachPrimitive(ghost);
-      activeGhostCandles.push(ghost);
-    });
+    const tiles = overlays.ghost_candles || [];
+    if (tiles.length) {
+      const batch = new GhostCandleBatchPrimitive(tiles);
+      candleSeries.attachPrimitive(batch);
+      activeGhostCandles.push(batch);
+    }
   }
   if (_overlayArrayChanged('volume_profile', overlays.volume_profile)) {
     if (activeVolumeProfile) {
