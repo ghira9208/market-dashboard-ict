@@ -1457,6 +1457,22 @@ with main_col:
                      "Binance crypto pairs here (see the Footprint chart), and Yahoo Forex tickers "
                      "report no real volume at all, so this stays off automatically wherever there's "
                      "nothing honest to compute it from.")
+            _vp_anchor_options = ["Full history", "Today", "This week", "This month", "Custom date"]
+            vp_anchor = st.selectbox(
+                "Volume Profile anchor", _vp_anchor_options, index=0, key="fvg_vp_anchor",
+                label_visibility="collapsed", disabled=not show_volume_profile,
+                help="Where the Volume Profile starts counting from. 'Full history' (default) uses "
+                     "everything currently loaded for this timeframe — honest, but on a long window "
+                     "(months of history) the busiest price can sit far from where price is trading "
+                     "today. Anchoring to 'Today'/'This week'/'This month' — or a specific 'Custom "
+                     "date' — recomputes it from just that point forward instead, the same idea as "
+                     "an Anchored Volume Profile on other platforms.")
+            vp_anchor_date = None
+            if vp_anchor == "Custom date":
+                vp_anchor_date = st.date_input(
+                    "Volume Profile anchor date", value=None, key="fvg_vp_anchor_date",
+                    label_visibility="collapsed",
+                    help="Recomputes the Volume Profile using only bars from this date forward.")
         with _tab_settings, st.container(key="_panel_settings"):
             selected_kill_zones = st.multiselect("Kill zones", list(KILL_ZONES.keys()),
                                                   default=["NY AM (9:30–11:30 ET)"], key="fvg_kill_zones")
@@ -1792,6 +1808,7 @@ with main_col:
             "selected_kill_zones": selected_kill_zones, "show_mitigated": show_mitigated,
             "show_volume": show_volume, "show_rsi": show_rsi, "show_macd": show_macd, "show_bb": show_bb,
             "show_ma": show_indicators, "ma_tf": indicator_tf, "show_volume_profile": show_volume_profile,
+            "vp_anchor": vp_anchor, "vp_anchor_date": vp_anchor_date,
             "zone_opacity": zone_opacity, "data_source": data_source,
             "overlay_tf": overlay_tf, "win_rate_exit_types": _win_rate_exit_types,
             "confluence_keys": _confluence_keys,
@@ -2146,6 +2163,8 @@ with main_col:
     show_indicators = _cc.get("show_ma", True)
     indicator_tf = _cc.get("ma_tf", "Chart TF")
     show_volume_profile = _cc.get("show_volume_profile", False)
+    vp_anchor = _cc.get("vp_anchor", "Full history")
+    vp_anchor_date = _cc.get("vp_anchor_date")
     zone_opacity = _cc.get("zone_opacity", 0.25)
     data_source = _cc.get("data_source", "auto")
     overlay_tf = _cc.get("overlay_tf", "4h")
@@ -2222,6 +2241,8 @@ with main_col:
             show_indicators = _cc.get("show_ma", True)
             indicator_tf = _cc.get("ma_tf", "Chart TF")
             show_volume_profile = _cc.get("show_volume_profile", False)
+            vp_anchor = _cc.get("vp_anchor", "Full history")
+            vp_anchor_date = _cc.get("vp_anchor_date")
             zone_opacity = _cc.get("zone_opacity", 0.25)
             data_source = _cc.get("data_source", "auto")
             overlay_tf = _cc.get("overlay_tf", "4h")
@@ -2649,9 +2670,32 @@ with main_col:
             # via a real ict_chart primitive), not through the indicators=
             # pathway above — a price-bucketed histogram isn't a time
             # series, so it doesn't fit that shape.
+            #
+            # Anchored per the Settings tab's own picker — "Full history"
+            # (default) keeps the original behavior (every bar currently
+            # loaded for this timeframe); anything else trims to bars at or
+            # after the chosen cutoff first, same idea as an Anchored Volume
+            # Profile on other platforms. Requested directly: on a long
+            # window (months of history) the busiest price can sit far from
+            # where price is trading today, which reads as "wrong" even
+            # when it's an honest reflection of the full period.
             volume_profile_buckets = []
-            if show_volume_profile and not df.empty:
-                _vp = volume_profile(df)
+            _vp_df = df
+            if show_volume_profile and vp_anchor != "Full history" and not df.empty:
+                _vp_cutoff = None
+                if vp_anchor == "Custom date" and vp_anchor_date is not None:
+                    _vp_cutoff = pd.Timestamp(vp_anchor_date, tz=df.index.tz)
+                elif vp_anchor == "Today":
+                    _vp_cutoff = pd.Timestamp.now(tz=df.index.tz).normalize()
+                elif vp_anchor == "This week":
+                    _vp_now = pd.Timestamp.now(tz=df.index.tz)
+                    _vp_cutoff = (_vp_now - pd.Timedelta(days=_vp_now.weekday())).normalize()
+                elif vp_anchor == "This month":
+                    _vp_cutoff = pd.Timestamp.now(tz=df.index.tz).normalize().replace(day=1)
+                if _vp_cutoff is not None:
+                    _vp_df = df[df.index >= _vp_cutoff]
+            if show_volume_profile and not _vp_df.empty:
+                _vp = volume_profile(_vp_df)
                 if _vp is not None:
                     for _b in _vp["buckets"]:
                         _is_poc = _b["price_low"] <= _vp["poc_price"] <= _b["price_high"]
@@ -2661,11 +2705,12 @@ with main_col:
                             "color": _hex_to_rgba(theme.NEON_CYAN, 0.55) if _is_poc
                                      else _hex_to_rgba("#8e8e93", 0.30),
                         })
-                    price_lines.append({"t0": axis_secs[0], "t1": future_edge, "price": _vp["poc_price"],
+                    _vp_t0 = _ny_fake_utc_seconds(_vp_df.index[0]) if vp_anchor != "Full history" else axis_secs[0]
+                    price_lines.append({"t0": _vp_t0, "t1": future_edge, "price": _vp["poc_price"],
                                          "color": _hex_to_rgba(theme.NEON_CYAN, 0.9), "title": "POC", "above": True})
-                    price_lines.append({"t0": axis_secs[0], "t1": future_edge, "price": _vp["value_area_high"],
+                    price_lines.append({"t0": _vp_t0, "t1": future_edge, "price": _vp["value_area_high"],
                                          "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAH", "above": True})
-                    price_lines.append({"t0": axis_secs[0], "t1": future_edge, "price": _vp["value_area_low"],
+                    price_lines.append({"t0": _vp_t0, "t1": future_edge, "price": _vp["value_area_low"],
                                          "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAL", "above": False})
 
             # Every layer detects against whatever SINGLE timeframe its own
