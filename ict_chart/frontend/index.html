@@ -1342,7 +1342,25 @@ function clearIndicators() {
   }
 }
 
+// Same "don't touch anything unless it actually changed" fix as
+// applyOverlays above, and for the same reason: this used to tear down
+// EVERY indicator series (removeSeries) AND every extra pane (RSI/MACD's
+// own, via removePane) and rebuild them from scratch on every render call
+// — including the main chart's own once-a-second auto-refresh tick, even
+// when none of MA/RSI/MACD/Bollinger had changed at all. With up to 8
+// series (rsi, macd x3, ma20, ma50, bb x3) each carrying up to ~17k
+// points on a real 5m chart, that's real, avoidable churn: pane removal/
+// creation triggers a full layout recalculation, and setData() on a
+// freshly-created series has to re-process every point even when the
+// data is byte-identical to what was already showing.
+let lastIndicatorsRaw = null;
+
 function applyIndicators(ind) {
+  ind = ind || {};
+  const changed = JSON.stringify(ind) !== JSON.stringify(lastIndicatorsRaw);
+  lastIndicatorsRaw = ind;
+  if (!changed) return;
+
   clearIndicators();
   if (!ind) return;
   let nextPane = 1;
