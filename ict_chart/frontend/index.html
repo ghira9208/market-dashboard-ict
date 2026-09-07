@@ -1212,47 +1212,88 @@ container.addEventListener('contextmenu', (e) => {
   measureA = null;
 });
 
-function clearOverlays() {
-  activeRectangles.forEach((r) => candleSeries.detachPrimitive(r));
-  activeRectangles = [];
-  activeHLines.forEach((l) => candleSeries.detachPrimitive(l));
-  activeHLines = [];
-  activeGhostCandles.forEach((g) => candleSeries.detachPrimitive(g));
-  activeGhostCandles = [];
-  if (activeVolumeProfile) {
-    candleSeries.detachPrimitive(activeVolumeProfile);
-    activeVolumeProfile = null;
-  }
+// Per-category "did this actually change since last render" tracking —
+// see applyOverlays' own comment below for why this exists. Deliberately
+// one bucket per overlay kind, not one fingerprint for the whole
+// `overlays` object: a layer checkbox toggling FVG on/off changes
+// `rectangles` but not `ghost_candles`, and re-touching the (potentially
+// thousands of) ghost-candle primitives just because SOME unrelated
+// layer changed would defeat the whole point.
+let lastOverlayRaw = { rectangles: null, price_lines: null, ghost_candles: null, volume_profile: null, markers: null };
+
+function _overlayArrayChanged(key, value) {
+  const nextValue = value || [];
+  const changed = JSON.stringify(nextValue) !== JSON.stringify(lastOverlayRaw[key]);
+  lastOverlayRaw[key] = nextValue;
+  return changed;
 }
 
+// Overlays used to be torn down and rebuilt from scratch on EVERY render
+// call — including the main chart's own once-a-second auto-refresh tick,
+// whether or not anything about them had actually changed. Harmless at
+// "a few dozen" primitives (this file's own prior comment's own
+// assumption), but confirmed directly on a real 5m chart with several
+// layers plus an active backfill tier: 4,500 ghost-candle primitives
+// attached at once (see _MAX_TOTAL_TILES in app.py/crypto_app.py, capped
+// at 5000) — detaching and reattaching all of those every single second,
+// even though Python's own backfill cache (_main_backfill_cache) only
+// actually recomputes them once every several minutes, is exactly the
+// kind of redundant per-tick cost this file's own fingerprint mechanism
+// (see lastFingerprint above) already exists to spare the candle series
+// itself; overlays just never got the same treatment. Comparing the
+// incoming arrays against what's already attached, per category, and
+// only touching categories that genuinely changed, is cheap even at
+// thousands of items (JSON.stringify + a string compare on a few
+// thousand small flat objects runs in low-single-digit milliseconds) —
+// nowhere near what the attach/detach churn itself costs.
 function applyOverlays(overlays) {
-  clearOverlays();
-  // Attached first specifically so it sits under everything else added
-  // this same pass too (zOrder 'bottom' already keeps it under the real
-  // candles; this ordering keeps it under FVG/OB rectangles as well).
-  (overlays.ghost_candles || []).forEach((g) => {
-    const ghost = new GhostCandlePrimitive(g.t0, g.t1, g.open, g.high, g.low, g.close, g.color);
-    candleSeries.attachPrimitive(ghost);
-    activeGhostCandles.push(ghost);
-  });
-  if ((overlays.volume_profile || []).length) {
-    activeVolumeProfile = new VolumeProfilePrimitive(overlays.volume_profile);
-    candleSeries.attachPrimitive(activeVolumeProfile);
+  overlays = overlays || {};
+  if (_overlayArrayChanged('ghost_candles', overlays.ghost_candles)) {
+    activeGhostCandles.forEach((g) => candleSeries.detachPrimitive(g));
+    activeGhostCandles = [];
+    // Attached first specifically so it sits under everything else added
+    // this same pass too (zOrder 'bottom' already keeps it under the real
+    // candles; this ordering keeps it under FVG/OB rectangles as well).
+    (overlays.ghost_candles || []).forEach((g) => {
+      const ghost = new GhostCandlePrimitive(g.t0, g.t1, g.open, g.high, g.low, g.close, g.color);
+      candleSeries.attachPrimitive(ghost);
+      activeGhostCandles.push(ghost);
+    });
   }
-  (overlays.rectangles || []).forEach((r) => {
-    const rect = new RectanglePrimitive(
-      { time: r.t0, price: r.p0 }, { time: r.t1, price: r.p1 }, r.fill, r.border || null, r.label || null,
-      r.border_width || 1, r.fill_to || null, r.extend_to_edge || false
-    );
-    candleSeries.attachPrimitive(rect);
-    activeRectangles.push(rect);
-  });
-  (overlays.price_lines || []).forEach((l) => {
-    const hline = new HLinePrimitive(l.t0, l.t1, l.price, l.color, l.title || '', l.line_width || 1, l.dashed);
-    candleSeries.attachPrimitive(hline);
-    activeHLines.push(hline);
-  });
-  markersHandle.setMarkers(overlays.markers || []);
+  if (_overlayArrayChanged('volume_profile', overlays.volume_profile)) {
+    if (activeVolumeProfile) {
+      candleSeries.detachPrimitive(activeVolumeProfile);
+      activeVolumeProfile = null;
+    }
+    if ((overlays.volume_profile || []).length) {
+      activeVolumeProfile = new VolumeProfilePrimitive(overlays.volume_profile);
+      candleSeries.attachPrimitive(activeVolumeProfile);
+    }
+  }
+  if (_overlayArrayChanged('rectangles', overlays.rectangles)) {
+    activeRectangles.forEach((r) => candleSeries.detachPrimitive(r));
+    activeRectangles = [];
+    (overlays.rectangles || []).forEach((r) => {
+      const rect = new RectanglePrimitive(
+        { time: r.t0, price: r.p0 }, { time: r.t1, price: r.p1 }, r.fill, r.border || null, r.label || null,
+        r.border_width || 1, r.fill_to || null, r.extend_to_edge || false
+      );
+      candleSeries.attachPrimitive(rect);
+      activeRectangles.push(rect);
+    });
+  }
+  if (_overlayArrayChanged('price_lines', overlays.price_lines)) {
+    activeHLines.forEach((l) => candleSeries.detachPrimitive(l));
+    activeHLines = [];
+    (overlays.price_lines || []).forEach((l) => {
+      const hline = new HLinePrimitive(l.t0, l.t1, l.price, l.color, l.title || '', l.line_width || 1, l.dashed);
+      candleSeries.attachPrimitive(hline);
+      activeHLines.push(hline);
+    });
+  }
+  if (_overlayArrayChanged('markers', overlays.markers)) {
+    markersHandle.setMarkers(overlays.markers || []);
+  }
 }
 
 /* ---------------------------------------------------------------------
