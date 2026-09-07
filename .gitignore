@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+.cache/
+.streamlit/secrets.toml
+*.log
+.last_state*.json
+*.pre_fill_fix_backup_*.db
+*.pre_merge_stale_cleanup_*.db

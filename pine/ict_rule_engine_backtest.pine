@@ -1,0 +1,501 @@
+//@version=6
+strategy("ICT Rule Engine Backtest (dashboard-matched)", shorttitle = "ICT Rule Backtest",
+     overlay = true, process_orders_on_close = true, pyramiding = 0, initial_capital = 10000,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// Ports market-dashboard-ict's backtest_custom_rule (recommender.py) and its
+// detect_fvgs / detect_order_blocks / detect_swings / detect_liquidity_levels
+// (fvg.py) detectors bar-by-bar, with no lookahead: same displacement gate
+// (DISPLACEMENT_MIN_BODY_RATIO), same consequent-encroachment fill logic for
+// FVG/Order Block zones, same ATR-scaled zigzag swings feeding Liquidity,
+// same nth-nearest-zone + zone-point rule resolution for entry/exit/stop,
+// same session / max-trades-per-day / min-R:R / min-stop quality filters.
+//
+// One unavoidable divergence: the dashboard's sweep engine assumes a
+// resolved entry price fills INSTANTLY the moment the rule resolves, with
+// no requirement that price ever actually trades there — see
+// backtest_custom_rule's own docstring, it's a theoretical rule-comparison
+// tool, not an order-fill simulator. TradingView's broker can only fill at
+// a real traded price, so the "Dashboard rule-engine stats" table below
+// reproduces the exact dashboard math (entry = the resolved zone price),
+// while this strategy's own native equity / trade list (Strategy Tester
+// tab) fills the same signal as a market order at that bar's close — the
+// closest real, tradeable stand-in for "instant now." Expect the two to
+// differ slightly; the table is the one that matches the dashboard's own
+// sweep numbers.
+
+// ---------------------------------------------------------------- Inputs ----
+grpRules = "Direction & Rules (mirrors Backtest -> Sweep tab)"
+direction = input.string("Bullish", "Direction", options = ["Bullish", "Bearish"], group = grpRules)
+
+entryDetector = input.string("FVG", "Entry detector", options = ["Current Price", "FVG", "Order Block", "Liquidity"], group = grpRules)
+entryRank = input.int(1, "Entry rank (nth-nearest)", minval = 1, maxval = 10, group = grpRules)
+entryZonePointStr = input.string("50%", "Entry zone point", options = ["0% (Low)", "25%", "50%", "75%", "100% (High)"], group = grpRules)
+
+exitDetector = input.string("FVG", "Target detector", options = ["Current Price", "FVG", "Order Block", "Liquidity"], group = grpRules)
+exitRank = input.int(1, "Target rank (nth-nearest)", minval = 1, maxval = 10, group = grpRules)
+exitZonePointStr = input.string("50%", "Target zone point", options = ["0% (Low)", "25%", "50%", "75%", "100% (High)"], group = grpRules)
+
+stopDetector = input.string("FVG", "Stop detector", options = ["Current Price", "FVG", "Order Block", "Liquidity"], group = grpRules)
+stopRank = input.int(1, "Stop rank (nth-nearest)", minval = 1, maxval = 10, group = grpRules)
+stopZonePointStr = input.string("50%", "Stop zone point", options = ["0% (Low)", "25%", "50%", "75%", "100% (High)"], group = grpRules)
+
+grpSession = "Session filter (NY time, matches the dashboard's session window)"
+useSession = input.bool(false, "Restrict new entries to a session window", group = grpSession)
+sessionWindow = input.session("0930-1130", "Session window", group = grpSession)
+sessionTZ = input.string("America/New_York", "Session timezone", group = grpSession)
+
+grpFilters = "Quality filters (optional, match the Sweep tab's own)"
+minRR = input.float(0.0, "Min R:R", minval = 0.0, step = 0.5, group = grpFilters)
+minStopPct = input.float(0.0, "Min stop distance (%)", minval = 0.0, step = 0.1, group = grpFilters)
+minStopAbs = input.float(0.0, "Min stop distance (price units)", minval = 0.0, step = 0.01, group = grpFilters)
+maxTradesPerSession = input.int(0, "Max trades per session/day (0 = no cap, needs session on)", minval = 0, group = grpFilters)
+
+grpDetect = "Detection settings (matches fvg.py's own constants)"
+displacementRatio = input.float(0.5, "Displacement min body ratio", minval = 0.01, maxval = 1.0, step = 0.01, group = grpDetect)
+swingAtrPeriod = input.int(14, "Swing ATR period", minval = 1, group = grpDetect)
+swingAtrMult = input.float(1.5, "Swing ATR multiplier", minval = 0.1, step = 0.1, group = grpDetect)
+
+grpRisk = "Risk / sizing (the dashboard has no money-management layer -- this only drives TradingView's own equity curve)"
+riskPerTradePct = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, step = 0.1, group = grpRisk)
+
+grpDisplay = "Display"
+showZones = input.bool(true, "Draw currently-active FVG / Order Block zones", group = grpDisplay)
+showStatsTable = input.bool(true, "Show dashboard-equivalent stats table", group = grpDisplay)
+
+// ------------------------------------------------------------- Helpers -----
+f_zonePointFrac(s) =>
+    switch s
+        "0% (Low)" => 0.0
+        "25%" => 0.25
+        "50%" => 0.5
+        "75%" => 0.75
+        "100% (High)" => 1.0
+        => 0.5
+
+entryFrac = f_zonePointFrac(entryZonePointStr)
+exitFrac = f_zonePointFrac(exitZonePointStr)
+stopFrac = f_zonePointFrac(stopZonePointStr)
+
+f_isDisplacement(o, h, l, c, minRatio) =>
+    rng = h - l
+    rng > 0 and math.abs(c - o) / rng >= minRatio
+
+// ------------------------------------------------------- Persistent state --
+var array<float> fvgTop = array.new_float(0)
+var array<float> fvgBottom = array.new_float(0)
+var array<bool> fvgBull = array.new_bool(0)
+
+var array<float> obTop = array.new_float(0)
+var array<float> obBottom = array.new_float(0)
+var array<bool> obBull = array.new_bool(0)
+
+var array<float> pendingHigh = array.new_float(0)   // unswept swing highs (Liquidity, "above" side)
+var array<float> pendingLow = array.new_float(0)    // unswept swing lows (Liquidity, "below" side)
+
+var array<float> trWindow = array.new_float(0)      // rolling TR window for the swing ATR
+
+var int zzDir = 0            // 0 = undetermined, 1 = tracking up, -1 = tracking down
+var float zzCandHiPrice = na
+var float zzCandLoPrice = na
+
+var bool inTrade = false
+var float tradeEntry = na
+var float tradeStop = na
+var float tradeTarget = na
+var bool tradeIsLong = false
+var int entryBarIdx = na
+
+var int nTrades = 0
+var int nWins = 0
+var float sumRR = 0.0
+
+var int lastDayKey = na
+var int tradesTodayCount = 0
+
+var array<box> fvgBoxes = array.new_box(0)
+var array<box> obBoxes = array.new_box(0)
+var line entryLine = na
+var line stopLine = na
+var line targetLine = na
+var table statsTable = table.new(position.top_right, 2, 6, border_width = 1)
+
+bool justOpened = false
+bool justWon = false
+bool justLost = false
+
+// ------------------------------------------------------- Detector engine ---
+// Prunes an FVG/Order-Block-shaped zone list in place: any zone the current
+// bar's range trades back into gets eaten from its own side (consequent
+// encroachment); one that's fully eaten is removed. Same clamp math as
+// fvg.py's detect_fvgs / detect_order_blocks.
+f_updateZones(topArr, bottomArr, bullArr, lo, hi) =>
+    n = array.size(topArr)
+    if n > 0
+        for i = n - 1 to 0
+            top = array.get(topArr, i)
+            bottom = array.get(bottomArr, i)
+            isBull = array.get(bullArr, i)
+            if lo <= top and hi >= bottom
+                newTop = isBull ? math.max(math.min(top, lo), bottom) : top
+                newBottom = isBull ? bottom : math.min(math.max(bottom, hi), top)
+                if newTop <= newBottom
+                    array.remove(topArr, i)
+                    array.remove(bottomArr, i)
+                    array.remove(bullArr, i)
+                else
+                    array.set(topArr, i, newTop)
+                    array.set(bottomArr, i, newBottom)
+
+// Removes any pending swing level the current bar's extreme has swept.
+f_pruneSwept(arr, curExtreme, isHighSide) =>
+    n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            p = array.get(arr, i)
+            swept = isHighSide ? curExtreme > p : curExtreme < p
+            if swept
+                array.remove(arr, i)
+
+// nth-nearest (1-indexed) zone to currentPrice on `side` ("above"/"below"),
+// resolved to a price at `frac` of the way from the zone's bottom to its
+// top -- mirrors recommender.py's _nth_zone_on_side + _zone_point_price.
+f_nthOnSideZone(topArr, bottomArr, currentPrice, side, n, frac) =>
+    candTop = array.new_float(0)
+    candBottom = array.new_float(0)
+    srcSz = array.size(topArr)
+    if srcSz > 0
+        for i = 0 to srcSz - 1
+            t = array.get(topArr, i)
+            b = array.get(bottomArr, i)
+            ok = side == "above" ? b >= currentPrice : t <= currentPrice
+            if ok
+                array.push(candTop, t)
+                array.push(candBottom, b)
+    found = false
+    result = float(na)
+    csz = array.size(candTop)
+    if csz >= n
+        for k = 1 to n
+            bestIdx = 0
+            bestKey = side == "above" ? array.get(candBottom, 0) : array.get(candTop, 0)
+            curSz = array.size(candTop)
+            if curSz > 1
+                for j = 1 to curSz - 1
+                    key = side == "above" ? array.get(candBottom, j) : array.get(candTop, j)
+                    better = side == "above" ? key < bestKey : key > bestKey
+                    if better
+                        bestKey := key
+                        bestIdx := j
+            if k == n
+                pTop = array.get(candTop, bestIdx)
+                pBottom = array.get(candBottom, bestIdx)
+                result := pBottom + (pTop - pBottom) * frac
+                found := true
+            else
+                array.remove(candTop, bestIdx)
+                array.remove(candBottom, bestIdx)
+    [found, result]
+
+// nth-nearest unswept swing HIGH above currentPrice (Liquidity, side="above").
+f_nthLiquidityHigh(srcArr, currentPrice, n) =>
+    cand = array.new_float(0)
+    srcSz = array.size(srcArr)
+    if srcSz > 0
+        for i = 0 to srcSz - 1
+            p = array.get(srcArr, i)
+            if p > currentPrice
+                array.push(cand, p)
+    found = false
+    result = float(na)
+    csz = array.size(cand)
+    if csz >= n
+        for k = 1 to n
+            bestIdx = 0
+            bestVal = array.get(cand, 0)
+            curSz = array.size(cand)
+            if curSz > 1
+                for j = 1 to curSz - 1
+                    v = array.get(cand, j)
+                    if v < bestVal
+                        bestVal := v
+                        bestIdx := j
+            if k == n
+                result := bestVal
+                found := true
+            else
+                array.remove(cand, bestIdx)
+    [found, result]
+
+// nth-nearest unswept swing LOW below currentPrice (Liquidity, side="below").
+f_nthLiquidityLow(srcArr, currentPrice, n) =>
+    cand = array.new_float(0)
+    srcSz = array.size(srcArr)
+    if srcSz > 0
+        for i = 0 to srcSz - 1
+            p = array.get(srcArr, i)
+            if p < currentPrice
+                array.push(cand, p)
+    found = false
+    result = float(na)
+    csz = array.size(cand)
+    if csz >= n
+        for k = 1 to n
+            bestIdx = 0
+            bestVal = array.get(cand, 0)
+            curSz = array.size(cand)
+            if curSz > 1
+                for j = 1 to curSz - 1
+                    v = array.get(cand, j)
+                    if v > bestVal
+                        bestVal := v
+                        bestIdx := j
+            if k == n
+                result := bestVal
+                found := true
+            else
+                array.remove(cand, bestIdx)
+    [found, result]
+
+// One entry/exit/stop rule -> a price, or na if it can't resolve right now
+// -- mirrors recommender.py's resolve_rule exactly (same detector keys,
+// same side/n/zone_point contract).
+f_resolve(detector, side, n, frac, currentPrice) =>
+    found = false
+    price = float(na)
+    if detector == "Current Price"
+        found := true
+        price := currentPrice
+    else if detector == "FVG"
+        [f, p] = f_nthOnSideZone(fvgTop, fvgBottom, currentPrice, side, n, frac)
+        found := f
+        price := p
+    else if detector == "Order Block"
+        [f, p] = f_nthOnSideZone(obTop, obBottom, currentPrice, side, n, frac)
+        found := f
+        price := p
+    else if detector == "Liquidity"
+        if side == "above"
+            [f, p] = f_nthLiquidityHigh(pendingHigh, currentPrice, n)
+            found := f
+            price := p
+        else
+            [f, p] = f_nthLiquidityLow(pendingLow, currentPrice, n)
+            found := f
+            price := p
+    [found, price]
+
+// ------------------------------------------------------------ Main logic ---
+if barstate.isconfirmed
+    // -- day-key reset (NY calendar day, for max-trades-per-session) --
+    dayKey = year(time, sessionTZ) * 10000 + month(time, sessionTZ) * 100 + dayofmonth(time, sessionTZ)
+    if dayKey != lastDayKey
+        tradesTodayCount := 0
+        lastDayKey := dayKey
+
+    // -- update existing zones/levels with this bar's range, THEN detect
+    //    anything new this bar confirms (so a brand-new zone never gets
+    //    checked against its own confirming bar) --
+    f_updateZones(fvgTop, fvgBottom, fvgBull, low, high)
+    if bar_index >= 2
+        prevHigh = high[2]
+        prevLow = low[2]
+        if f_isDisplacement(open[1], high[1], low[1], close[1], displacementRatio)
+            if low > prevHigh
+                array.push(fvgTop, low)
+                array.push(fvgBottom, prevHigh)
+                array.push(fvgBull, true)
+            else if high < prevLow
+                array.push(fvgTop, prevLow)
+                array.push(fvgBottom, high)
+                array.push(fvgBull, false)
+
+    f_updateZones(obTop, obBottom, obBull, low, high)
+    if bar_index >= 1
+        oPrev = open[1]
+        hPrev = high[1]
+        lPrev = low[1]
+        cPrev = close[1]
+        isBearishI = cPrev < oPrev
+        isBullishI = cPrev > oPrev
+        topI = math.max(oPrev, cPrev)
+        bottomI = math.min(oPrev, cPrev)
+        if f_isDisplacement(open, high, low, close, displacementRatio)
+            if isBearishI and close > hPrev
+                array.push(obTop, topI)
+                array.push(obBottom, bottomI)
+                array.push(obBull, true)
+            else if isBullishI and close < lPrev
+                array.push(obTop, topI)
+                array.push(obBottom, bottomI)
+                array.push(obBull, false)
+
+    f_pruneSwept(pendingHigh, high, true)
+    f_pruneSwept(pendingLow, low, false)
+
+    // -- ATR-scaled zigzag swings (feeds Liquidity) --
+    prevClose = bar_index == 0 ? close : close[1]
+    tr = math.max(high - low, math.max(math.abs(high - prevClose), math.abs(low - prevClose)))
+    array.push(trWindow, tr)
+    if array.size(trWindow) > swingAtrPeriod
+        array.remove(trWindow, 0)
+    atrVal = array.sum(trWindow) / array.size(trWindow)
+    threshold = swingAtrMult * atrVal
+
+    if bar_index == 0
+        zzCandHiPrice := high
+        zzCandLoPrice := low
+    else
+        if zzDir == 0
+            if high > zzCandHiPrice
+                zzCandHiPrice := high
+            if low < zzCandLoPrice
+                zzCandLoPrice := low
+            if zzCandHiPrice - low >= threshold
+                array.push(pendingHigh, zzCandHiPrice)
+                zzDir := -1
+                zzCandLoPrice := low
+            else if high - zzCandLoPrice >= threshold
+                array.push(pendingLow, zzCandLoPrice)
+                zzDir := 1
+                zzCandHiPrice := high
+        else if zzDir == 1
+            if high > zzCandHiPrice
+                zzCandHiPrice := high
+            else if zzCandHiPrice - low >= threshold
+                array.push(pendingHigh, zzCandHiPrice)
+                zzDir := -1
+                zzCandLoPrice := low
+        else
+            if low < zzCandLoPrice
+                zzCandLoPrice := low
+            else if high - zzCandLoPrice >= threshold
+                array.push(pendingLow, zzCandLoPrice)
+                zzDir := 1
+                zzCandHiPrice := high
+
+    // -- walk-forward trade simulation (mirrors backtest_custom_rule) --
+    if not inTrade
+        inSessionNow = not useSession or not na(time(timeframe.period, sessionWindow + ":23456", sessionTZ))
+        dayOk = not useSession or maxTradesPerSession <= 0 or tradesTodayCount < maxTradesPerSession
+        if inSessionNow and dayOk
+            priceNow = close
+            sideEntry = direction == "Bullish" ? "below" : "above"
+            sideExit = direction == "Bullish" ? "above" : "below"
+            sideStop = sideEntry
+
+            [eFound, e] = f_resolve(entryDetector, sideEntry, entryRank, entryFrac, priceNow)
+            [xFound, x] = f_resolve(exitDetector, sideExit, exitRank, exitFrac, priceNow)
+            [sFound, s] = f_resolve(stopDetector, sideStop, stopRank, stopFrac, priceNow)
+
+            if eFound and xFound and sFound
+                isLong = x > e
+                sane = isLong ? (s < e and e < x) : (s > e and e > x)
+                if sane
+                    risk = math.abs(e - s)
+                    reward = math.abs(x - e)
+                    rr = risk > 0 ? reward / risk : float(na)
+                    passRR = minRR <= 0 or (not na(rr) and rr >= minRR)
+                    passStopPct = minStopPct <= 0 or (e > 0 and (risk / e * 100) >= minStopPct)
+                    passStopAbs = minStopAbs <= 0 or risk >= minStopAbs
+                    if passRR and passStopPct and passStopAbs
+                        inTrade := true
+                        tradeEntry := e
+                        tradeStop := s
+                        tradeTarget := x
+                        tradeIsLong := isLong
+                        entryBarIdx := bar_index
+                        tradesTodayCount += 1
+                        justOpened := true
+
+                        riskAmount = strategy.equity * riskPerTradePct / 100
+                        stopDist = math.abs(close - s)
+                        qty = stopDist > 0 ? riskAmount / stopDist : float(na)
+                        if not na(qty) and qty > 0
+                            if isLong
+                                strategy.entry("Long", strategy.long, qty = qty)
+                                strategy.exit("Exit Long", "Long", stop = s, limit = x)
+                            else
+                                strategy.entry("Short", strategy.short, qty = qty)
+                                strategy.exit("Exit Short", "Short", stop = s, limit = x)
+
+                        line.delete(entryLine)
+                        line.delete(stopLine)
+                        line.delete(targetLine)
+                        entryLine := line.new(bar_index, e, bar_index + 50, e, color = color.new(color.white, 0), style = line.style_dashed)
+                        stopLine := line.new(bar_index, s, bar_index + 50, s, color = color.new(color.red, 0), style = line.style_dashed)
+                        targetLine := line.new(bar_index, x, bar_index + 50, x, color = color.new(color.green, 0), style = line.style_dashed)
+    else
+        if bar_index > entryBarIdx
+            hitStop = tradeIsLong ? low <= tradeStop : high >= tradeStop
+            hitTarget = tradeIsLong ? high >= tradeTarget : low <= tradeTarget
+            if hitStop or hitTarget
+                won = hitTarget and not hitStop
+                nTrades += 1
+                if won
+                    nWins += 1
+                    justWon := true
+                else
+                    justLost := true
+                sumRR += math.abs(tradeTarget - tradeEntry) / math.abs(tradeEntry - tradeStop)
+                inTrade := false
+                line.delete(entryLine)
+                line.delete(stopLine)
+                line.delete(targetLine)
+
+// ------------------------------------------------------------- Visuals -----
+bgcolor(useSession and not na(time(timeframe.period, sessionWindow + ":23456", sessionTZ)) ? color.new(color.blue, 92) : na)
+
+plotshape(justOpened and tradeIsLong, title = "Long entry", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny)
+plotshape(justOpened and not tradeIsLong, title = "Short entry", style = shape.triangledown, location = location.abovebar, color = color.orange, size = size.tiny)
+plotshape(justWon, title = "Target hit", style = shape.labelup, location = location.belowbar, color = color.new(color.green, 0), text = "W", textcolor = color.white, size = size.tiny)
+plotshape(justLost, title = "Stop hit", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), text = "L", textcolor = color.white, size = size.tiny)
+
+if showZones and barstate.islast
+    bsz = array.size(fvgBoxes)
+    if bsz > 0
+        for i = 0 to bsz - 1
+            box.delete(array.get(fvgBoxes, i))
+    array.clear(fvgBoxes)
+    fsz = array.size(fvgTop)
+    if fsz > 0
+        for i = 0 to fsz - 1
+            t = array.get(fvgTop, i)
+            b = array.get(fvgBottom, i)
+            isBull = array.get(fvgBull, i)
+            bx = box.new(bar_index - 20, t, bar_index + 20, b,
+                 border_color = isBull ? color.new(color.teal, 30) : color.new(color.maroon, 30),
+                 bgcolor = isBull ? color.new(color.teal, 85) : color.new(color.maroon, 85),
+                 extend = extend.right)
+            array.push(fvgBoxes, bx)
+
+    obsz = array.size(obBoxes)
+    if obsz > 0
+        for i = 0 to obsz - 1
+            box.delete(array.get(obBoxes, i))
+    array.clear(obBoxes)
+    osz = array.size(obTop)
+    if osz > 0
+        for i = 0 to osz - 1
+            t = array.get(obTop, i)
+            b = array.get(obBottom, i)
+            isBull = array.get(obBull, i)
+            bx2 = box.new(bar_index - 20, t, bar_index + 20, b,
+                 border_color = isBull ? color.new(color.blue, 30) : color.new(color.orange, 30),
+                 bgcolor = color.new(color.gray, 92),
+                 extend = extend.right)
+            array.push(obBoxes, bx2)
+
+if showStatsTable and barstate.islast
+    table.cell(statsTable, 0, 0, "Dashboard rule-engine stats", text_color = color.white, bgcolor = color.new(color.blue, 0))
+    table.cell(statsTable, 1, 0, "", bgcolor = color.new(color.blue, 0))
+    table.cell(statsTable, 0, 1, "Trades", text_color = color.white)
+    table.cell(statsTable, 1, 1, str.tostring(nTrades), text_color = color.white)
+    table.cell(statsTable, 0, 2, "Wins", text_color = color.white)
+    table.cell(statsTable, 1, 2, str.tostring(nWins), text_color = color.white)
+    table.cell(statsTable, 0, 3, "Win rate", text_color = color.white)
+    table.cell(statsTable, 1, 3, nTrades > 0 ? str.tostring(nWins / nTrades * 100, "#.#") + "%" : "-", text_color = color.white)
+    table.cell(statsTable, 0, 4, "Avg R:R", text_color = color.white)
+    table.cell(statsTable, 1, 4, nTrades > 0 ? str.tostring(sumRR / nTrades, "#.##") : "-", text_color = color.white)
+    table.cell(statsTable, 0, 5, "In trade", text_color = color.white)
+    table.cell(statsTable, 1, 5, inTrade ? (tradeIsLong ? "Long" : "Short") : "No", text_color = color.white)

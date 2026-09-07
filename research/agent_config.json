@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "tickers": [
+    "BTC-USD"
+  ],
+  "intervals": [
+    "60m",
+    "1d",
+    "30m"
+  ],
+  "detectors": {
+    "fvg": false,
+    "order_block": false,
+    "liquidity_reaction": false,
+    "equal_highs_lows": false,
+    "bos": false,
+    "choch": false,
+    "judas_swing": true
+  },
+  "provider": "auto"
+}

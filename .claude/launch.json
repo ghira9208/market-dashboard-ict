@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "market-dashboard-ict-markets",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "streamlit", "run", "app.py", "--server.headless", "true", "--server.port", "8501", "--server.fileWatcherType", "none"],
+      "port": 8501
+    },
+    {
+      "name": "market-dashboard-ict-crypto",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "streamlit", "run", "crypto_app.py", "--server.headless", "true", "--server.port", "8506", "--server.fileWatcherType", "none"],
+      "port": 8506
+    },
+    {
+      "name": "market-dashboard-ict-backtest",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "streamlit", "run", "backtest_app.py", "--server.headless", "true", "--server.port", "8507", "--server.fileWatcherType", "none"],
+      "port": 8507
+    }
+  ]
+}

@@ -1,0 +1,1572 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<script src="https://unpkg.com/lightweight-charts@5.2.1/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  /* height:100% down this chain only resolves if every ancestor up to html
+     has an explicit height too — html/body default to auto (shrink to
+     content), which made #chart collapse to 0px and createChart() size
+     its canvas off a zero-height container. */
+  html, body { margin: 0; padding: 0; height: 100%; background: #1c1c1e; overflow: hidden; }
+  /* Which of the 3 charts on the page the shared TF bar currently controls.
+     Used to be an inset box-shadow on <body> — confirmed directly (live,
+     via a user report of "only visible on the right/bottom edges, and
+     sometimes the top, when glitching") that this doesn't actually work in
+     this layout: #chart fills body's ENTIRE content box with its own
+     opaque canvas starting flush at the top-left origin, so the shadow
+     only ever showed through on whichever edges happened to have a stray
+     unfilled gap (a canvas sizing rounding error, naturally biased toward
+     the right/bottom since content is positioned from the top-left) —
+     never a real, reliable border. A genuine CSS border on #chart doesn't
+     have that problem: it's its own dedicated box-model layer, always
+     painted around all four edges regardless of what its children render.
+     The border-width stays CONSTANT (2px, just transparent when
+     unselected) rather than toggling 0-to-2px — that's what the original
+     "would eat into the box and throw off the ResizeObserver" concern was
+     actually about: an appearing/disappearing border changes
+     clientWidth/clientHeight, which would resize the canvas every time
+     selection changes. A color-only toggle on an already-reserved border
+     never changes those numbers at all. Thinner than the original 4px on
+     request — still a clear, unambiguous edge at 2px, just not a slab. */
+  #chart {
+    width: 100%; height: 100%;
+    box-sizing: border-box;
+    border: 2px solid transparent;
+  }
+  body.chart-selected #chart {
+    border-color: var(--neon-cyan, #0A84FF);
+  }
+  body:not(.chart-selected) {
+    filter: brightness(0.7) saturate(0.75);
+    transition: filter 0.15s ease;
+  }
+  #fitBtn {
+    position: absolute; top: 6px; right: 8px; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums; font-size: 0.7rem;
+    color: #0A84FF; background: rgba(28,28,30,0.75); border: 1px solid rgba(10,132,255,0.3);
+    border-radius: 8px; padding: 3px 8px; cursor: pointer; user-select: none;
+  }
+  #fitBtn:hover { background: rgba(10,132,255,0.12); }
+  /* Sits left of #fitBtn, same visual language. Active state (measuring in
+     progress) gets a filled background instead of the usual transparent
+     one — has to read as "on" at a glance, since it changes what a plain
+     click on the chart does everywhere else. */
+  #measureBtn {
+    position: absolute; top: 6px; right: 62px; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums; font-size: 0.7rem;
+    color: #0A84FF; background: rgba(28,28,30,0.75); border: 1px solid rgba(10,132,255,0.3);
+    border-radius: 8px; padding: 3px 8px; cursor: pointer; user-select: none;
+  }
+  #measureBtn:hover { background: rgba(10,132,255,0.12); }
+  #measureBtn.active { background: rgba(10,132,255,0.35); color: #1c1c1e; font-weight: 700; }
+  /* Sits at the bottom-left of the plot area — the actual time/price axis
+     intersection now that rightPriceScale is off and price labels only
+     ever render on the left. Pure client-side toggle, no round-trip to
+     Streamlit, matching how #fitBtn already behaves. */
+  #scaleBtn {
+    position: absolute; bottom: 26px; left: 8px; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums; font-size: 0.65rem;
+    color: #98989d; background: rgba(28,28,30,0.75); border: 1px solid rgba(10,132,255,0.25);
+    border-radius: 8px; padding: 2px 7px; cursor: pointer; user-select: none;
+  }
+  #scaleBtn:hover { color: #0A84FF; background: rgba(10,132,255,0.12); }
+  /* TradingView-style readout pinned to the chart's own top-left corner,
+     instead of a separate Streamlit-rendered line above the chart. */
+  #ohlcOverlay {
+    position: absolute; top: 6px; left: 8px; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums; font-size: 0.85rem;
+    letter-spacing: 0; pointer-events: none;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
+  #ohlcOverlay .sym { font-size: 0.98rem; font-weight: 700; }
+  #ohlcOverlay .lbl { color: #98989d; }
+  #ohlcOverlay .val { color: #f5f5f7; }
+  #ohlcOverlay .src { color: #6e6e73; }
+  /* Own element rather than a span inside #ohlcOverlay — that div's whole
+     innerHTML gets rebuilt on every renderOhlc() call (hover included), so
+     a countdown living in there would need rebuilding every second too.
+     Ticking this one independently (see renderCountdown/setInterval) keeps
+     the 1s tick a plain textContent write, not a full readout re-render. */
+  #countdownOverlay {
+    position: absolute; top: 26px; left: 8px; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums; font-size: 0.72rem;
+    letter-spacing: 0; pointer-events: none; color: #6e6e73;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
+  #countdownOverlay .cdval { color: #98989d; }
+  body.hide-ohlc #ohlcOverlay { display: none; }
+  /* Shown instead of candles when Python sends options.error_message (an
+     empty/failed fetch) — the chart shell (border, fit button, click-to-
+     select) stays fully intact around it rather than the whole panel
+     going blank, since only the DATA failed, nothing about the UI did. */
+  #noDataOverlay {
+    position: absolute; inset: 0; z-index: 5; display: none;
+    align-items: center; justify-content: center; text-align: center;
+    pointer-events: none; padding: 0 10%;
+  }
+  #noDataOverlay span {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
+    font-size: 0.95rem;
+    color: #98989d; letter-spacing: 0;
+  }
+</style>
+</head><body>
+<div id="chart"></div>
+<div id="noDataOverlay"><span></span></div>
+<div id="ohlcOverlay"></div>
+<div id="countdownOverlay"></div>
+<button id="fitBtn" title="Fit all loaded data">⤢ Fit</button>
+<button id="measureBtn" title="Click two points on a candle to measure price/%/bars between them. Right-click the chart to clear.">📏 Measure</button>
+<button id="scaleBtn" title="Toggle log/arithmetic price scale">LOG</button>
+<script>
+window.__ictDebug = { errors: [] };
+window.addEventListener('error', (e) => {
+  window.__ictDebug.errors.push(String(e.error && e.error.stack || e.message));
+});
+
+/* ---------------------------------------------------------------------
+ * Streamlit Components JS protocol, hand-rolled (no React / build step —
+ * this is Streamlit's own documented "no framework" pattern). A real
+ * declare_component(path=...) serves this file via a stable src= URL, so
+ * the iframe navigates ONCE on first mount and then only receives
+ * postMessage events — unlike components.v1.html()'s srcdoc=, which forces
+ * a full navigation/reload (and total JS state loss) on every single
+ * Streamlit rerun. That persistence is the entire point of building this
+ * as a real component: it's what makes incremental tick updates possible.
+ * ------------------------------------------------------------------- */
+function sendToStreamlit(type, extra) {
+  window.parent.postMessage(Object.assign({ type, isStreamlitMessage: true }, extra), '*');
+}
+function setFrameHeight(height) {
+  sendToStreamlit('streamlit:setFrameHeight', { height });
+}
+// Remembered so the ResizeObserver below can re-assert it independently
+// of handleRender — see that observer's own comment for why this is
+// needed at all.
+let lastFrameHeight = null;
+
+let onRenderArgs = null; // set by the render handler below
+
+window.addEventListener('message', (event) => {
+  if (!event.data || event.data.type !== 'streamlit:render') return;
+  onRenderArgs = event.data.args;
+  handleRender(onRenderArgs);
+});
+
+/* ---------------------------------------------------------------------
+ * Chart setup — created ONCE on first render and reused for the life of
+ * the component instance. Native pan (drag), zoom (wheel/pinch), and
+ * crosshair all come from the library itself — no hand-rolled d2p/p2d
+ * math, no rangebreak edge cases, none of what market-dashboard's earlier
+ * Plotly-based chart had to fight all session.
+ * ------------------------------------------------------------------- */
+const LC = window.LightweightCharts;
+const container = document.getElementById('chart');
+
+const chart = LC.createChart(container, {
+  layout: {
+    background: { type: 'solid', color: '#1c1c1e' },
+    textColor: '#f5f5f7',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif',
+    attributionLogo: false,
+  },
+  // Vertical grid lines off entirely, horizontal at a barely-there opacity —
+  // Apple's own chart language (Stocks.app) reads time from the axis labels
+  // alone, not a lattice; a quiet horizontal reference is still useful for
+  // eyeballing price levels across the pane.
+  grid: {
+    vertLines: { visible: false },
+    horzLines: { color: 'rgba(255,255,255,0.04)' },
+  },
+  // MagnetOHLC snaps the crosshair's horizontal line to the actual O/H/L/C
+  // of whatever candle it's over, instead of floating at the raw pixel
+  // position — makes reading an exact level off a candle a lot less fiddly.
+  crosshair: { mode: LC.CrosshairMode.MagnetOHLC },
+  // Visually unused (nothing is ever plotted against it — price lives on
+  // 'left', see below) but must stay visible:true anyway: disabling it
+  // silently breaks Pane.setStretchFactor()/setHeight() for EVERY pane on
+  // the whole chart, not just this scale — confirmed directly, and only
+  // after a long detour through what looked like a pane-reflow-ordering
+  // bug (it wasn't). With an empty right scale, no series ever attaches to
+  // it, so it stays effectively invisible/zero-width in practice anyway.
+  // Genuinely unused — candles/indicators all plot on the left scale below.
+  // Used to be forced visible:true anyway to dodge a real bug (an
+  // invisible-AND-undefined-visibility pair of scales silently broke
+  // setStretchFactor/pane heights chart-wide), which left a permanent empty
+  // black gutter on the right. Confirmed directly: with leftPriceScale
+  // already explicitly visible (below), turning this off does NOT
+  // reintroduce the bug — tested live with 3 panes (RSI+MACD), heights
+  // came back correct (382.5/133.5/134, zero errors). The bug needed *a*
+  // visible scale, not specifically this one.
+  rightPriceScale: { visible: false },
+  leftPriceScale: {
+    visible: true,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  timeScale: {
+    borderColor: 'rgba(255,255,255,0.1)',
+    timeVisible: true,
+    secondsVisible: false,
+    // The reported "jitters when loading" (i.e. on every live auto-refresh
+    // tick) traced to a real per-candle jump, confirmed directly by
+    // instrumenting handleRender + getVisibleLogicalRange(): every time a
+    // brand-new candle actually opens (not just an ordinary price-tick
+    // poll — those never moved anything), the visible logical range shifted
+    // by exactly one bar, e.g. {8413,9880} -> {8414,9881}. That's
+    // lightweight-charts' default "stay pinned to the live edge" behavior
+    // (shiftVisibleRangeOnNewBar defaults to true): with zero rightOffset
+    // margin, a newly-appended bar has nowhere to go but to shove the
+    // entire view over by one bar-width. At the wide zoom used for
+    // testing that's sub-pixel and invisible, but at a normal zoomed-in
+    // view (a few dozen candles on screen) one bar-width is a real,
+    // visible jump — that's the jitter.
+    //
+    // rightOffset alone does NOT fix it — confirmed directly: adding
+    // margin still shifted by 1 on the next new candle (the reserved
+    // empty space slides along with everything else, it doesn't absorb
+    // the new bar). Disabling shiftVisibleRangeOnNewBar is what actually
+    // stops it — confirmed directly: with it off, a real candle-open
+    // boundary produced byte-identical before/after logical ranges. New
+    // candles now grow into the rightOffset margin instead of translating
+    // the whole chart; the tradeoff is the view no longer auto-follows
+    // once that margin fills up, matching how "Fit"/scrolling already
+    // work elsewhere on this page (nothing else auto-recenters either).
+    rightOffset: 8,
+    shiftVisibleRangeOnNewBar: false,
+  },
+});
+
+// formingBarTime: the still-forming last candle's time (set from
+// args.ohlc.forming_bar_time in handleRender), or null when there isn't
+// one (daily+ timeframes, or between an auto-refresh's poll cycle and the
+// bar actually closing). See the autoscaleInfoProvider below for why this
+// exists — declared up here since candleSeries' options close over it.
+let formingBarTime = null;
+
+const candleSeries = chart.addSeries(LC.CandlestickSeries, {
+  upColor: '#30D158', downColor: '#FF453A', borderVisible: false,
+  wickUpColor: '#30D158', wickDownColor: '#FF453A',
+  priceScaleId: 'left',
+  // Root cause of "the whole chart area jitters when updating," confirmed
+  // directly by instrumenting priceScale().getVisibleRange() across live
+  // poll ticks: app.py's forming-candle accumulator (see its own comments)
+  // can only ever GROW the live candle's high/low across polls — it never
+  // shrinks — and every such growth feeds straight into series.update(),
+  // which by default drives autoscale on every single poll, not just on
+  // candle-close. During any real price movement that meant the vertical
+  // scale — and with it every visible candle's position — could rescale
+  // on nearly every ~8-20s tick, well before the candle actually closed.
+  // That's the noisy, still-approximate range app.py's own comments
+  // already flag as "an unavoidable approximation of a polling-based
+  // feed" — it was never meant to be authoritative, so it shouldn't drive
+  // the whole chart's vertical scale either. Excluding just that one bar
+  // from the autoscale computation (falling back to the library's own
+  // default whenever there's no forming bar, or it's the only bar in
+  // view) means the scale now only moves at genuine candle-close
+  // boundaries, matching how the horizontal-axis fix above already
+  // treats "new candle" as the meaningful event, not "new poll."
+  autoscaleInfoProvider: (original) => {
+    const base = original();
+    if (!base || formingBarTime === null || !barsByTime.has(formingBarTime)) return base;
+    const visible = chart.timeScale().getVisibleRange();
+    if (!visible) return base;
+    let min = null, max = null, count = 0;
+    for (const [t, bar] of barsByTime) {
+      if (t === formingBarTime || t < visible.from || t > visible.to) continue;
+      count += 1;
+      if (min === null || bar.low < min) min = bar.low;
+      if (max === null || bar.high > max) max = bar.high;
+    }
+    if (count === 0) return base; // forming bar is the only one in view — nothing to exclude it in favor of
+    return { priceRange: { minValue: min, maxValue: max }, margins: base.margins };
+  },
+});
+candleSeries.priceScale().applyOptions({
+  scaleMargins: { top: 0.05, bottom: 0.3 },
+});
+
+const volumeSeries = chart.addSeries(LC.HistogramSeries, {
+  priceFormat: { type: 'volume' },
+  priceScaleId: '', // '' creates its own implicit overlay scale, independent of the left price scale above
+  scaleMargins: { top: 0.75, bottom: 0 },
+});
+
+const markersHandle = LC.createSeriesMarkers(candleSeries, []);
+
+// fitContent() computes bar spacing from the container's width AT THE
+// MOMENT it's called — calling it synchronously inside the first
+// streamlit:render handler races the browser's own resize/layout pass
+// (ResizeObserver callbacks are asynchronous and batched), and can catch
+// the chart mid-transition to its final size. Confirmed directly: read
+// getVisibleLogicalRange() right after a synchronous fitContent() call
+// and got {from: -1340, to: 199} for a 200-bar dataset — a range 7x wider
+// than the actual data, matching exactly the "candles squeezed into a
+// sliver with empty space to the left" visual bug. A double
+// requestAnimationFrame is the standard fix for "wait until layout has
+// definitely settled" — the first rAF fires after the current paint, the
+// second after the NEXT one, guaranteeing at least one full layout/paint
+// cycle has completed first.
+// Set from options.candle_width_factor on every render (see handleRender) —
+// the main chart's candles read visually heavier than the mini panels' at
+// the same zoom purely because lightweight-charts derives candle body width
+// straight from barSpacing, with no separate "thickness" knob. Python sends
+// a slightly-below-1 factor for the main chart only, applied here right
+// after fitContent() picks its own auto-fit spacing.
+let candleWidthFactor = 1;
+
+function fitContentWhenReady() {
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    chart.timeScale().fitContent();
+    if (candleWidthFactor !== 1) {
+      const current = chart.timeScale().options().barSpacing;
+      chart.timeScale().applyOptions({ barSpacing: current * candleWidthFactor });
+    }
+  }));
+}
+
+new ResizeObserver(() => {
+  chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+  // Re-assert the frame's own OUTER height every time this fires, not
+  // just once from handleRender's own setFrameHeight call. Streamlit
+  // only reliably applies a streamlit:setFrameHeight message while the
+  // component is genuinely visible — one sent while sitting inside a
+  // hidden tab panel (this component's own fragment ticks on its
+  // independent schedule regardless of which side-panel tab is
+  // currently selected — see _render_mini_chart in app.py) gets
+  // silently dropped, leaving the iframe stuck at Streamlit's ~150px
+  // fallback even once that tab becomes the visible one again.
+  // Confirmed directly: the height arg (380) was correctly received in
+  // every handleRender call, but the outer <iframe> element itself
+  // never actually grew past 150px until the tab was switched back to.
+  // A real resize DOES fire the instant display:none lifts (clientWidth/
+  // clientHeight jump from 0 to their real values), so re-sending here
+  // catches exactly that transition and self-heals it.
+  if (lastFrameHeight) setFrameHeight(lastFrameHeight);
+}).observe(container);
+
+// lightweight-charts has no built-in "reset zoom" gesture (no
+// double-click-to-autorange the way Plotly did natively) — once a user
+// zooms in, this button is the only way back to the full loaded range.
+document.getElementById('fitBtn').addEventListener('click', () => {
+  chart.timeScale().fitContent();
+  if (candleWidthFactor !== 1) {
+    const current = chart.timeScale().options().barSpacing;
+    chart.timeScale().applyOptions({ barSpacing: current * candleWidthFactor });
+  }
+});
+
+// Pure client-side toggle, deliberately never re-driven from Python after
+// first mount — every Streamlit rerun (a TF click, a layer checkbox) would
+// otherwise stomp the user's choice back to the server-sent default on
+// every single interaction. isLogScale tracks the true current state;
+// handleRender only seeds it once, on a genuine full reload.
+let isLogScale = false;
+const scaleBtn = document.getElementById('scaleBtn');
+function applyScaleMode() {
+  candleSeries.priceScale().applyOptions({ mode: isLogScale ? 1 : 0 });
+  scaleBtn.textContent = isLogScale ? 'LOG' : 'ARITH';
+}
+scaleBtn.addEventListener('click', () => {
+  isLogScale = !isLogScale;
+  applyScaleMode();
+});
+
+/* ---------------------------------------------------------------------
+ * Rectangle primitive — FVG / Order Block / liquidity-reaction zones.
+ * Adapted from TradingView's own published plugin-examples
+ * (rectangle-drawing-tool.ts): same renderer/pane-view split, same
+ * useBitmapCoordinateSpace + positionsBox pattern for DPI-correct pixel
+ * rects, trimmed of the interactive drawing-tool / axis-label parts this
+ * page doesn't need (these zones are drawn programmatically from
+ * detection output, never drawn by hand).
+ * ------------------------------------------------------------------- */
+function positionsBox(pos1, pos2, pixelRatio) {
+  const a = Math.round(pixelRatio * pos1), b = Math.round(pixelRatio * pos2);
+  return { position: Math.min(a, b), length: Math.abs(b - a) + 1 };
+}
+
+// timeToCoordinate only ever resolves a time that EXACTLY matches one of
+// the series' own loaded bar timestamps — confirmed directly: it returns
+// null for a time strictly BETWEEN two real bars (no interpolation) and
+// for any time past the last one (no extrapolation), even well inside the
+// rightOffset margin's own empty pixel space. Every "still open/active"
+// overlay (an unfilled FVG, an unmitigated order block, an unswept
+// liquidity level, Premium/Discount's own box) computes its open-ended
+// edge as "a few bars past the main chart's own last real bar" (Python's
+// own future_edge) — a synthetic timestamp that will essentially never
+// exactly match a real bar, so relying on timeToCoordinate alone made
+// every one of those silently fail to draw (confirmed: liquidity levels
+// are ALWAYS still-unswept by construction, so every single one hit this
+// every time — this is why Liquidity specifically never rendered at all).
+// logicalToCoordinate CAN place a point in that empty margin space
+// (that's what it's for), so this falls back to it for times past the
+// last bar: compute how many bar-widths past it the requested time sits,
+// and ask for that logical position instead.
+function resolveTimeCoordinate(chart, series, time) {
+  const timeScale = chart.timeScale();
+  const x = timeScale.timeToCoordinate(time);
+  if (x !== null) return x;
+  const data = series.data();
+  if (data.length < 2) return null;
+  const last = data[data.length - 1];
+  if (time <= last.time) return null;  // not a past-the-end case — a different, already-understood limitation (e.g. before the series' own first bar), not this fallback's job
+  const barStep = last.time - data[data.length - 2].time;
+  if (!barStep) return null;
+  const logicalIndex = (data.length - 1) + (time - last.time) / barStep;
+  // Rounded to the nearest whole index, not passed through fractional —
+  // confirmed directly that lightweight-charts' own logicalToCoordinate
+  // returns exactly 0 (not an approximate nearby pixel, not null — a
+  // hard 0, i.e. the chart's literal left edge) for ANY non-integer
+  // logical index sitting in this past-the-last-bar region, while every
+  // whole-number index there resolves correctly. This is what produced
+  // the "zone rendered all the way to the left edge of the chart"
+  // bug: a layer detecting on a finer timeframe than the main chart
+  // (e.g. a 4h swing feeding a 1W chart) anchors its own overlays at a
+  // real 4h timestamp that lands a fraction of a main-chart bar past
+  // the series' last bar, not exactly on a whole one. Rounding costs at
+  // most half a bar-width of position error (a few pixels) and entirely
+  // avoids the 0-coordinate case.
+  return timeScale.logicalToCoordinate(Math.round(logicalIndex));
+}
+
+class RectangleRenderer {
+  constructor(p1, p2, fillColor, borderColor, label, borderWidth, fillColorTo, extendToEdge) {
+    this._p1 = p1; this._p2 = p2; this._fillColor = fillColor; this._borderColor = borderColor;
+    this._label = label; this._borderWidth = borderWidth || 1; this._fillColorTo = fillColorTo || null;
+    this._extendToEdge = extendToEdge || false;
+  }
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (this._p1.x === null || this._p1.y === null || this._p2.y === null) return;
+      if (!this._extendToEdge && this._p2.x === null) return;
+      const ctx = scope.context;
+      // The recommended trade's own risk/reward zone (e.g. entry-to-SL)
+      // always reaches the pane's right edge, same treatment and same
+      // reasoning as the Entry/SL/TP lines it's paired with — see
+      // HLineRenderer's own copy of this comment. mediaSize (not
+      // bitmapSize) since positionsBox scales by pixelRatio itself.
+      const x2 = this._extendToEdge ? scope.mediaSize.width : this._p2.x;
+      const h = positionsBox(this._p1.x, x2, scope.horizontalPixelRatio);
+      const v = positionsBox(this._p1.y, this._p2.y, scope.verticalPixelRatio);
+      // Mitigated FVG slivers pass fillColorTo (same hue, alpha 0) to fade
+      // left-to-right instead of a flat wash — "how much of this got eaten,
+      // fading out toward the live edge" reads more naturally as a gradient
+      // than a uniform tint. Left->right regardless of the rect's own p1/p2
+      // order, since h.position is already the resolved left pixel edge.
+      if (this._fillColorTo) {
+        const grad = ctx.createLinearGradient(h.position, 0, h.position + h.length, 0);
+        grad.addColorStop(0, this._fillColor);
+        grad.addColorStop(1, this._fillColorTo);
+        ctx.fillStyle = grad;
+      } else {
+        ctx.fillStyle = this._fillColor;
+      }
+      ctx.fillRect(h.position, v.position, h.length, v.length);
+      if (this._borderColor) {
+        ctx.strokeStyle = this._borderColor;
+        ctx.lineWidth = this._borderWidth * scope.verticalPixelRatio;
+        ctx.strokeRect(h.position, v.position, h.length, v.length);
+      }
+      // Kill-zone bands pass a label (FVG/OB rectangles don't) — two
+      // low-opacity fills in adjacent hues (e.g. this session's blue vs.
+      // another's violet) turned out to read as "the same color" at a
+      // glance once painted at an opacity low enough not to bury the
+      // candles under it (confirmed directly against the live app, not
+      // just guessed at). Text removes the ambiguity outright instead of
+      // chasing more hue separation.
+      if (this._label && this._borderColor) {
+        ctx.save();
+        ctx.font = `${Math.round(10 * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
+        ctx.fillStyle = this._borderColor;
+        ctx.textBaseline = 'top';
+        ctx.fillText(this._label, h.position + 4 * scope.horizontalPixelRatio, v.position + 3 * scope.verticalPixelRatio);
+        ctx.restore();
+      }
+    });
+  }
+}
+
+class RectanglePaneView {
+  constructor(source) { this._source = source; this._p1 = { x: null, y: null }; this._p2 = { x: null, y: null }; }
+  update() {
+    const chart = this._source.chart, series = this._source.series;
+    const y1 = series.priceToCoordinate(this._source.p1.price);
+    const y2 = series.priceToCoordinate(this._source.p2.price);
+    const x1 = resolveTimeCoordinate(chart, series, this._source.p1.time);
+    // extendToEdge rectangles override x2 to the pane's right border in
+    // the renderer's own draw() regardless of what this resolves to — 0
+    // here is just a non-null placeholder so the renderer's null guard
+    // (skipped for extendToEdge) never gets in the way.
+    const x2 = this._source.extendToEdge ? 0 : resolveTimeCoordinate(chart, series, this._source.p2.time);
+    this._p1 = { x: x1, y: y1 }; this._p2 = { x: x2, y: y2 };
+  }
+  renderer() {
+    return new RectangleRenderer(this._p1, this._p2, this._source.fillColor, this._source.borderColor,
+                                  this._source.label, this._source.borderWidth, this._source.fillColorTo,
+                                  this._source.extendToEdge);
+  }
+}
+
+class RectanglePrimitive {
+  constructor(p1, p2, fillColor, borderColor, label, borderWidth, fillColorTo, extendToEdge) {
+    this.p1 = p1; this.p2 = p2; this.fillColor = fillColor; this.borderColor = borderColor;
+    this.label = label || null; this.borderWidth = borderWidth || 1; this.fillColorTo = fillColorTo || null;
+    this.extendToEdge = extendToEdge || false;
+    this._paneViews = [new RectanglePaneView(this)];
+  }
+  attached({ chart, series }) { this.chart = chart; this.series = series; }
+  detached() { this.chart = undefined; this.series = undefined; }
+  updateAllViews() { this._paneViews.forEach((v) => v.update()); }
+  paneViews() { return this._paneViews; }
+}
+
+/* ---------------------------------------------------------------------
+ * Ghost-candle primitive — a second timeframe's own candles (e.g. 4h)
+ * drawn faded on the main chart, sharing its real time axis so a 4h bar
+ * visually spans exactly the handful of main-timeframe candles it
+ * actually covers ("overlaps perfectly"). A real CandlestickSeries can't
+ * do this: its bar width comes from the chart's global barSpacing, not
+ * each bar's own duration, so a second candle series just draws
+ * same-width, wrongly-spaced bars. A primitive sidesteps that entirely —
+ * body is a plain t0..t1 rect (same box math as RectanglePrimitive
+ * above), wick is centered on the body's own PIXEL span after
+ * time-to-coordinate conversion, so it stays correctly positioned at any
+ * zoom level instead of drifting like a fixed time-width wick would.
+ * zOrder 'bottom' keeps it behind the real candlestick series regardless
+ * of attach order — this is backdrop, not foreground.
+ * ------------------------------------------------------------------- */
+class GhostCandleRenderer {
+  constructor(x1, x2, yOpen, yClose, yHigh, yLow, color) {
+    this._x1 = x1; this._x2 = x2;
+    this._yOpen = yOpen; this._yClose = yClose; this._yHigh = yHigh; this._yLow = yLow;
+    this._color = color;
+  }
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (this._x1 === null || this._x2 === null || this._yOpen === null || this._yLow === null) return;
+      const ctx = scope.context;
+      const hb = positionsBox(this._x1, this._x2, scope.horizontalPixelRatio);
+      const vBody = positionsBox(this._yOpen, this._yClose, scope.verticalPixelRatio);
+      ctx.fillStyle = this._color;
+      ctx.fillRect(hb.position, vBody.position, hb.length, Math.max(vBody.length, scope.verticalPixelRatio));
+      const midX = Math.round(hb.position + hb.length / 2 - scope.horizontalPixelRatio / 2);
+      const vWick = positionsBox(this._yHigh, this._yLow, scope.verticalPixelRatio);
+      ctx.fillRect(midX, vWick.position, Math.max(1, Math.round(scope.horizontalPixelRatio)), vWick.length);
+    });
+  }
+}
+
+class GhostCandlePaneView {
+  constructor(source) {
+    this._source = source;
+    this._x1 = null; this._x2 = null; this._yOpen = null; this._yClose = null; this._yHigh = null; this._yLow = null;
+  }
+  update() {
+    const series = this._source.series, timeScale = this._source.chart.timeScale();
+    this._x1 = timeScale.timeToCoordinate(this._source.t0);
+    this._x2 = timeScale.timeToCoordinate(this._source.t1);
+    this._yOpen = series.priceToCoordinate(this._source.open);
+    this._yClose = series.priceToCoordinate(this._source.close);
+    this._yHigh = series.priceToCoordinate(this._source.high);
+    this._yLow = series.priceToCoordinate(this._source.low);
+  }
+  renderer() {
+    return new GhostCandleRenderer(this._x1, this._x2, this._yOpen, this._yClose, this._yHigh, this._yLow, this._source.color);
+  }
+  zOrder() { return 'bottom'; }
+}
+
+class GhostCandlePrimitive {
+  constructor(t0, t1, open, high, low, close, color) {
+    this.t0 = t0; this.t1 = t1; this.open = open; this.high = high; this.low = low; this.close = close;
+    this.color = color;
+    this._paneViews = [new GhostCandlePaneView(this)];
+  }
+  attached({ chart, series }) { this.chart = chart; this.series = series; }
+  detached() { this.chart = undefined; this.series = undefined; }
+  updateAllViews() { this._paneViews.forEach((v) => v.update()); }
+  paneViews() { return this._paneViews; }
+}
+
+/* ---------------------------------------------------------------------
+ * Volume Profile primitive — a price-bucketed volume histogram, drawn as
+ * horizontal bars anchored to the pane's own LEFT edge at a FIXED pixel
+ * position (0), unlike every other overlay here which is anchored to a
+ * real bar time — a profile bucket has no time of its own, only a price
+ * range and a share of volume. Each bucket's own bar length is
+ * volume_frac (already computed in Python, 0..1 with the busiest bucket
+ * at exactly 1.0) times a fixed fraction of the PANE's own current
+ * width (mediaSize.width, the same "reach the pane's own edge" value
+ * RectangleRenderer's extendToEdge path already reads), so bars stay
+ * proportional to each other at any zoom/pane-width instead of drifting
+ * the way a fixed pixel width would. zOrder 'bottom' keeps every bar
+ * behind the real candlestick series, same as GhostCandlePrimitive above
+ * — this is background context, never allowed to hide a candle's own
+ * body. Python pre-sorts nothing here (bucket order doesn't matter for
+ * drawing), and pre-computes each bucket's own fill color (POC bucket
+ * highlighted, the rest a uniform dim tone) — this stays as dumb a
+ * renderer as RectanglePrimitive itself.
+ * ------------------------------------------------------------------- */
+class VolumeProfileRenderer {
+  constructor(buckets, maxWidthFraction) {
+    this._buckets = buckets;
+    this._maxWidthFraction = maxWidthFraction;
+  }
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      const ctx = scope.context;
+      const maxWidthMediaPx = scope.mediaSize.width * this._maxWidthFraction;
+      for (const b of this._buckets) {
+        if (b.y1 === null || b.y2 === null) continue;
+        const v = positionsBox(b.y1, b.y2, scope.verticalPixelRatio);
+        const h = positionsBox(0, Math.max(1, b.volumeFrac * maxWidthMediaPx), scope.horizontalPixelRatio);
+        ctx.fillStyle = b.color;
+        ctx.fillRect(h.position, v.position, h.length, v.length);
+      }
+    });
+  }
+}
+
+class VolumeProfilePaneView {
+  constructor(source) { this._source = source; this._buckets = []; }
+  update() {
+    const series = this._source.series;
+    this._buckets = this._source.buckets.map((b) => ({
+      y1: series.priceToCoordinate(b.price_high),
+      y2: series.priceToCoordinate(b.price_low),
+      volumeFrac: b.volume_frac,
+      color: b.color,
+    }));
+  }
+  renderer() { return new VolumeProfileRenderer(this._buckets, this._source.maxWidthFraction); }
+  zOrder() { return 'bottom'; }
+}
+
+class VolumeProfilePrimitive {
+  constructor(buckets, maxWidthFraction) {
+    this.buckets = buckets;
+    this.maxWidthFraction = maxWidthFraction || 0.22;
+    this._paneViews = [new VolumeProfilePaneView(this)];
+  }
+  attached({ chart, series }) { this.chart = chart; this.series = series; }
+  detached() { this.chart = undefined; this.series = undefined; }
+  updateAllViews() { this._paneViews.forEach((v) => v.update()); }
+  paneViews() { return this._paneViews; }
+}
+
+/* ---------------------------------------------------------------------
+ * Horizontal line SEGMENT primitive — BSL/SSL/EQH/EQL/EQ50-style levels,
+ * drawn from their origin candle to wherever they get invalidated (a later
+ * candle's wick crossing back through the exact price), instead of
+ * native createPriceLine()'s always-full-chart-width line. Same
+ * draw/paneView split as RectanglePrimitive, with a manual text label
+ * (native price lines get one for free on the axis; a bounded segment
+ * doesn't belong on the axis at all, so the label is drawn in-pane at the
+ * segment's right end instead — closer to how the original Plotly version
+ * annotated these anyway). Python computes t0/t1 (see _line_stop_time) —
+ * this only draws whatever span it's given. */
+// this._color is always "rgba(r,g,b,a)" (see _hex_to_rgba in app.py) —
+// swap just the trailing alpha to build the transparent end of a gradient.
+function _rgbaAlpha(rgba, alpha) {
+  return rgba.replace(/[\d.]+\)$/, alpha + ')');
+}
+
+class HLineRenderer {
+  constructor(p1, p2, color, label, lineWidth, dashed) {
+    this._p1 = p1; this._p2 = p2; this._color = color; this._label = label;
+    this._lineWidth = lineWidth || 1; this._dashed = dashed !== false;
+  }
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (this._p1.x === null || this._p1.y === null || this._p2.x === null) return;
+      const ctx = scope.context;
+      const y = this._p1.y * scope.verticalPixelRatio;
+      const x1 = this._p1.x * scope.horizontalPixelRatio;
+      // The recommended trade's own Entry/SL/TP (the only non-dashed lines
+      // this renderer draws) always reach the pane's own right edge —
+      // asked for as "stretch it"; a literal drag handle would need a
+      // round-trip back into Python session state, so this is the static
+      // version instead: it re-resolves to the current right border on
+      // every pan/zoom, which reads the same as "still open, all the way
+      // to now" without needing to be draggable.
+      const x2 = this._dashed ? this._p2.x * scope.horizontalPixelRatio : scope.bitmapSize.width;
+      ctx.save();
+      if (this._dashed) {
+        ctx.strokeStyle = this._color;
+        ctx.lineWidth = Math.max(1, Math.round(this._lineWidth * scope.verticalPixelRatio));
+        ctx.setLineDash([4 * scope.horizontalPixelRatio, 3 * scope.horizontalPixelRatio]);
+        ctx.beginPath();
+        ctx.moveTo(x1, y);
+        ctx.lineTo(x2, y);
+        ctx.stroke();
+      } else {
+        // Transparent at the real entry candle, solid at the right edge —
+        // a trade that's been open since way back in history reads as a
+        // faint band that builds toward "now," instead of a uniform-weight
+        // line that looks the same whether it opened yesterday or three
+        // years ago. Same idea as the FVG/OB zone fills, just a thin band
+        // instead of the zone's own full price range.
+        const gx1 = Math.min(x1, x2), gx2 = Math.max(x1, x2);
+        const grad = ctx.createLinearGradient(gx1, 0, gx2, 0);
+        grad.addColorStop(0, _rgbaAlpha(this._color, 0));
+        grad.addColorStop(1, this._color);
+        const bandHalf = 5 * scope.verticalPixelRatio;
+        ctx.fillStyle = grad;
+        ctx.fillRect(gx1, y - bandHalf, gx2 - gx1, bandHalf * 2);
+        // A crisp core line on top, same gradient, with the existing glow
+        // — keeps the exact price level readable even where the band's
+        // own color is still faint near the old entry candle.
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = Math.max(1, Math.round(this._lineWidth * scope.verticalPixelRatio));
+        ctx.shadowColor = this._color;
+        ctx.shadowBlur = 10 * scope.verticalPixelRatio;
+        ctx.beginPath();
+        ctx.moveTo(x1, y);
+        ctx.lineTo(x2, y);
+        ctx.stroke();
+        // A second pass darkens/solidifies the glow's own core — shadowBlur
+        // alone leaves the center stroke looking the same as a plain line
+        // with a faint aura; stroking twice (glow still active) builds up
+        // real visible density right on the line itself.
+        ctx.stroke();
+      }
+      if (this._label) {
+        ctx.setLineDash([]);
+        // Bold, solid lines (the recommended trade's own Entry/SL/TP) get a
+        // bigger label too — same "make it obvious" treatment as the
+        // MA+FVG border: the ONE actionable pick shouldn't read at the
+        // same visual weight as every other reference line on the chart.
+        const fontPx = this._dashed ? 10 : 12;
+        ctx.font = `${this._dashed ? '' : 'bold '}${Math.round(fontPx * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
+        ctx.fillStyle = this._color;
+        ctx.textBaseline = 'bottom';
+        // Right-anchored at the max end, not left-anchored at the min:
+        // t0 is the setup's real entry candle, which for a trade that's
+        // been open a while can sit far to the left of "now." Anchoring
+        // the label there buries it off in old history instead of next
+        // to the price action the reader is actually looking at — the
+        // max end now always resolves to the right edge itself for solid
+        // lines (see x2 above). textAlign 'right' draws the text growing
+        // back toward x1 instead of off the right edge of the pane.
+        ctx.textAlign = 'right';
+        ctx.fillText(this._label, Math.max(x1, x2) - 4 * scope.horizontalPixelRatio, y - 2 * scope.verticalPixelRatio);
+      }
+      ctx.restore();
+    });
+  }
+}
+
+class HLinePaneView {
+  constructor(source) { this._source = source; this._p1 = { x: null, y: null }; this._p2 = { x: null, y: null }; }
+  update() {
+    const chart = this._source.chart, series = this._source.series;
+    const y = series.priceToCoordinate(this._source.price);
+    const x1 = resolveTimeCoordinate(chart, series, this._source.t0);
+    const x2 = resolveTimeCoordinate(chart, series, this._source.t1);
+    this._p1 = { x: x1, y }; this._p2 = { x: x2, y };
+  }
+  renderer() { return new HLineRenderer(this._p1, this._p2, this._source.color, this._source.label, this._source.lineWidth, this._source.dashed); }
+}
+
+class HLinePrimitive {
+  constructor(t0, t1, price, color, label, lineWidth, dashed) {
+    this.t0 = t0; this.t1 = t1; this.price = price; this.color = color; this.label = label;
+    this.lineWidth = lineWidth || 1; this.dashed = dashed !== false;
+    this._paneViews = [new HLinePaneView(this)];
+  }
+  attached({ chart, series }) { this.chart = chart; this.series = series; }
+  detached() { this.chart = undefined; this.series = undefined; }
+  updateAllViews() { this._paneViews.forEach((v) => v.update()); }
+  paneViews() { return this._paneViews; }
+}
+
+/* ---------------------------------------------------------------------
+ * Measure tool — a purely client-side ruler between two user-picked
+ * points (the "📏 Measure" button below), never touches Python at all.
+ * p2 starts null (only the first click has landed yet): draws a small dot
+ * so there's visible feedback that the click registered, before there's
+ * anything to actually draw a line between. Once p2 is set it becomes a
+ * solid diagonal line (an arbitrary two-point ruler, unlike every other
+ * primitive on this page which is either axis-aligned or horizontal) with
+ * a label at the midpoint — price delta, %, and bars-between computed from
+ * bar_seconds rather than a maintained index map, since bars are evenly
+ * spaced and that's already available on currentOhlcMeta.
+ * ------------------------------------------------------------------- */
+class MeasureRenderer {
+  constructor(p1, p2, color, label) {
+    this._p1 = p1; this._p2 = p2; this._color = color; this._label = label;
+  }
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (this._p1.x === null || this._p1.y === null) return;
+      const ctx = scope.context;
+      const hr = scope.horizontalPixelRatio, vr = scope.verticalPixelRatio;
+      const x1 = this._p1.x * hr, y1 = this._p1.y * vr;
+      ctx.save();
+      if (this._p2 === null || this._p2.x === null || this._p2.y === null) {
+        ctx.fillStyle = this._color;
+        ctx.beginPath();
+        ctx.arc(x1, y1, 3 * vr, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+        return;
+      }
+      const x2 = this._p2.x * hr, y2 = this._p2.y * vr;
+      ctx.strokeStyle = this._color;
+      ctx.lineWidth = Math.max(1, Math.round(1.5 * vr));
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+      ctx.fillStyle = this._color;
+      [[x1, y1], [x2, y2]].forEach(([x, y]) => {
+        ctx.beginPath();
+        ctx.arc(x, y, 3 * vr, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      if (this._label) {
+        const midX = (x1 + x2) / 2, midY = (y1 + y2) / 2;
+        ctx.font = `${Math.round(11 * vr)}px -apple-system, sans-serif`;
+        const lines = this._label.split('\n');
+        const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 10 * hr;
+        const lh = 13 * vr;
+        const boxH = lh * lines.length + 6 * vr;
+        const boxX = midX + 8 * hr, boxY = midY - boxH / 2;
+        ctx.fillStyle = 'rgba(28,28,30,0.85)';
+        ctx.strokeStyle = this._color;
+        ctx.lineWidth = 1;
+        ctx.fillRect(boxX, boxY, w, boxH);
+        ctx.strokeRect(boxX, boxY, w, boxH);
+        ctx.fillStyle = this._color;
+        ctx.textBaseline = 'top';
+        lines.forEach((l, i) => ctx.fillText(l, boxX + 5 * hr, boxY + 3 * vr + i * lh));
+      }
+      ctx.restore();
+    });
+  }
+}
+
+class MeasurePaneView {
+  constructor(source) { this._source = source; this._p1 = { x: null, y: null }; this._p2 = null; }
+  update() {
+    const series = this._source.series, timeScale = this._source.chart.timeScale();
+    this._p1 = {
+      x: timeScale.timeToCoordinate(this._source.p1.time),
+      y: series.priceToCoordinate(this._source.p1.price),
+    };
+    this._p2 = this._source.p2 && {
+      x: timeScale.timeToCoordinate(this._source.p2.time),
+      y: series.priceToCoordinate(this._source.p2.price),
+    };
+  }
+  renderer() { return new MeasureRenderer(this._p1, this._p2, this._source.color, this._source.label); }
+}
+
+class MeasurePrimitive {
+  constructor(p1, p2, color, label) {
+    this.p1 = p1; this.p2 = p2 || null; this.color = color; this.label = label || null;
+    this._paneViews = [new MeasurePaneView(this)];
+  }
+  attached({ chart, series, requestUpdate }) { this.chart = chart; this.series = series; this._requestUpdate = requestUpdate; }
+  detached() { this.chart = undefined; this.series = undefined; }
+  updateAllViews() { this._paneViews.forEach((v) => v.update()); }
+  paneViews() { return this._paneViews; }
+  setPoint2(p2, label) { this.p2 = p2; this.label = label || null; if (this._requestUpdate) this._requestUpdate(); }
+}
+
+function formatMeasurePrice(v) {
+  return Math.abs(v) < 10 ? v.toFixed(5) : v.toFixed(2);
+}
+
+function measureLabel(p1, p2) {
+  const diff = p2.price - p1.price;
+  const pct = (diff / p1.price) * 100;
+  const barSeconds = currentOhlcMeta.bar_seconds;
+  const bars = barSeconds ? Math.round(Math.abs(p2.time - p1.time) / barSeconds) : null;
+  const lines = [
+    `${diff >= 0 ? '+' : ''}${formatMeasurePrice(diff)}  (${pct >= 0 ? '+' : ''}${pct.toFixed(3)}%)`,
+  ];
+  if (bars !== null) lines.push(`${bars} bar${bars === 1 ? '' : 's'}`);
+  return lines.join('\n');
+}
+
+/* ---------------------------------------------------------------------
+ * Time-axis labels. Every bar's `time` is pre-encoded by Python as
+ * "fake-UTC" seconds — the target timezone's (America/New_York, to match
+ * ICT convention) wall-clock digits, packed into a UTCTimestamp as if they
+ * were already UTC. Rendered with getUTC*() below, that trick alone makes
+ * default tick labels show correct NY time with zero library-level
+ * timezone configuration (lightweight-charts has none).
+ *
+ * That trick stops working when a kill-zone session filter is active,
+ * though: axis positions there are sequential bar indices (0,1,2,...), not
+ * real elapsed time at all — gap-free display of e.g. "NY AM only" means
+ * consecutive bars sit one tick apart on the axis regardless of the
+ * 22-hour real gap between one session's close and the next day's open.
+ * Python sends a synthetic-second -> label string map for exactly that
+ * case (tick_labels); this checks that map first and only falls back to
+ * the tier-aware formatting below when no explicit label was given.
+ *
+ * axisTickFormat is tier-aware via the tickMarkType the library itself
+ * passes in (Year/Month/DayOfMonth/Time) — it already knows, from tick
+ * spacing, exactly which ticks land on a month boundary vs. an ordinary
+ * day/hour tick, so the month name only ever renders on the tick that
+ * actually crosses into a new month (typically the 1st), and every other
+ * tick just shows a day number or "HH:MM". The old version formatted
+ * every single tick as "Mon D, HH:MM" regardless of type, which is why
+ * the month name used to repeat on every tick instead of just once.
+ * fullTimeFormat (full "Mon D, HH:MM") is kept for the crosshair readout,
+ * which always wants complete context, not a tier-appropriate fragment.
+ * ------------------------------------------------------------------- */
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function fullTimeFormat(sec) {
+  const d = new Date(sec * 1000);
+  const hh = String(d.getUTCHours()).padStart(2, '0'), mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()}, ${hh}:${mm}`;
+}
+function axisTickFormat(sec, tickMarkType) {
+  const d = new Date(sec * 1000);
+  switch (tickMarkType) {
+    case LC.TickMarkType.Year:
+      return String(d.getUTCFullYear());
+    case LC.TickMarkType.Month:
+      return MONTH_NAMES[d.getUTCMonth()];
+    case LC.TickMarkType.DayOfMonth:
+      return String(d.getUTCDate());
+    default: {
+      const hh = String(d.getUTCHours()).padStart(2, '0'), mm = String(d.getUTCMinutes()).padStart(2, '0');
+      return `${hh}:${mm}`;
+    }
+  }
+}
+let tickLabels = {};
+chart.applyOptions({
+  timeScale: {
+    tickMarkFormatter: (time, tickMarkType) => tickLabels[String(time)] || axisTickFormat(time, tickMarkType),
+  },
+  localization: { timeFormatter: (time) => tickLabels[String(time)] || fullTimeFormat(time) },
+});
+
+/* ---------------------------------------------------------------------
+ * Incremental vs. full update decision.
+ *
+ * Python already knows, at the moment it builds each call, whether this
+ * is a genuinely new dataset (ticker/timeframe/session/log-scale changed)
+ * or just a live price tick on the SAME dataset — that's cheap for it to
+ * track and expensive to re-derive here by diffing arrays. So Python
+ * sends an explicit `fingerprint` string that only changes on a real
+ * dataset change; matching it against the last-seen one is all this needs.
+ * ------------------------------------------------------------------- */
+let lastFingerprint = null;
+let activeRectangles = [];
+let activeHLines = [];
+let activeGhostCandles = [];
+let activeVolumeProfile = null;
+// Measure-tool state — deliberately separate from the arrays above:
+// clearOverlays() runs on every data re-render (new bars, ticker switch),
+// and a user's own measurements should survive that, not vanish the next
+// time a live tick comes in. Only the explicit "Measure" toggle-off or a
+// right-click on the chart touches these.
+let measureMode = false;
+let measureA = null;       // {time, price} once the first click of a pair has landed, else null
+let measurePrimitives = []; // completed AND in-progress MeasurePrimitive instances
+
+// Backing state for the crosshair-hover OHLC readout below: the latest
+// render's bars (keyed by time for O(1) lookup) and its ticker/source meta,
+// kept around so the crosshairMove subscription — set up once, outside
+// handleRender — always has the current dataset to read from.
+let barsByTime = new Map();
+let currentOhlcMeta = {};
+let lastBar = null;
+
+// Two independent sources now push into the same "current bar" slot —
+// Python's own poll-driven fragment (every 1-8s) and, for crypto, the
+// Binance WS feed below (sub-second). lightweight-charts' series.update()
+// requires non-decreasing time and throws ("Cannot update oldest data")
+// if a call arrives with a time behind what's already applied — which
+// happens for real the moment WS has already advanced to a new bar and
+// the slower poll then reports the previous one. Routing every update
+// through here — reset on each full reload, checked before every partial
+// one — makes whichever source is actually ahead win and silently drops
+// the stale one, instead of either source being able to crash the chart.
+let lastSeriesTime = null;
+function safeSeriesUpdate(bar, volBar) {
+  if (lastSeriesTime !== null && bar.time < lastSeriesTime) return;
+  candleSeries.update(bar);
+  if (volBar) volumeSeries.update(volBar);
+  lastSeriesTime = bar.time;
+}
+
+/* ---------------------------------------------------------------------
+ * Live tick feed — Binance's public kline WebSocket, connected to
+ * DIRECTLY from the browser. This is the actual mechanism behind "how
+ * does TradingView update so fast": a push feed reacts the instant a
+ * trade happens on its own persistent connection, instead of the client
+ * periodically asking "anything new?" the way every other data path in
+ * this app (Python's own poll-driven fragments) has to. Binance is the
+ * one provider in this app's chain that exposes a free public WS feed —
+ * crypto tickers (…-USD) only, everything else keeps riding the
+ * poll-based path Python already drives.
+ *
+ * Deliberately layered ON TOP of, not instead of, the existing
+ * poll-driven updates: Python's own fetch still owns full reloads
+ * (ticker/TF switches, historical bars) and keeps correcting the last
+ * bar every 1-8s regardless — if the WS drops or Binance is unreachable,
+ * nothing breaks, the chart just falls back to exactly the cadence it
+ * already had.
+ * ------------------------------------------------------------------- */
+// Same trick as Python's own _ny_fake_utc_seconds (see app.py) — the WS
+// feed's timestamps are genuine UTC (Binance), but every bar this chart
+// already has came from Python re-labeling NY wall-clock digits as if
+// they were UTC (lightweight-charts has no timezone setting of its own).
+// Skipping this on the WS path would place every live tick ~4-5h off the
+// historical candles it's supposed to be updating — confirmed by working
+// through exactly what _ny_fake_utc_seconds does before writing this,
+// not by trial and error against a visibly-wrong chart.
+const NY_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+});
+function nyFakeUtcSeconds(realUtcMs) {
+  const parts = NY_FMT.formatToParts(new Date(realUtcMs));
+  const get = (type) => parseInt(parts.find((p) => p.type === type).value, 10);
+  let hour = get('hour');
+  if (hour === 24) hour = 0; // some engines report midnight as "24" with hour12:false
+  return Math.floor(Date.UTC(get('year'), get('month') - 1, get('day'), hour, get('minute'), get('second')) / 1000);
+}
+
+const BINANCE_WS_INTERVAL = {
+  '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+  '1h': '1h', '4h': '4h', '1D': '1d', '1W': '1w', '1M': '1M',
+};
+let liveWs = null;
+let liveWsKey = null; // "SYMBOL|interval" currently subscribed, or null
+
+function closeLiveFeed() {
+  if (liveWs) {
+    try { liveWs.close(); } catch (e) { /* already closing/closed */ }
+    liveWs = null;
+  }
+  liveWsKey = null;
+}
+
+function connectLiveFeed(tickerSymbol, tfInterval) {
+  if (!tickerSymbol || !tickerSymbol.toUpperCase().endsWith('-USD')) { closeLiveFeed(); return; }
+  const bnInterval = BINANCE_WS_INTERVAL[tfInterval];
+  if (!bnInterval) { closeLiveFeed(); return; }
+  const bnSymbol = tickerSymbol.toUpperCase().replace('-USD', '') + 'USDT'; // BTC-USD -> BTCUSDT
+  const key = bnSymbol + '|' + bnInterval;
+  if (key === liveWsKey) return; // already on exactly this stream — most renders land here
+  closeLiveFeed();
+  liveWsKey = key;
+  const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${bnSymbol.toLowerCase()}@kline_${bnInterval}`);
+  liveWs = ws;
+  ws.onmessage = (event) => {
+    if (ws !== liveWs) return; // a newer connection already replaced this one — stale message, drop it
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return; }
+    const k = msg && msg.k;
+    if (!k) return;
+    const bar = {
+      time: nyFakeUtcSeconds(k.t),
+      open: parseFloat(k.o), high: parseFloat(k.h), low: parseFloat(k.l), close: parseFloat(k.c),
+    };
+    const volume = parseFloat(k.v) || 0;
+    safeSeriesUpdate(bar, {
+      time: bar.time, value: volume,
+      color: bar.close >= bar.open ? 'rgba(48,209,88,0.5)' : 'rgba(255,69,58,0.5)',
+    });
+    const fullBar = Object.assign({ volume }, bar);
+    barsByTime.set(bar.time, fullBar);
+    lastBar = fullBar;
+    // Keeps the "closes in" countdown's bar boundary pinned to Binance's own
+    // kline clock instead of Python's — Yahoo's polled forming-bar data (the
+    // only other source of forming_bar_time) can lag true wall-clock time by
+    // tens of seconds, which left the countdown stuck at 0:00 across a bar
+    // rollover until Python's next poll happened to catch up (confirmed live
+    // on BTC-USD/1m before adding this). bar_seconds itself is left alone —
+    // it's the fixed TF duration Python already sends and Binance's interval
+    // string maps to the exact same duration, nothing to resync there.
+    formingBarTime = bar.time;
+    renderOhlc(lastBar, false);
+  };
+  // No reconnect-on-error loop — a dropped WS just means this chart quietly
+  // falls back to Python's own poll cadence until the next full render
+  // calls connectLiveFeed() again (e.g. the active-panel's 1s tick), which
+  // opens a fresh connection on its own.
+  ws.onerror = () => {};
+}
+
+function renderOhlc(bar, hovering) {
+  if (!bar) return;
+  const up = bar.close >= bar.open;
+  const color = up ? '#30D158' : '#FF453A';
+  const ohlc = currentOhlcMeta;
+  // Hovering a historical candle shows that candle's real close, which
+  // isn't "the price" the way the live last bar's close is — dim the C
+  // label so it can't be mistaken for a live tick, and swap the source
+  // caption to say what's actually being shown.
+  document.getElementById('ohlcOverlay').innerHTML =
+    `<span class="sym" style="color:${color}">${ohlc.ticker || ''}</span>` +
+    `<span class="lbl"> &nbsp;O</span> <span class="val">${bar.open.toFixed(2)}</span>` +
+    `<span class="lbl"> &nbsp;H</span> <span class="val">${bar.high.toFixed(2)}</span>` +
+    `<span class="lbl"> &nbsp;L</span> <span class="val">${bar.low.toFixed(2)}</span>` +
+    `<span class="lbl"> &nbsp;C</span> <span class="val" style="color:${hovering ? '#98989d' : color}">${bar.close.toFixed(2)}</span>` +
+    (hovering ? `<span class="src"> &nbsp;·&nbsp; hover</span>`
+               : (ohlc.source ? `<span class="src"> &nbsp;·&nbsp; ${ohlc.source}</span>` : ''));
+  renderCountdown();
+}
+
+// Ticks the "closes in" readout for the live forming bar. Independent of
+// renderOhlc's own rebuilds (called there too, so it's never stale after a
+// real update) because it also needs to advance once a second on its own —
+// Python's poll cadence is 10-120s (1s only for the selected panel), far
+// too coarse for a per-second countdown by itself. bar_seconds comes from
+// app.py (only set for the native intraday TFs that track a forming bar at
+// all — see forming_bar_ts in app.py); no bar_seconds or no formingBarTime
+// means there's nothing currently forming to count down, so it stays blank
+// rather than showing a stale or meaningless value.
+function renderCountdown() {
+  const el = document.getElementById('countdownOverlay');
+  const barSeconds = currentOhlcMeta.bar_seconds;
+  if (formingBarTime === null || !barSeconds) { el.textContent = ''; return; }
+  const nowAxis = nyFakeUtcSeconds(Date.now());
+  const remaining = Math.max(0, (formingBarTime + barSeconds) - nowAxis);
+  const mm = Math.floor(remaining / 60);
+  const ss = remaining % 60;
+  el.innerHTML = `closes in <span class="cdval">${mm}:${String(ss).padStart(2, '0')}</span>`;
+}
+setInterval(renderCountdown, 1000);
+
+// TradingView's own documented pattern (subscribeCrosshairMove) — swap the
+// corner readout to whatever candle the crosshair is over, falling back to
+// the latest bar the instant the mouse leaves the chart. This is the one
+// piece of the readout that's genuinely cheap to make interactive: no
+// server round-trip, just a Map lookup against data already on the client.
+chart.subscribeCrosshairMove((param) => {
+  if (!param || param.time === undefined) {
+    renderOhlc(lastBar, false);
+    return;
+  }
+  const bar = barsByTime.get(param.time);
+  renderOhlc(bar || lastBar, !!bar);
+});
+
+// A plain click (not a pan-drag) reports "this chart got picked" up to
+// Streamlit as the component's return value. Sending Date.now() rather
+// than a fixed value guarantees Python sees a genuinely new value on every
+// click, including clicking the SAME already-selected chart again — a
+// value that never changes would never re-fire the widget-changed check on
+// the Python side.
+chart.subscribeClick((param) => {
+  if (!param) return;
+  if (measureMode && param.time !== undefined && param.point) {
+    const price = candleSeries.coordinateToPrice(param.point.y);
+    if (price !== null) {
+      const point = { time: param.time, price };
+      if (!measureA) {
+        // First click of a pair — drop a dot marker so there's immediate
+        // feedback, then wait for the second click to complete the line.
+        measureA = point;
+        const dot = new MeasurePrimitive(point, null, '#0A84FF', null);
+        candleSeries.attachPrimitive(dot);
+        measurePrimitives.push(dot);
+      } else {
+        const pending = measurePrimitives[measurePrimitives.length - 1];
+        pending.setPoint2(point, measureLabel(measureA, point));
+        measureA = null;
+      }
+    }
+  }
+  // Still reported even while measuring — "this panel got clicked" and
+  // "a measurement point got placed" aren't mutually exclusive, and the
+  // panel-select behavior is harmless to keep regardless of tool mode.
+  sendToStreamlit('streamlit:setComponentValue', { value: Date.now(), dataType: 'json' });
+});
+
+document.getElementById('measureBtn').addEventListener('click', () => {
+  measureMode = !measureMode;
+  document.getElementById('measureBtn').classList.toggle('active', measureMode);
+  container.style.cursor = measureMode ? 'crosshair' : '';
+  if (!measureMode && measureA) {
+    // Turning the tool off mid-pick — drop the dangling first-click dot
+    // rather than leaving an orphaned point nothing will ever complete.
+    const dangling = measurePrimitives.pop();
+    if (dangling) candleSeries.detachPrimitive(dangling);
+    measureA = null;
+  }
+});
+
+// Right-click = clear, the standard convention for a drawing tool's own
+// "start over" gesture — only intercepted while the tool is actually in
+// use, so the browser's normal context menu still works otherwise.
+container.addEventListener('contextmenu', (e) => {
+  if (!measureMode) return;
+  e.preventDefault();
+  measurePrimitives.forEach((p) => candleSeries.detachPrimitive(p));
+  measurePrimitives = [];
+  measureA = null;
+});
+
+function clearOverlays() {
+  activeRectangles.forEach((r) => candleSeries.detachPrimitive(r));
+  activeRectangles = [];
+  activeHLines.forEach((l) => candleSeries.detachPrimitive(l));
+  activeHLines = [];
+  activeGhostCandles.forEach((g) => candleSeries.detachPrimitive(g));
+  activeGhostCandles = [];
+  if (activeVolumeProfile) {
+    candleSeries.detachPrimitive(activeVolumeProfile);
+    activeVolumeProfile = null;
+  }
+}
+
+function applyOverlays(overlays) {
+  clearOverlays();
+  // Attached first specifically so it sits under everything else added
+  // this same pass too (zOrder 'bottom' already keeps it under the real
+  // candles; this ordering keeps it under FVG/OB rectangles as well).
+  (overlays.ghost_candles || []).forEach((g) => {
+    const ghost = new GhostCandlePrimitive(g.t0, g.t1, g.open, g.high, g.low, g.close, g.color);
+    candleSeries.attachPrimitive(ghost);
+    activeGhostCandles.push(ghost);
+  });
+  if ((overlays.volume_profile || []).length) {
+    activeVolumeProfile = new VolumeProfilePrimitive(overlays.volume_profile);
+    candleSeries.attachPrimitive(activeVolumeProfile);
+  }
+  (overlays.rectangles || []).forEach((r) => {
+    const rect = new RectanglePrimitive(
+      { time: r.t0, price: r.p0 }, { time: r.t1, price: r.p1 }, r.fill, r.border || null, r.label || null,
+      r.border_width || 1, r.fill_to || null, r.extend_to_edge || false
+    );
+    candleSeries.attachPrimitive(rect);
+    activeRectangles.push(rect);
+  });
+  (overlays.price_lines || []).forEach((l) => {
+    const hline = new HLinePrimitive(l.t0, l.t1, l.price, l.color, l.title || '', l.line_width || 1, l.dashed);
+    candleSeries.attachPrimitive(hline);
+    activeHLines.push(hline);
+  });
+  markersHandle.setMarkers(overlays.markers || []);
+}
+
+/* ---------------------------------------------------------------------
+ * Standard indicators (MA/Bollinger overlay the main pane; RSI/MACD each
+ * get their own pane below it via chart.addSeries(type, options,
+ * paneIndex)). Rebuilt from scratch on every render — series/pane creation
+ * is cheap and only runs once per Streamlit interaction, not per frame, so
+ * there's no reason to diff instead of just tearing down and redrawing
+ * whatever's currently enabled. Panes always collapse back down to just
+ * the main one before rebuilding, so toggling RSI/MACD off actually
+ * reclaims the vertical space instead of leaving an empty pane behind.
+ * ------------------------------------------------------------------- */
+let indicatorSeries = [];
+
+function clearIndicators() {
+  indicatorSeries.forEach((s) => {
+    try { chart.removeSeries(s); } catch (e) { /* already gone */ }
+  });
+  indicatorSeries = [];
+  while (chart.panes().length > 1) {
+    chart.removePane(chart.panes().length - 1);
+  }
+}
+
+function applyIndicators(ind) {
+  clearIndicators();
+  if (!ind) return;
+  let nextPane = 1;
+  let numFixedPanes = 0; // RSI/MACD panes, each fixed at FIXED_PANE_PX
+
+  if (ind.rsi && ind.rsi.length) {
+    const s = chart.addSeries(LC.LineSeries, {
+      color: '#BF5AF2', lineWidth: 1, priceLineVisible: false, lastValueVisible: true,
+    }, nextPane);
+    s.setData(ind.rsi);
+    s.createPriceLine({ price: 70, color: 'rgba(255,255,255,0.25)', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: '70' });
+    s.createPriceLine({ price: 30, color: 'rgba(255,255,255,0.25)', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: '30' });
+    indicatorSeries.push(s);
+    nextPane += 1;
+    numFixedPanes += 1;
+  }
+
+  if (ind.macd) {
+    const macdLine = chart.addSeries(LC.LineSeries, { color: '#0A84FF', lineWidth: 1, priceLineVisible: false, lastValueVisible: false }, nextPane);
+    macdLine.setData(ind.macd.macd || []);
+    const signalLine = chart.addSeries(LC.LineSeries, { color: '#FF9F0A', lineWidth: 1, priceLineVisible: false, lastValueVisible: false }, nextPane);
+    signalLine.setData(ind.macd.signal || []);
+    const hist = chart.addSeries(LC.HistogramSeries, { priceLineVisible: false, lastValueVisible: false }, nextPane);
+    hist.setData(ind.macd.histogram || []);
+    indicatorSeries.push(macdLine, signalLine, hist);
+    nextPane += 1;
+    numFixedPanes += 1;
+  }
+
+  // MA/Bollinger share the candles' own price scale ('left') so they
+  // visually line up with price — a new line series on pane 0 defaults to
+  // the 'right' scale, which this chart keeps hidden/unused (rightPriceScale
+  // is disabled at setup), so it would render off-scale without this.
+  //
+  // Two explicit keys (ma20/ma50), not a single ma list — the MA+FVG
+  // strategy (recommender.py) checks both periods independently, and
+  // showing both on the SAME chart the strategy reads them from is the
+  // whole point (see project preference: anything meant for a human to
+  // see should be obvious, not inferred from a sidebar label alone).
+  // Two distinct, high-contrast colors so which line is which reads at a
+  // glance without a legend.
+  if (ind.ma20 && ind.ma20.length) {
+    const s = chart.addSeries(LC.LineSeries, {
+      color: '#FFD60A', lineWidth: 2, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false, title: 'EMA 20',
+    }, 0);
+    s.setData(ind.ma20);
+    indicatorSeries.push(s);
+  }
+  if (ind.ma50 && ind.ma50.length) {
+    const s = chart.addSeries(LC.LineSeries, {
+      color: '#64D2FF', lineWidth: 2, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false, title: 'EMA 50',
+    }, 0);
+    s.setData(ind.ma50);
+    indicatorSeries.push(s);
+  }
+  if (ind.bb) {
+    ['upper', 'basis', 'lower'].forEach((k) => {
+      if (!ind.bb[k] || !ind.bb[k].length) return;
+      const s = chart.addSeries(LC.LineSeries, {
+        color: 'rgba(10,132,255,0.55)', lineWidth: 1, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false,
+      }, 0);
+      s.setData(ind.bb[k]);
+      indicatorSeries.push(s);
+    });
+  }
+
+  // Pane.setHeight() looked plausible but is genuinely broken for
+  // multi-pane charts in this library version — confirmed directly
+  // (measured 0-31.5px on a pane explicitly set to 140-300px, no matter how
+  // long after creation it was called), and it's a known, filed issue
+  // (tradingview/lightweight-charts#1847, #2035). The maintainer's own
+  // fix in both threads: use setStretchFactor instead, and — critically —
+  // use the desired PIXEL value directly AS the stretch factor for
+  // "fixed-size" panes, with the main pane's factor computed as whatever
+  // pixel height is left over. Stretch factors are relative weights, not
+  // literal pixels, but feeding it pixel-shaped numbers this way is
+  // exactly what makes the resulting ratio land on the right pixel split.
+  // All panes must be set together or (per the same threads) the result is
+  // "strange" — the loop below always covers every existing pane, not just
+  // the ones just added.
+  if (numFixedPanes > 0) {
+    const FIXED_PANE_PX = 140;
+    const totalPx = container.clientHeight || 700;
+    const mainPx = Math.max(totalPx - FIXED_PANE_PX * numFixedPanes, 100);
+    chart.panes().forEach((p, i) => {
+      p.setStretchFactor(i === 0 ? mainPx : FIXED_PANE_PX);
+    });
+  }
+}
+
+function handleRender(args) {
+  if (!args) return;
+  const { bars, fingerprint, overlays, options, height, tick_labels, indicators } = args;
+  if (height) { lastFrameHeight = height; setFrameHeight(height); }
+
+  tickLabels = tick_labels || {};
+  volumeSeries.applyOptions({ visible: !options || options.volume !== false });
+  document.body.classList.toggle('chart-selected', !!(options && options.selected));
+  // The mini HTF/LTF reference charts pass this — plain candles at a
+  // glance, no O/H/L/C/source heading competing with the main chart's
+  // own for space. See the .hide-ohlc rule below.
+  document.body.classList.toggle('hide-ohlc', !!(options && options.hide_ohlc));
+  candleWidthFactor = (options && options.candle_width_factor) || 1;
+
+  const noDataEl = document.getElementById('noDataOverlay');
+  const errorMessage = options && options.error_message;
+  noDataEl.style.display = errorMessage ? 'flex' : 'none';
+  if (errorMessage) noDataEl.querySelector('span').textContent = errorMessage;
+
+  const isFullReload = fingerprint !== lastFingerprint;
+  lastFingerprint = fingerprint;
+  // Resync detection: is Python's own "did I already send full data for
+  // this fingerprint" belief actually true for THIS frontend instance?
+  //
+  // Tempting but WRONG first attempt (caught by testing, not left in):
+  // comparing against isFullReload above. An iframe/component remount
+  // resets ALL of this frontend's module state at once, INCLUDING
+  // lastFingerprint back to null — so on the very next render after a
+  // remount, isFullReload is ALREADY true (fingerprint !== null), same as
+  // any genuine full reload. That's exactly why it's the wrong signal:
+  // it can't distinguish "genuinely fresh data" from "fresh frontend,
+  // stale data" — in BOTH cases isFullReload reads true, but only one of
+  // them actually received the full bars array, because Python decides
+  // that independently, server-side, from st.session_state — which
+  // persists right through a remount that wipes this frontend's own
+  // memory. Confirmed directly as a real failure mode this way: switching
+  // timeframes left the candle series holding only the last history bar
+  // plus the live bar (exactly bars[-2:], the incremental-tail payload,
+  // silently standing in for the whole dataset) — with THIS frontend's
+  // own isFullReload reading true the whole time, since it had no prior
+  // fingerprint to compare against.
+  //
+  // The only way to actually catch the mismatch: have Python say what it
+  // decided (args.ohlc.is_full_reload, opt-in — only the main chart's own
+  // call site sets it; see app.py's _CHART_NEEDS_FULL_RELOAD comment) and
+  // compare THAT against this frontend's own ground truth — barsByTime,
+  // checked BEFORE this render's own merge below mutates it, so it
+  // reflects whatever was actually cached walking in. Strict === false
+  // (not falsy) so call sites that never opt in (mini panels, the
+  // no-data path) — where args.ohlc.is_full_reload is simply undefined —
+  // are correctly exempt rather than matching by accident.
+  const pythonSaysFullReload = args.ohlc ? args.ohlc.is_full_reload : undefined;
+  const neededResyncBeforeThisRender = pythonSaysFullReload === false && barsByTime.size === 0 && bars.length > 0;
+  // What actually governs setData() vs. a last-bar-only patch below, and
+  // whether barsByTime gets rebuilt vs. merged — NOT plain isFullReload.
+  // Confirmed directly as a second bug on top of the first: the corrective
+  // rerun app.py's own _CHART_NEEDS_FULL_RELOAD handling triggers DOES
+  // arrive with the genuinely full bars array and is_full_reload:true —
+  // but by then THIS frontend's own lastFingerprint already got set to the
+  // current fingerprint on the FAILED render right before it (line above
+  // runs unconditionally, every render), so isFullReload reads false for
+  // the corrective render too, routing the full array through the
+  // last-bar-only patch branch and discarding everything but the last
+  // element anyway. Trusting Python's explicit is_full_reload whenever the
+  // caller opted in (main chart only) sidesteps the frontend's own
+  // fingerprint bookkeeping entirely for this decision; falls back to
+  // isFullReload unchanged for every call site that never opts in (mini
+  // panels, the no-data path), matching their existing behavior exactly.
+  const effectiveFullReload = pythonSaysFullReload !== undefined ? pythonSaysFullReload : isFullReload;
+
+  // Only seed from Python's default on an actual new dataset — otherwise
+  // this would stomp the user's own corner-button clicks back to
+  // arithmetic on every unrelated Streamlit rerun (a TF click, a layer
+  // checkbox), since args.options.log_scale never changes on the Python
+  // side once the sidebar checkbox was removed in favor of this toggle.
+  if (isFullReload) {
+    isLogScale = !!(options && options.log_scale);
+  }
+  applyScaleMode();
+
+  // color/borderColor/wickColor are per-bar overrides (CandlestickSeries
+  // supports these natively) — only ever set by Python for backfill
+  // anchor bars (see _render_chart's backfill block), made fully
+  // transparent so the bar still occupies a real, scrollable slot in the
+  // series without being visible: the actual visible shape for that
+  // stretch is drawn correctly-widthed by a ghost-candle primitive
+  // instead, since a real series can't render one bar wider than another.
+  const candleBars = bars.map((b) => {
+    const c = { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close };
+    if (b.color !== undefined) { c.color = b.color; c.borderColor = b.borderColor; c.wickColor = b.wickColor; }
+    return c;
+  });
+  const volBars = bars.map((b) => ({
+    time: b.time, value: b.volume || 0,
+    color: b.color !== undefined ? b.color : (b.close >= b.open ? 'rgba(48,209,88,0.5)' : 'rgba(255,69,58,0.5)'),
+  }));
+
+  // Overlays/indicators are rebuilt every render, independent of
+  // isFullReload — a layer checkbox toggling on/off, or the
+  // mitigated/opacity settings changing, doesn't touch the underlying
+  // dataset (fingerprint stays the same, correctly keeping the user's
+  // pan/zoom), but the drawn overlays still need to reflect the new
+  // selection every time. Detaching and reattaching a few dozen primitives
+  // is cheap — this only runs once per Streamlit interaction, nowhere near
+  // a per-frame cost.
+  applyOverlays(overlays || {});
+  applyIndicators(indicators || {});
+
+  if (effectiveFullReload) {
+    // A ticker/TF switch used to always hand the price axis back to
+    // autoscale, discarding any manual Y-zoom (drag/scroll on the price
+    // axis) the user had set — setData() rebuilds the series, and the
+    // default autoScale:true then just refits to whatever the NEW
+    // timeframe's data happens to span. Capture the current manual range
+    // (if the user actually zoomed the price axis away from autoscale —
+    // priceScale().options().autoScale reports which mode it's in) BEFORE
+    // the reload, and reapply it after, so switching timeframes keeps
+    // whatever price band you were looking at instead of snapping back to
+    // "fit everything." Only kicks in when the user genuinely zoomed the Y
+    // axis by hand; ordinary autoscale behavior (the default) is untouched.
+    const priceScale = candleSeries.priceScale();
+    const wasManualZoom = priceScale.options().autoScale === false;
+    const savedPriceRange = wasManualZoom ? priceScale.getVisibleRange() : null;
+
+    candleSeries.setData(candleBars);
+    volumeSeries.setData(volBars);
+    fitContentWhenReady();
+    // A full reload replaces the whole series, so the gate must forget
+    // whatever it last saw — otherwise a reload to an earlier time range
+    // (new ticker/TF) would have every subsequent update rejected as "old".
+    lastSeriesTime = candleBars.length ? candleBars[candleBars.length - 1].time : null;
+
+    if (savedPriceRange) {
+      priceScale.applyOptions({ autoScale: false });
+      priceScale.setVisibleRange(savedPriceRange);
+    }
+  } else if (candleBars.length) {
+    // Same dataset, newer/changed last bar only — routed through the same
+    // gate the WS feed uses, so whichever source (this poll or a faster WS
+    // push) is actually ahead wins instead of either one crashing the chart.
+    safeSeriesUpdate(candleBars[candleBars.length - 1], volBars[volBars.length - 1]);
+  }
+
+  // In-chart OHLC readout, TradingView-style — reflects the latest bar by
+  // default, and whatever candle the crosshair is over while hovering (see
+  // the subscribeCrosshairMove handler above renderOhlc's definition).
+  //
+  // Python only sends the full `bars` array on a genuine full reload — on
+  // every other (steady-state, every-few-seconds) tick it sends just the
+  // tail, to avoid re-serializing and re-transmitting thousands of rows
+  // when only the last one or two actually changed. So barsByTime gets
+  // rebuilt wholesale on a full reload, and merged (upsert by time) on an
+  // incremental one — losing the merge here would silently break hovering
+  // over any candle except the very last few after the first tick.
+  if (effectiveFullReload) {
+    barsByTime = new Map(bars.map((b) => [b.time, b]));
+  } else {
+    bars.forEach((b) => barsByTime.set(b.time, b));
+  }
+  currentOhlcMeta = args.ohlc || {};
+  formingBarTime = currentOhlcMeta.forming_bar_time ?? null;
+  lastBar = bars.length ? bars[bars.length - 1] : lastBar;
+  renderOhlc(lastBar, false);
+  // Cheap to call every render — connectLiveFeed no-ops immediately if
+  // already on the right symbol+interval, which is true on nearly every
+  // call (only a genuine ticker/TF switch, or the no-data path sending no
+  // symbol at all, actually opens/closes a connection).
+  connectLiveFeed(currentOhlcMeta.symbol, currentOhlcMeta.interval);
+
+  // Normally null (see _select_chart's own docstring on the click-value
+  // contract this shares) — the one exception is the resync signal
+  // computed above: a real, distinct string value Python checks for
+  // BEFORE treating this as a click, so it can clear its own
+  // "already sent this fingerprint" bookkeeping and re-render with the
+  // full array this frontend instance is actually missing.
+  sendToStreamlit('streamlit:setComponentValue', {
+    value: neededResyncBeforeThisRender ? '__ICT_CHART_NEEDS_FULL_RELOAD__' : null,
+    dataType: 'json',
+  });
+}
+
+sendToStreamlit('streamlit:componentReady', { apiVersion: 1 });
+// No speculative setFrameHeight(N) here on purpose. This same template
+// serves 3 differently-sized instances (main=1000, mini=380x2) — any single
+// guessed number is wrong for at least two of them, and the correction
+// once real args arrive (handleRender's own setFrameHeight(args.height))
+// is exactly the visible page-layout jump this is fixing. Streamlit's
+// first real streamlit:render call lands within the same tick as
+// componentReady in practice, so there's nothing meaningful to show a
+// guessed height for in the gap anyway.
+
+Object.assign(window.__ictDebug, {
+  chart, candleSeries, volumeSeries,
+  getLastArgs: () => onRenderArgs,
+  getLastFingerprint: () => lastFingerprint,
+  getMeasureState: () => ({
+    mode: measureMode, pendingA: measureA,
+    lines: measurePrimitives.map((p) => ({ p1: p.p1, p2: p.p2, label: p.label })),
+  }),
+});
+</script>
+</body></html>
