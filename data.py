@@ -408,6 +408,89 @@ def _disk_cache_write(path, df):
         pass  # a failed write just means the next restart pays full price again — not worth surfacing
 
 
+def _disk_cache_read_stale(path):
+    """Same file, same parsing as _disk_cache_read, but ignoring
+    _DISK_CACHE_MAX_AGE entirely — used only as the BASE for an incremental
+    top-up (see _incremental_topup below), never returned to a caller
+    directly. A cache past its 1h TTL is still byte-correct for every bar
+    except whatever's happened since it was written; throwing the whole
+    thing away and re-fetching the full `period` from scratch (what
+    happened before this existed) redoes 100% of the work to pick up the
+    last few bars. Returns None on anything missing/corrupt, same as
+    _disk_cache_read — this is a "maybe helps" path, never a hard
+    dependency."""
+    try:
+        df = pd.read_parquet(path)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    provider_used = df.attrs.get("provider")
+    if "_provider" in df.columns:
+        provider_used = df["_provider"].iloc[0] if len(df) else provider_used
+        df = df.drop(columns=["_provider"])
+    df.attrs["provider"] = provider_used
+    return df
+
+
+def _incremental_topup(ticker, period, interval, provider, stale_df):
+    """Extends `stale_df` (a disk cache past its 1h TTL) with whatever's
+    new since its own last bar, instead of redoing the full `period` fetch
+    from scratch. A provider's own history endpoint costs roughly the same
+    wall-clock time per bar scanned server-side regardless of how much of
+    it we actually needed — re-pulling 60 days to pick up the last hour's
+    worth of 5m bars wastes almost all of that time re-fetching rows that
+    hadn't changed. Returns None (never raises) on anything that makes a
+    clean top-up unsafe; the caller falls through to the ordinary full
+    fetch in that case, so this can only ever help, never introduce a new
+    failure mode.
+
+    "max" is deliberately excluded: it isn't a rolling window relative to
+    now the way "7d"/"60d"/"2y" are, so there's no safe `cutoff` to trim
+    a top-up back to "the same thing a fresh max fetch would give" —
+    trimming to _period_to_days("max")'s own 3650-day placeholder could
+    silently cut off genuinely older history a real max fetch would have
+    included (BTC-USD, or a forex major with decades on file)."""
+    if period == "max":
+        return None
+    try:
+        last_ts = stale_df.index[-1]
+        full_days = _period_to_days(period)
+        # +2 days of overlap, not just "since last_ts" exactly — covers
+        # weekend/holiday gaps (a stock/forex ticker's last bar could be a
+        # Friday close) and any clock skew between here and the provider,
+        # without materially changing the request's own size.
+        gap_days = max(1, (pd.Timestamp.now(tz=last_ts.tz) - last_ts).days + 2)
+        if gap_days >= full_days:
+            return None  # stale copy doesn't save anything here — same size as a full fetch
+        fresh = _fetch_any(ticker, f"{gap_days}d", interval, provider)
+        if fresh.empty:
+            return None
+        if fresh.attrs.get("provider") != stale_df.attrs.get("provider"):
+            # A different vendor answered this time (e.g. Yahoo was down
+            # when `fresh` was fetched, still up when `stale_df` was) —
+            # splicing two vendors' own close/volume conventions into one
+            # series risks a visible discontinuity right at the seam.
+            # Falling back to an ordinary full fetch (single vendor,
+            # consistent throughout) is worth more than the time saved.
+            return None
+        # Yahoo's own short-window endpoint doesn't revise bars that
+        # already closed (confirmed directly: two fetches 9s apart
+        # returned byte-identical values for every already-closed row) —
+        # so simply preferring `fresh` for any timestamp both sides share
+        # is safe, not just "probably fine."
+        merged = pd.concat([stale_df[stale_df.index < fresh.index[0]], fresh])
+        merged.attrs["provider"] = fresh.attrs["provider"]
+        # Trim back to the ORIGINALLY requested period — a caller asking
+        # for period="60d" must keep getting ~60 days back, not however
+        # much extra history `stale_df` happened to be carrying.
+        cutoff = pd.Timestamp.now(tz=merged.index.tz) - pd.Timedelta(days=full_days)
+        merged = merged[merged.index >= cutoff]
+        return merged if not merged.empty else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=60)
 def get_yf_ohlcv(ticker, period="6mo", interval="1d", provider="auto"):
     # No st.spinner wrapper here — theme.py hides Streamlit's cache spinner
@@ -419,6 +502,20 @@ def get_yf_ohlcv(ticker, period="6mo", interval="1d", provider="auto"):
     cached = _disk_cache_read(path)
     if cached is not None and not cached.empty:
         return cached
+    # The fresh (within-TTL) disk cache above missed — either this exact
+    # combo's never been fetched, or it has but the hour's up. Try
+    # extending whatever's on disk regardless of age before paying for a
+    # full re-fetch; see _incremental_topup's own docstring for why that's
+    # both faster and lighter on the provider's rate limit. Any failure
+    # here (missing file, corrupt, provider mismatch, "max" period, gap
+    # too big to bother) falls straight through to the full fetch below —
+    # this path only ever makes a cold cache faster, never a new way to fail.
+    stale = _disk_cache_read_stale(path)
+    if stale is not None:
+        topped_up = _incremental_topup(ticker, period, interval, provider, stale)
+        if topped_up is not None:
+            _disk_cache_write(path, topped_up)
+            return topped_up
     df = _fetch_any(ticker, period, interval, provider)
     if not df.empty:
         _disk_cache_write(path, df)
