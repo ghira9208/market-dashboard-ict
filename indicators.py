@@ -73,6 +73,27 @@ def volume_profile(df, n_buckets=24, value_area_pct=0.70):
     if not np.isfinite(volume).any() or float(np.nansum(volume)) <= 0:
         return None
 
+    # A single bad print — a provider-side data glitch, not a real trade —
+    # can otherwise swamp the entire profile. Confirmed directly on live
+    # data: two DOT-USD hourly bars (180d/60m fetch) reported ~18 BILLION
+    # volume apiece against a ~1.4 MILLION per-bar median across that same
+    # fetch — roughly 13,000x — accounting for 87% of the dataset's total
+    # reported volume between just those two bars. Every bucket's weight
+    # came down to essentially two ticks, collapsing POC/VAH/VAL onto
+    # whatever price those two happened to print at, regardless of where
+    # real trading actually concentrated (the on-chart symptom: VAH/POC/
+    # VAL clustered within a few cents of each other, floating nowhere
+    # near the visible candles). Capping each bar's OWN contribution at
+    # the dataset's own 99th percentile — not a fixed constant, so this
+    # adapts to whatever "normal" looks like for this specific ticker/
+    # interval/volume-unit combination — neutralizes an extreme outlier's
+    # influence while leaving every genuinely-high-but-real bar's relative
+    # weight essentially untouched (a bar sitting at the 90th percentile
+    # is unaffected either way).
+    _nonzero_volume = volume[np.isfinite(volume) & (volume > 0)]
+    if len(_nonzero_volume) > 0:
+        volume = np.minimum(volume, np.percentile(_nonzero_volume, 99))
+
     price_lo = float(np.nanmin(low))
     price_hi = float(np.nanmax(high))
     if not (price_hi > price_lo):
