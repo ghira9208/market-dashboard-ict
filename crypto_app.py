@@ -18,7 +18,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 
 import backtest_ui
 import theme
-from data import get_crypto_universe, get_latest_bars, get_yf_ohlcv, is_ticker_alive, resample_ohlc
+from data import get_crypto_universe, get_latest_bars, get_yf_ohlcv, is_ticker_alive, resample_ohlc, warm_in_background
 from fvg import (
     current_dealing_range,
     detect_equal_levels,
@@ -3560,30 +3560,48 @@ with main_col:
         _prefetch_specs.append((get_yf_ohlcv, (ticker,),
                                  {"period": _bf_conf["period"],
                                   "interval": _bf_conf["fetch_interval"], "provider": data_source}))
+    _prefetch(_prefetch_specs)
+
     # Also warm EVERY OTHER timeframe's own base candle history — not just
-    # what this exact render needs — so whichever TF button gets clicked
-    # NEXT is already a warm get_yf_ohlcv cache entry instead of a cold
-    # fetch. Confirmed directly: a first-time (ticker, period, interval)
-    # combo took ~3.9s end to end for the chart to update, a warm one ~2s —
-    # this closes that gap for every TF, not just the ones already in
-    # play above. Every backfill-source/overlay/layer timeframe this render
-    # could ever reach for is one of these same TIMEFRAMES entries, so this
-    # transitively warms those too — no separate backfill-chain loop
-    # needed. Cheap in the common case: get_yf_ohlcv's own
-    # @st.cache_data(ttl=60) makes an already-warm entry an instant
-    # in-memory hit, not a new network call — this only pays for itself on
-    # a TF nobody's actually touched in the last 60s.
+    # what THIS render needs — so whichever TF button gets clicked NEXT is
+    # already a warm get_yf_ohlcv cache entry instead of a cold fetch.
+    # Confirmed directly: a first-time (ticker, period, interval) combo
+    # took ~3.9s end to end for the chart to update, a warm one ~2s — this
+    # closes that gap for every TF, not just the ones already in play
+    # above. Every backfill-source/overlay/layer timeframe this render
+    # could ever reach for is one of these same TIMEFRAMES entries, so
+    # this transitively warms those too — no separate backfill-chain loop
+    # needed.
+    #
+    # Deliberately NOT folded into _prefetch_specs above (a first version
+    # of this did exactly that, and it was wrong): _prefetch blocks THIS
+    # render — the one the user is actually looking at right now — until
+    # EVERY one of its specs finishes, active-TF included. Bundling 9 more
+    # timeframes' worth of fetches into that same blocking wait meant a
+    # slow background combo could delay the chart currently on screen for
+    # no reason it would ever need that data. warm_in_background instead
+    # fires these through a SEPARATE, small, persistent pool (see its own
+    # docstring in data.py) that this script never waits on at all — this
+    # render proceeds to _render_chart() the moment ITS OWN needs are met,
+    # full stop, regardless of how the other 9 are doing.
+    #
+    # Sorted smallest-first (by estimated bar count) rather than in
+    # TIMEFRAMES' own declared order — with only 3 background workers,
+    # cheap timeframes (1D's ~700 bars) finish and free a slot almost
+    # immediately, while the most expensive one (5m's ~17k bars) would
+    # otherwise occupy a worker for the whole batch's duration if started
+    # first, needlessly delaying everything queued behind it.
     _already_warm_tfs = {tf_label, _backfill_tf} | _needed_layer_tfs
     if overlay_tf != "None":
         _already_warm_tfs.add(overlay_tf)
     for _cid2 in CHART_IDS:
         _already_warm_tfs.add(st.session_state.get(TF_KEY_BY_CHART[_cid2], DEFAULT_TF_BY_CHART[_cid2]))
-    for _all_tf_key, _all_tf_conf in TIMEFRAMES.items():
-        if _all_tf_key in _already_warm_tfs:
-            continue
-        _prefetch_specs.append((get_yf_ohlcv, (ticker,),
-                                 {"period": _all_tf_conf["period"],
-                                  "interval": _all_tf_conf["fetch_interval"], "provider": data_source}))
-    _prefetch(_prefetch_specs)
+    _bg_warm_tfs = [k for k in TIMEFRAMES if k not in _already_warm_tfs]
+    _bg_warm_tfs.sort(key=lambda k: _TF_PERIOD_DAYS[k] * 86400 / _TF_BAR_SECONDS[k])
+    for _bg_tf_key in _bg_warm_tfs:
+        _bg_tf_conf = TIMEFRAMES[_bg_tf_key]
+        warm_in_background(get_yf_ohlcv, (ticker,),
+                            {"period": _bg_tf_conf["period"],
+                             "interval": _bg_tf_conf["fetch_interval"], "provider": data_source})
 
     _render_chart()

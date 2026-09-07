@@ -125,6 +125,50 @@ def _call_with_hard_timeout(fn, timeout):
     return future.result(timeout=timeout)
 
 
+# A SEPARATE, small, persistent pool for "warm this up because it MIGHT be
+# needed soon" work — e.g. app.py/crypto_app.py's own background prefetch
+# of every OTHER timeframe besides the one currently on screen. Kept
+# entirely apart from _YF_TIMEOUT_EXECUTOR (the one the ACTIVE render's own
+# critical-path fetches go through) on purpose: that pool's whole 20-way
+# budget exists so the chart the user is actually looking at never waits
+# in line behind other work, and mixing best-effort background warming
+# into the SAME pool would silently reintroduce exactly that queueing —
+# confirmed directly as a real risk, not a hypothetical one: a cold
+# session warming all 10 timeframes at once already produces close to 20
+# concurrent fetches on its own before counting layer/backfill/mini-panel
+# combos, which would leave little headroom for a fresh critical fetch
+# landing in the same pool at the same moment. A small, separate pool
+# means background warm-up can only ever compete with ITSELF, never with
+# whatever's currently on screen. Not torn down between reruns (unlike
+# _prefetch's own per-call executor) — created once, lives for the
+# process's whole lifetime, so work submitted on one rerun keeps running
+# even after the script that submitted it has already finished and a new
+# one has started (this is what makes it genuinely non-blocking; a
+# `with ThreadPoolExecutor() as pool:` context manager would wait for
+# every submitted task to finish before ever returning control).
+_BACKGROUND_WARM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="tf-warm-bg")
+
+
+def warm_in_background(fn, args=(), kwargs=None):
+    """Fire-and-forget: submits fn(*args, **kwargs) to the small, separate
+    background pool above and returns IMMEDIATELY, never waiting for (or
+    even checking) the result — for pre-warming a cache entry nothing on
+    screen right now actually needs yet. Exceptions are swallowed since
+    nothing is watching for them; a failed warm-up just means that combo
+    stays a genuine cache miss the next time it's actually needed, same
+    as if this were never called at all — nothing here is ever on a
+    correctness-critical path, only a "make the NEXT click faster" one."""
+    kwargs = kwargs or {}
+
+    def _run():
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            pass
+
+    _BACKGROUND_WARM_EXECUTOR.submit(_run)
+
+
 def _fetch_yahoo(ticker, period, interval):
     # prepost=True so pre-market/after-hours candles are actually present —
     # needed for the RTH/ETH kill-zone highlights to mean anything (without
