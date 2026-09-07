@@ -1627,9 +1627,59 @@ function handleRender(args) {
     const wasManualZoom = priceScale.options().autoScale === false;
     const savedPriceRange = wasManualZoom ? priceScale.getVisibleRange() : null;
 
+    // Same idea for the TIME axis, requested directly: a TF/ticker switch
+    // used to always fall through to fitContentWhenReady() below, snapping
+    // back to "fit the WHOLE loaded dataset" regardless of what calendar
+    // window the user was actually looking at. Captured as real calendar
+    // timestamps (the same fake-UTC-encoded NY wall-clock seconds bar
+    // times already use), not bar indices or a bar count — "500 bars from
+    // the left edge" means a completely different calendar span on 5m vs
+    // 1h, but "Sept 1 09:00 to Sept 3 17:00" means the same thing
+    // regardless of which timeframe is rendering it.
+    const timeScale = chart.timeScale();
+    const savedTimeRange = timeScale.getVisibleRange();
+
     candleSeries.setData(candleBars);
     volumeSeries.setData(volBars);
-    fitContentWhenReady();
+    // Only restored when it actually overlaps the NEW dataset's own span —
+    // switching to a timeframe whose history doesn't reach back that far
+    // (e.g. 1Y, mostly-backfilled history -> 1m, 7 real days) falls
+    // through to the normal fit-everything default instead of silently
+    // showing an empty-looking chart with the real data off past one edge.
+    const newFirst = candleBars.length ? candleBars[0].time : null;
+    const newLast = candleBars.length ? candleBars[candleBars.length - 1].time : null;
+    const timeRangeStillValid = savedTimeRange && newFirst !== null &&
+      savedTimeRange.to >= newFirst && savedTimeRange.from <= newLast;
+    if (timeRangeStillValid) {
+      // setVisibleRange(savedTimeRange) — the obvious approach — turned out
+      // NOT to work here: confirmed directly, calling it (even deferred a
+      // full task/animation-frame after setData()) with a real timestamp
+      // range landed on a WRONG window, off by months, read back
+      // immediately after setting it. The new dataset has a completely
+      // different bar density than the old one (a real day is ~4x more
+      // bars on 1h than on 4h) — whatever internal bar-spacing/zoom state
+      // carried over from the OLD series appears to make setVisibleRange's
+      // own time-to-position conversion land somewhere that "looks like"
+      // the old zoom level rather than the literal requested timestamps.
+      // Converting the saved range to LOGICAL indices into the NEW
+      // candleBars array first, then calling setVisibleLogicalRange (a
+      // position-based API, not a time-based one) sidesteps that
+      // conversion entirely — confirmed directly to land exactly on the
+      // requested calendar window instead.
+      const findIndex = (targetTime) => {
+        let lo = 0, hi = candleBars.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (candleBars[mid].time < targetTime) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+      };
+      const fromIdx = findIndex(savedTimeRange.from);
+      const toIdx = findIndex(savedTimeRange.to);
+      timeScale.setVisibleLogicalRange({ from: fromIdx, to: toIdx });
+    } else {
+      fitContentWhenReady();
+    }
     // A full reload replaces the whole series, so the gate must forget
     // whatever it last saw — otherwise a reload to an earlier time range
     // (new ticker/TF) would have every subsequent update rejected as "old".
