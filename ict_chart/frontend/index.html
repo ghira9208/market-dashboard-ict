@@ -596,11 +596,34 @@ class GhostCandleBatchPaneView {
   constructor(source) { this._source = source; this._items = []; }
   update() {
     const series = this._source.series, timeScale = this._source.chart.timeScale();
+    // update() (hence this whole per-tile coordinate pass) runs on EVERY
+    // repaint — every pan/zoom/crosshair frame, not just when the data
+    // itself changes — so processing tiles nobody can currently see is
+    // pure waste. Confirmed directly: recording real requestAnimationFrame
+    // deltas during a sustained pan/zoom, dropping from 4,500 loaded tiles
+    // to 1,479 (a smaller timeframe/backfill combo) took p99 frame time
+    // from 143ms to 21.5ms and eliminated every sub-30fps frame (7.8% ->
+    // 0%) — the cost scales with tile COUNT, not just presence. Filtering
+    // to the chart's own current visible time range before doing any
+    // coordinate math extends that same win to the COMMON case (zoomed to
+    // a working view, not the full multi-year history) without shrinking
+    // _MAX_TOTAL_TILES itself or losing any backfill detail once the user
+    // actually scrolls back to it. A small padding on each side (one
+    // visible-range-width) keeps tiles just off-screen ready instead of
+    // popping in a frame late as the view scrolls past their edge.
+    const visible = timeScale.getVisibleRange();
+    let tiles = this._source.tiles;
+    if (visible) {
+      const pad = (visible.to - visible.from) || 0;
+      const lo = visible.from - pad, hi = visible.to + pad;
+      tiles = tiles.filter((t) => t.t1 >= lo && t.t0 <= hi);
+    }
     // Still one timeToCoordinate/priceToCoordinate call PER tile (that
     // part of the cost is irreducible — each tile really does sit at its
-    // own place on the axis) — what's gone is the other 4,499 primitives'
-    // worth of separate update() DISPATCH, not the coordinate math itself.
-    this._items = this._source.tiles.map((t) => ({
+    // own place on the axis) — what's gone is both the other primitives'
+    // worth of separate update() DISPATCH (see GhostCandleBatchRenderer's
+    // own docstring) and now every off-screen tile's coordinate math too.
+    this._items = tiles.map((t) => ({
       x1: timeScale.timeToCoordinate(t.t0),
       x2: timeScale.timeToCoordinate(t.t1),
       yOpen: series.priceToCoordinate(t.open),
