@@ -471,19 +471,32 @@ class RectangleRenderer {
         ctx.lineWidth = this._borderWidth * scope.verticalPixelRatio;
         ctx.strokeRect(h.position, v.position, h.length, v.length);
       }
-      // Kill-zone bands pass a label (FVG/OB rectangles don't) — two
-      // low-opacity fills in adjacent hues (e.g. this session's blue vs.
-      // another's violet) turned out to read as "the same color" at a
-      // glance once painted at an opacity low enough not to bury the
-      // candles under it (confirmed directly against the live app, not
-      // just guessed at). Text removes the ambiguity outright instead of
-      // chasing more hue separation.
+      // Kill-zone bands AND open FVG/OB zones both pass a label (win rate,
+      // "MA+FVG", or the session name) — two low-opacity fills in adjacent
+      // hues (e.g. this session's blue vs. another's violet) turned out to
+      // read as "the same color" at a glance once painted at an opacity low
+      // enough not to bury the candles under it (confirmed directly against
+      // the live app, not just guessed at). Text removes the ambiguity
+      // outright instead of chasing more hue separation.
+      //
+      // Right-anchored, not left: a zone's own t0 (its formation candle)
+      // can sit far back in history — an open FVG/OB stays live and keeps
+      // extending toward "now" for as long as it's unfilled, sometimes
+      // days or weeks after it formed. Left-anchoring at t0 buried the
+      // label off in old history the user had to scroll back to see (the
+      // exact complaint this fixes); anchoring at the zone's OWN right
+      // edge instead keeps it next to whatever's currently on screen,
+      // same reasoning as HLineRenderer's own Entry/SL/TP right-anchor
+      // above. textBaseline 'middle' at the vertical midpoint keeps it
+      // inside the zone (not above/below like a line's own label) — an
+      // area reads as one shape, not two sides to distinguish.
       if (this._label && this._borderColor) {
         ctx.save();
         ctx.font = `${Math.round(10 * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
         ctx.fillStyle = this._borderColor;
-        ctx.textBaseline = 'top';
-        ctx.fillText(this._label, h.position + 4 * scope.horizontalPixelRatio, v.position + 3 * scope.verticalPixelRatio);
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'right';
+        ctx.fillText(this._label, h.position + h.length - 4 * scope.horizontalPixelRatio, v.position + v.length / 2);
         ctx.restore();
       }
     });
@@ -696,9 +709,17 @@ function _rgbaAlpha(rgba, alpha) {
 }
 
 class HLineRenderer {
-  constructor(p1, p2, color, label, lineWidth, dashed) {
+  constructor(p1, p2, color, label, lineWidth, dashed, above) {
     this._p1 = p1; this._p2 = p2; this._color = color; this._label = label;
     this._lineWidth = lineWidth || 1; this._dashed = dashed !== false;
+    // Which side of the line the label sits on — Python already knows
+    // each line's own bullish/bearish or above/below-price identity (BSL
+    // vs SSL, EQH vs EQL, a bullish vs bearish structure break, ...) far
+    // more reliably than anything this file could re-derive from color or
+    // geometry, so it's passed straight through rather than guessed here.
+    // Undefined (a caller that never set it) defaults to true — the
+    // original always-above behavior — so nothing regresses silently.
+    this._above = above !== false;
   }
   draw(target) {
     target.useBitmapCoordinateSpace((scope) => {
@@ -763,7 +784,12 @@ class HLineRenderer {
         const fontPx = this._dashed ? 10 : 12;
         ctx.font = `${this._dashed ? '' : 'bold '}${Math.round(fontPx * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
         ctx.fillStyle = this._color;
-        ctx.textBaseline = 'bottom';
+        // Above-price/bullish lines (BSL, EQH, VAH, a bullish structure
+        // break, ...) sit above their own line; below-price/bearish ones
+        // (SSL, EQL, VAL, a bearish break, ...) sit below it — see this._above's
+        // own constructor comment for where that comes from.
+        ctx.textBaseline = this._above ? 'bottom' : 'top';
+        const labelY = this._above ? y - 2 * scope.verticalPixelRatio : y + 2 * scope.verticalPixelRatio;
         // Right-anchored at the max end, not left-anchored at the min:
         // t0 is the setup's real entry candle, which for a trade that's
         // been open a while can sit far to the left of "now." Anchoring
@@ -773,7 +799,7 @@ class HLineRenderer {
         // lines (see x2 above). textAlign 'right' draws the text growing
         // back toward x1 instead of off the right edge of the pane.
         ctx.textAlign = 'right';
-        ctx.fillText(this._label, Math.max(x1, x2) - 4 * scope.horizontalPixelRatio, y - 2 * scope.verticalPixelRatio);
+        ctx.fillText(this._label, Math.max(x1, x2) - 4 * scope.horizontalPixelRatio, labelY);
       }
       ctx.restore();
     });
@@ -789,13 +815,16 @@ class HLinePaneView {
     const x2 = resolveTimeCoordinate(chart, series, this._source.t1);
     this._p1 = { x: x1, y }; this._p2 = { x: x2, y };
   }
-  renderer() { return new HLineRenderer(this._p1, this._p2, this._source.color, this._source.label, this._source.lineWidth, this._source.dashed); }
+  renderer() {
+    return new HLineRenderer(this._p1, this._p2, this._source.color, this._source.label,
+                              this._source.lineWidth, this._source.dashed, this._source.above);
+  }
 }
 
 class HLinePrimitive {
-  constructor(t0, t1, price, color, label, lineWidth, dashed) {
+  constructor(t0, t1, price, color, label, lineWidth, dashed, above) {
     this.t0 = t0; this.t1 = t1; this.price = price; this.color = color; this.label = label;
-    this.lineWidth = lineWidth || 1; this.dashed = dashed !== false;
+    this.lineWidth = lineWidth || 1; this.dashed = dashed !== false; this.above = above;
     this._paneViews = [new HLinePaneView(this)];
   }
   attached({ chart, series }) { this.chart = chart; this.series = series; }
@@ -1310,7 +1339,7 @@ function applyOverlays(overlays) {
     activeHLines.forEach((l) => candleSeries.detachPrimitive(l));
     activeHLines = [];
     (overlays.price_lines || []).forEach((l) => {
-      const hline = new HLinePrimitive(l.t0, l.t1, l.price, l.color, l.title || '', l.line_width || 1, l.dashed);
+      const hline = new HLinePrimitive(l.t0, l.t1, l.price, l.color, l.title || '', l.line_width || 1, l.dashed, l.above);
       candleSeries.attachPrimitive(hline);
       activeHLines.push(hline);
     });

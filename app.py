@@ -737,7 +737,7 @@ def _build_mini_overlays(chart_id, df_own, current_price, axis_secs_own, future_
         rectangles.append({"t0": t0, "t1": future_edge_own, "p0": dr["bottom"], "p1": dr["eq"],
                             "fill": _hex_to_rgba(theme.NEON_GREEN, 0.14), "border": None})
         price_lines.append({"t0": t0, "t1": future_edge_own, "price": dr["eq"],
-                             "color": _hex_to_rgba(theme.NEON_AMBER, 1.0), "title": "EQ 50%"})
+                             "color": _hex_to_rgba(theme.NEON_AMBER, 1.0), "title": "EQ 50%", "above": True})
 
     def _fvg_overlay(zones, opacity):
         # Every zone passed in has already been filtered to open-only
@@ -759,7 +759,7 @@ def _build_mini_overlays(chart_id, df_own, current_price, axis_secs_own, future_
             color = theme.NEON_AMBER if is_choch else (theme.NEON_GREEN if b["type"] == "bullish" else theme.NEON_MAGENTA)
             price_lines.append({"t0": _ny_fake_utc_seconds(b["start"]), "t1": future_edge_own,
                                  "price": b["level"], "color": _hex_to_rgba(color, 1.0),
-                                 "title": f"{b['type'].capitalize()} {b['structure']}"})
+                                 "title": f"{b['type'].capitalize()} {b['structure']}", "above": b["type"] == "bullish"})
 
         dr = current_dealing_range(own_confirmed)
         if dr is not None:
@@ -782,7 +782,7 @@ def _build_mini_overlays(chart_id, df_own, current_price, axis_secs_own, future_
             color = theme.NEON_MAGENTA if side == "above" else theme.NEON_AMBER
             price_lines.append({"t0": _ny_fake_utc_seconds(lvl["time"]), "t1": future_edge_own,
                                  "price": lvl["price"], "color": _hex_to_rgba(color, 1.0),
-                                 "title": "BSL" if side == "above" else "SSL"})
+                                 "title": "BSL" if side == "above" else "SSL", "above": side == "above"})
 
         if len(df_cross) >= 3:
             cross_confirmed = df_cross.iloc[:-1] if len(df_cross) > 1 else df_cross
@@ -2468,7 +2468,8 @@ with main_col:
                 if _price is not None:
                     price_lines.append({"t0": _entry_x, "t1": future_edge, "price": _price,
                                          "color": _hex_to_rgba(_color, 1.0), "title": _title,
-                                         "line_width": 3, "dashed": False})
+                                         "line_width": 3, "dashed": False,
+                                         "above": _price >= (_entry_price if _entry_price is not None else _price)})
             if _entry_price is not None and _stop_price is not None:
                 # The risk itself, not just its two edges — a translucent
                 # band between Entry and SL, fading in from the entry
@@ -2661,11 +2662,11 @@ with main_col:
                                      else _hex_to_rgba("#8e8e93", 0.30),
                         })
                     price_lines.append({"t0": axis_secs[0], "t1": future_edge, "price": _vp["poc_price"],
-                                         "color": _hex_to_rgba(theme.NEON_CYAN, 0.9), "title": "POC"})
+                                         "color": _hex_to_rgba(theme.NEON_CYAN, 0.9), "title": "POC", "above": True})
                     price_lines.append({"t0": axis_secs[0], "t1": future_edge, "price": _vp["value_area_high"],
-                                         "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAH"})
+                                         "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAH", "above": True})
                     price_lines.append({"t0": axis_secs[0], "t1": future_edge, "price": _vp["value_area_low"],
-                                         "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAL"})
+                                         "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAL", "above": False})
 
             # Every layer detects against whatever SINGLE timeframe its own
             # dropdown picked (see the Layers popover) — no more fixed 4h/
@@ -3187,7 +3188,8 @@ with main_col:
                             t1 = _line_stop_time(rf["confirmed"], times[0], price, direction=direction, exclude=set(times))
                             price_lines.append({"t0": _ny_fake_utc_seconds(times[0]), "t1": rf["t1_axis"](t1), "price": price,
                                                  "color": _hex_to_rgba(color, 1.0),
-                                                 "title": f"{label} ({layer_tf['Equal Highs/Lows']})"})
+                                                 "title": f"{label} ({layer_tf['Equal Highs/Lows']})",
+                                                 "above": direction == "above"})
                             eq_count += 1
                     legend_items.append((f"Equal H/L ({layer_tf['Equal Highs/Lows']})", f"{eq_count} clusters", theme.NEON_MAGENTA))
 
@@ -3223,7 +3225,8 @@ with main_col:
                         color = theme.NEON_AMBER if is_choch else (theme.NEON_GREEN if b["type"] == "bullish" else theme.NEON_MAGENTA)
                         price_lines.append({"t0": _ny_fake_utc_seconds(b["start"]), "t1": _ny_fake_utc_seconds(b["end"]),
                                              "price": b["level"], "color": _hex_to_rgba(color, 1.0),
-                                             "title": f"{b['structure']} ({layer_tf['Market Structure']})"})
+                                             "title": f"{b['structure']} ({layer_tf['Market Structure']})",
+                                             "above": b["type"] == "bullish"})
                         if is_choch:
                             choch_n += 1
                         else:
@@ -3258,7 +3261,7 @@ with main_col:
                                             "fill": _hex_to_rgba(theme.NEON_GREEN, fill_opacity), "border": None})
                         price_lines.append({"t0": t0, "t1": future_edge, "price": dr["eq"],
                                              "color": _hex_to_rgba(theme.NEON_AMBER, 1.0),
-                                             "title": f"EQ 50% ({layer_tf['Premium/Discount']})"})
+                                             "title": f"EQ 50% ({layer_tf['Premium/Discount']})", "above": True})
                         # The shaded rectangles above both start at t0 (the
                         # LATER of the two swing points' own confirmations),
                         # so the earlier-forming boundary's own actual swing
@@ -3271,10 +3274,10 @@ with main_col:
                         # shaded half read as the same boundary.
                         price_lines.append({"t0": _ny_fake_utc_seconds(dr["top_time"]), "t1": future_edge,
                                              "price": dr["top"], "color": _hex_to_rgba(theme.NEON_MAGENTA, 1.0),
-                                             "title": f"Swing high ({layer_tf['Premium/Discount']})"})
+                                             "title": f"Swing high ({layer_tf['Premium/Discount']})", "above": True})
                         price_lines.append({"t0": _ny_fake_utc_seconds(dr["bottom_time"]), "t1": future_edge,
                                              "price": dr["bottom"], "color": _hex_to_rgba(theme.NEON_GREEN, 1.0),
-                                             "title": f"Swing low ({layer_tf['Premium/Discount']})"})
+                                             "title": f"Swing low ({layer_tf['Premium/Discount']})", "above": False})
                         legend_items.append((f"Premium/Discount ({layer_tf['Premium/Discount']})",
                                               f"range {dr['bottom']:.5g}–{dr['top']:.5g}", theme.NEON_AMBER))
                         # Explains the otherwise-confusing "price already
@@ -3332,7 +3335,7 @@ with main_col:
                             title += " · " + "+".join(INDICATOR_SPECS[k]["label"] for k in matched_inds)
                         price_lines.append({"t0": _ny_fake_utc_seconds(lvl["time"]), "t1": rf["t1_axis"](t1),
                                              "price": lvl["price"], "color": _hex_to_rgba(theme.NEON_MAGENTA, 1.0),
-                                             "title": title, "line_width": 2 if matched_inds else 1})
+                                             "title": title, "line_width": 2 if matched_inds else 1, "above": True})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "BSL (buy-side)", "price": lvl["price"], "formed": lvl["time"]})
                     for lvl in below:
                         t1 = _line_stop_time(rf["confirmed"], lvl["time"], lvl["price"])
@@ -3342,7 +3345,7 @@ with main_col:
                             title += " · " + "+".join(INDICATOR_SPECS[k]["label"] for k in matched_inds)
                         price_lines.append({"t0": _ny_fake_utc_seconds(lvl["time"]), "t1": rf["t1_axis"](t1),
                                              "price": lvl["price"], "color": _hex_to_rgba(theme.NEON_AMBER, 1.0),
-                                             "title": title, "line_width": 2 if matched_inds else 1})
+                                             "title": title, "line_width": 2 if matched_inds else 1, "above": False})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "SSL (sell-side)", "price": lvl["price"], "formed": lvl["time"]})
 
                     # rf["confirmed"], not rf["df"] — same caching fix as
