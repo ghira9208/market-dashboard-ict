@@ -3056,7 +3056,18 @@ with main_col:
             if "Swing Points" in layers:
                 rf = tf_frames.get(layer_tf["Swing Points"])
                 if rf is not None:
-                    highs, lows = detect_swings(rf["df"])
+                    # rf["confirmed"], not rf["df"] — this used to run on the
+                    # still-forming last bar too, which for a live-splicing
+                    # timeframe changes on almost every tick (any new local
+                    # high/low), defeating detect_swings' own @st.cache_data:
+                    # a different last row means a different hash means a
+                    # full rescan, every time. rf["confirmed"] only changes
+                    # when a bar actually closes (confirmed empirically: two
+                    # get_latest_bars fetches 9s apart returned byte-identical
+                    # values for every already-closed row), so this now hits
+                    # cache the same way every other detector call already
+                    # does via rf["confirmed"] elsewhere in this function.
+                    highs, lows = detect_swings(rf["confirmed"])
                     highs = highs[-max_items_per_layer:]
                     lows = lows[-max_items_per_layer:]
                     hi_color = _hex_to_rgba(theme.NEON_MAGENTA, 1.0)
@@ -3097,7 +3108,8 @@ with main_col:
                 # cluster's line the instant its own second point forms.
                 rf = tf_frames.get(layer_tf["Equal Highs/Lows"])
                 if rf is not None:
-                    highs, lows = detect_swings(rf["df"])
+                    # rf["confirmed"] — see Swing Points' own comment above.
+                    highs, lows = detect_swings(rf["confirmed"])
                     eq_count = 0
                     for group, color, label, direction in [(detect_equal_levels(highs), theme.NEON_MAGENTA, "EQH", "above"),
                                                              (detect_equal_levels(lows), theme.NEON_GREEN, "EQL", "below")]:
@@ -3266,7 +3278,20 @@ with main_col:
                                              "title": title, "line_width": 2 if matched_inds else 1})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "SSL (sell-side)", "price": lvl["price"], "formed": lvl["time"]})
 
-                    reactions = detect_liquidity_reactions(rf["df"])
+                    # rf["confirmed"], not rf["df"] — same caching fix as
+                    # Swing Points above, plus this was ALSO the exact
+                    # "compared against rdf's own last bar, never matches
+                    # r_confirmed.index[-1]" bug the tf_frames construction
+                    # comment already describes fixing elsewhere: rf["end"]
+                    # (used by rf["t1_axis"] just above, for these same
+                    # reaction rectangles' own right edge) could only ever
+                    # equal rf["df"]'s last row, which never equals
+                    # rf["confirmed"]'s own last row — so a still-active
+                    # reaction never actually extended to future_edge, it
+                    # silently stopped exactly where price had printed so
+                    # far. Missed when that fix was applied to every other
+                    # layer; this call site just hadn't been touched yet.
+                    reactions = detect_liquidity_reactions(rf["confirmed"])
                     reactions = reactions[-max_items_per_layer:]
                     for r in reactions:
                         color = theme.NEON_MAGENTA if r["type"] == "bearish" else theme.NEON_AMBER
@@ -3535,6 +3560,30 @@ with main_col:
         _prefetch_specs.append((get_yf_ohlcv, (ticker,),
                                  {"period": _bf_conf["period"],
                                   "interval": _bf_conf["fetch_interval"], "provider": data_source}))
+    # Also warm EVERY OTHER timeframe's own base candle history — not just
+    # what this exact render needs — so whichever TF button gets clicked
+    # NEXT is already a warm get_yf_ohlcv cache entry instead of a cold
+    # fetch. Confirmed directly: a first-time (ticker, period, interval)
+    # combo took ~3.9s end to end for the chart to update, a warm one ~2s —
+    # this closes that gap for every TF, not just the ones already in
+    # play above. Every backfill-source/overlay/layer timeframe this render
+    # could ever reach for is one of these same TIMEFRAMES entries, so this
+    # transitively warms those too — no separate backfill-chain loop
+    # needed. Cheap in the common case: get_yf_ohlcv's own
+    # @st.cache_data(ttl=60) makes an already-warm entry an instant
+    # in-memory hit, not a new network call — this only pays for itself on
+    # a TF nobody's actually touched in the last 60s.
+    _already_warm_tfs = {tf_label, _backfill_tf} | _needed_layer_tfs
+    if overlay_tf != "None":
+        _already_warm_tfs.add(overlay_tf)
+    for _cid2 in CHART_IDS:
+        _already_warm_tfs.add(st.session_state.get(TF_KEY_BY_CHART[_cid2], DEFAULT_TF_BY_CHART[_cid2]))
+    for _all_tf_key, _all_tf_conf in TIMEFRAMES.items():
+        if _all_tf_key in _already_warm_tfs:
+            continue
+        _prefetch_specs.append((get_yf_ohlcv, (ticker,),
+                                 {"period": _all_tf_conf["period"],
+                                  "interval": _all_tf_conf["fetch_interval"], "provider": data_source}))
     _prefetch(_prefetch_specs)
 
     _render_chart()
