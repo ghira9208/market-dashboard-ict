@@ -356,6 +356,28 @@ chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
 // after this function picks its own auto-fit spacing.
 let candleWidthFactor = 1;
 
+// A single setVisibleLogicalRange() call to a drastically different zoom
+// level than the current one doesn't reliably land — confirmed directly:
+// requesting the jump from a 7-bar-wide view to the full ~9200-bar series
+// stayed stuck at the old 7-bar view even several seconds later, while
+// issuing the EXACT SAME request again immediately snapped straight to
+// the target. Whatever internal step-limiting the library applies to a
+// large jump apparently needs to be re-triggered, not just waited out.
+// Repeating the request a few times a beat apart is blunt but reliable —
+// it converges either way, and once it's already at the target further
+// calls are harmless no-ops. candleWidthFactor is applied only after the
+// last attempt, not the first, so it's adjusting the spacing that's
+// actually settled rather than whatever stale value the first call left.
+function setFullLogicalRange(from, to, attemptsLeft) {
+  chart.timeScale().setVisibleLogicalRange({ from, to });
+  if (attemptsLeft > 0) {
+    setTimeout(() => setFullLogicalRange(from, to, attemptsLeft - 1), 60);
+  } else if (candleWidthFactor !== 1) {
+    const current = chart.timeScale().options().barSpacing;
+    chart.timeScale().applyOptions({ barSpacing: current * candleWidthFactor });
+  }
+}
+
 function fitContentWhenReady() {
   requestAnimationFrame(() => requestAnimationFrame(() => {
     // Deliberately NOT chart.timeScale().fitContent() — confirmed directly
@@ -375,13 +397,9 @@ function fitContentWhenReady() {
     // by construction, not an approximation of it.
     const data = candleSeries.data();
     if (data.length) {
-      chart.timeScale().setVisibleLogicalRange({ from: 0, to: data.length - 1 });
+      setFullLogicalRange(0, data.length - 1, 3);
     } else {
       chart.timeScale().fitContent();
-    }
-    if (candleWidthFactor !== 1) {
-      const current = chart.timeScale().options().barSpacing;
-      chart.timeScale().applyOptions({ barSpacing: current * candleWidthFactor });
     }
   }));
 }
@@ -409,20 +427,19 @@ new ResizeObserver(() => {
 // lightweight-charts has no built-in "reset zoom" gesture (no
 // double-click-to-autorange the way Plotly did natively) — once a user
 // zooms in, this button is the only way back to the full loaded range.
-// Same setVisibleLogicalRange(0, length-1) approach as fitContentWhenReady
-// (see its own comment) rather than fitContent() directly, for the same
-// reason: on a large dataset fitContent() doesn't actually reach index 0,
-// so this button wouldn't reliably do what its own label promises.
+// Same setFullLogicalRange approach as fitContentWhenReady (see its own
+// comment) rather than fitContent() directly or a single
+// setVisibleLogicalRange() call — on a large dataset fitContent() doesn't
+// actually reach index 0, and a lone setVisibleLogicalRange() call from a
+// very different zoom level (the common case here — this button exists
+// specifically for when the user has zoomed in a lot) doesn't reliably
+// land either, so this button wouldn't do what its own label promises.
 document.getElementById('fitBtn').addEventListener('click', () => {
   const data = candleSeries.data();
   if (data.length) {
-    chart.timeScale().setVisibleLogicalRange({ from: 0, to: data.length - 1 });
+    setFullLogicalRange(0, data.length - 1, 3);
   } else {
     chart.timeScale().fitContent();
-  }
-  if (candleWidthFactor !== 1) {
-    const current = chart.timeScale().options().barSpacing;
-    chart.timeScale().applyOptions({ barSpacing: current * candleWidthFactor });
   }
 });
 
@@ -1727,7 +1744,7 @@ function handleRender(args) {
   // sidesteps the inconsistency instead of trying to filter it back out
   // afterward.
   let savedPriceRange = null;
-  let savedTimeRange = null;
+  let savedVisibleBarCount = null;
   if (effectiveFullReload) {
     // A ticker/TF switch used to always hand the price axis back to
     // autoscale, discarding any manual Y-zoom (drag/scroll on the price
@@ -1743,55 +1760,32 @@ function handleRender(args) {
     const wasManualZoom = candleSeries.priceScale().options().autoScale === false;
     savedPriceRange = wasManualZoom ? candleSeries.priceScale().getVisibleRange() : null;
 
-    // Same idea for the TIME axis, requested directly: a TF/ticker switch
-    // used to always fall through to fitContentWhenReady() below, snapping
-    // back to "fit the WHOLE loaded dataset" regardless of what calendar
-    // window the user was actually looking at. Captured as real calendar
-    // timestamps (the same fake-UTC-encoded NY wall-clock seconds bar
-    // times already use), not bar indices or a bar count — "500 bars from
-    // the left edge" means a completely different calendar span on 5m vs
-    // 1h, but "Sept 1 09:00 to Sept 3 17:00" means the same thing
-    // regardless of which timeframe is rendering it.
-    //
-    // Deliberately NOT timeScale.getVisibleRange(), NOR a fresh
-    // timeScale.getVisibleLogicalRange() poll — see lastKnownLogicalRange's
-    // own comment for why each of those reads can come back stale here.
-    // lastKnownLogicalRange (kept current via the library's own
-    // subscribeVisibleLogicalRangeChange event, not polled) and mapping it
-    // to real calendar times ourselves, off whatever the series actually
-    // holds right now — queried fresh here, not from a snapshot of our own
-    // that a live incremental tick could silently outgrow between one full
-    // reload and the next (confirmed directly as a cause of "ends up
-    // zoomed in after a few switches": a new candle opening on the SAME
-    // timeframe between switches grows the real series past a once-per-
-    // full-reload snapshot's own remembered length, making a genuinely
-    // current visible range look out-of-bounds against it a few hops
-    // later) — sidesteps that staleness bug too instead of patching one
-    // symptom of it.
-    const savedLogicalRange = lastKnownLogicalRange;
-    const previousBars = candleSeries.data();
-    const clampToPreviousBars = (idx) => Math.max(0, Math.min(previousBars.length - 1, Math.round(idx)));
-    // hasRenderedOnce guards the genuinely-first-ever render for this chart
-    // instance, where there's no real prior view to speak of yet — confirmed
-    // directly that this matters: an untouched, just-created time scale can
-    // already report a non-null logical/visible range once the
-    // ResizeObserver has fired, with zero relation to any dataset, which
-    // would otherwise get "restored" as if it were a real prior view.
-    //
-    // The bounds check on savedLogicalRange itself (not just clamping the
-    // lookup) matters too — confirmed directly: getVisibleLogicalRange() can
-    // report a range that starts BEYOND the previous series' own length
-    // entirely, not just spill slightly past one edge the way the
-    // rightOffset margin does. Clamping that straight into range would
-    // silently collapse from/to to the same last-bar index — a degenerate,
-    // one-bar-wide "restore" — so a range with no actual overlap with the
-    // data it's meant to describe is treated as unusable instead, falling
-    // back to fitContentWhenReady().
-    const logicalRangeUsable = savedLogicalRange && previousBars.length &&
-      savedLogicalRange.from < previousBars.length && savedLogicalRange.to >= 0;
-    savedTimeRange = (hasRenderedOnce && logicalRangeUsable)
-      ? { from: previousBars[clampToPreviousBars(savedLogicalRange.from)].time,
-          to: previousBars[clampToPreviousBars(savedLogicalRange.to)].time }
+    // Same idea for the TIME axis, requested directly — but NOT as "the
+    // same calendar window," which is what every earlier version of this
+    // tried and repeatedly got wrong (see git history: a brand-new-chart
+    // default treated as a real prior view, getVisibleRange()/
+    // getVisibleLogicalRange() reads that go stale immediately after this
+    // module's own writes, a once-per-full-reload bars snapshot silently
+    // outgrown by live incremental ticks, indicator data swapped onto the
+    // new timeframe while candleSeries still held the old one — each one
+    // fixed in turn, each one a genuine reproduced bug, and still not the
+    // end of it). All of those existed to solve one problem: converting a
+    // calendar window from one timeframe's bar density to another's.
+    // Dropping that conversion entirely — preserving the bar COUNT
+    // instead of the calendar span, always anchored to the live edge —
+    // sidesteps the whole category. Confirmed directly against the exact
+    // corruption chased through most of that history: when the old
+    // logical-range read landed on a corrupted position ({10011,10659}
+    // instead of the real {8251,8899}), its WIDTH was still exactly
+    // right (648 either way) — the corruption was positional, not about
+    // how many bars were visible. A user switching timeframes is asking
+    // "show me this many candles at the new resolution," not "show me
+    // this exact multi-week span" — which also isn't always answerable
+    // anyway (see fitContentWhenReady's own comment on the library's real
+    // rendering-width ceiling).
+    savedVisibleBarCount = (hasRenderedOnce && lastKnownLogicalRange &&
+      lastKnownLogicalRange.to > lastKnownLogicalRange.from)
+      ? Math.round(lastKnownLogicalRange.to - lastKnownLogicalRange.from)
       : null;
   }
 
@@ -1810,40 +1804,17 @@ function handleRender(args) {
     const timeScale = chart.timeScale();
     candleSeries.setData(candleBars);
     volumeSeries.setData(volBars);
-    // Only restored when it actually overlaps the NEW dataset's own span —
-    // switching to a timeframe whose history doesn't reach back that far
-    // (e.g. 1Y, mostly-backfilled history -> 1m, 7 real days) falls
-    // through to the normal fit-everything default instead of silently
-    // showing an empty-looking chart with the real data off past one edge.
-    const newFirst = candleBars.length ? candleBars[0].time : null;
-    const newLast = candleBars.length ? candleBars[candleBars.length - 1].time : null;
-    const timeRangeStillValid = savedTimeRange && newFirst !== null &&
-      savedTimeRange.to >= newFirst && savedTimeRange.from <= newLast;
-    if (timeRangeStillValid) {
-      // Converting the saved range to LOGICAL indices into the NEW
-      // candleBars array, then calling setVisibleLogicalRange (a
-      // position-based API, not a time-based one) — confirmed directly to
-      // land exactly on the requested calendar window, unlike
-      // setVisibleRange(savedTimeRange) (the obvious approach), which
-      // landed on a WRONG window, off by months, even deferred a full
-      // task/animation-frame after setData(). The new dataset has a
-      // completely different bar density than the old one (a real day is
-      // ~4x more bars on 1h than on 4h) — whatever internal bar-spacing/
-      // zoom state carried over from the OLD series appears to make
-      // setVisibleRange's own time-to-position conversion land somewhere
-      // that "looks like" the old zoom level rather than the literal
-      // requested timestamps.
-      const findIndex = (targetTime) => {
-        let lo = 0, hi = candleBars.length - 1;
-        while (lo < hi) {
-          const mid = (lo + hi) >> 1;
-          if (candleBars[mid].time < targetTime) lo = mid + 1; else hi = mid;
-        }
-        return lo;
-      };
-      const fromIdx = findIndex(savedTimeRange.from);
-      const toIdx = findIndex(savedTimeRange.to);
-      timeScale.setVisibleLogicalRange({ from: fromIdx, to: toIdx });
+    // Always anchored to the live edge (the new dataset's own last bar),
+    // not wherever the old view's own right edge happened to sit — a
+    // switch is read as "show me this many candles at the new
+    // resolution," not "preserve exactly how far back I'd scrolled."
+    // Clamped so a saved count larger than the new dataset (e.g.
+    // switching to a timeframe with much shorter real history) still
+    // shows everything instead of requesting bars that don't exist.
+    if (savedVisibleBarCount && candleBars.length) {
+      const newTo = candleBars.length - 1;
+      const newFrom = Math.max(0, newTo - savedVisibleBarCount);
+      timeScale.setVisibleLogicalRange({ from: newFrom, to: newTo });
       // Set synchronously and optimistically rather than left purely to the
       // subscription callback above — we already know exactly what was just
       // requested, no need to wait for the library to confirm it back. Also
@@ -1851,7 +1822,7 @@ function handleRender(args) {
       // it reports for the next PROGRAMMATIC_SETTLE_WINDOW_MS (see that
       // constant's own comment) instead of clobbering this with a stale
       // transitional value moments later.
-      lastKnownLogicalRange = { from: fromIdx, to: toIdx };
+      lastKnownLogicalRange = { from: newFrom, to: newTo };
       lastProgrammaticSetAt = Date.now();
     } else {
       fitContentWhenReady();
