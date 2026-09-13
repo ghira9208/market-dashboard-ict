@@ -14,10 +14,16 @@
       "port": 8506
     },
     {
-      "name": "market-dashboard-ict-backtest",
+      "name": "market-dashboard-ict-news",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "streamlit", "run", "backtest_app.py", "--server.headless", "true", "--server.port", "8507", "--server.fileWatcherType", "none"],
+      "runtimeArgs": ["-m", "streamlit", "run", "news_app.py", "--server.headless", "true", "--server.port", "8507", "--server.fileWatcherType", "none"],
       "port": 8507
+    },
+    {
+      "name": "market-dashboard-ict-institutional",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "streamlit", "run", "institutional_app.py", "--server.headless", "true", "--server.port", "8508", "--server.fileWatcherType", "none"],
+      "port": 8508
     }
   ]
 }
