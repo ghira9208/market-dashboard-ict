@@ -1,0 +1,45 @@
+name: Collect data
+
+# Runs collect_data.py on a schedule, independent of anyone visiting any
+# dashboard page — see collect_data.py's own docstring for why that's
+# necessary at all (Streamlit only records these snapshots as a
+# side effect of a page load). Every 6 hours is a balance: frequent
+# enough that a single failed run doesn't leave a big gap, infrequent
+# enough not to spam commit history or Actions minutes for data that's
+# mostly daily-resolution anyway (institutional/market-cap history dedupe
+# by day regardless of how often this fires).
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab, for testing
+
+permissions:
+  contents: write  # needed to commit the updated cache files back to the repo
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run collector
+        run: python3 collect_data.py
+
+      - name: Commit and push if anything changed
+        run: |
+          git config user.name "collect-data bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .cache
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Scheduled data collection"
+            git push
+          fi

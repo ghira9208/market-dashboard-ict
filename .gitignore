@@ -1,7 +1,18 @@
 __pycache__/
 *.pyc
 .DS_Store
-.cache/
+# Bulk, regenerable OHLCV disk caches only — NOT the small accumulating
+# history logs that live alongside them (institutional_bias_history.json,
+# market_cap_history.json, news_history.json under .cache/, trials.jsonl
+# under edge_lab/.cache/). Those are exactly what the scheduled GitHub
+# Actions collector (see .github/workflows/collect.yml) exists to grow
+# over real calendar time — gitignoring them would silently throw away
+# every day's snapshot the moment the workflow's own runner exits, since
+# nothing else persists them. research/.cache/ stays fully ignored: it's
+# ~250MB of the same kind of regenerable per-ticker OHLCV cache, no
+# small logs mixed in worth carving out.
+research/.cache/
+.cache/ohlcv/
 .streamlit/secrets.toml
 *.log
 .last_state*.json
