@@ -1,7 +1,10 @@
 streamlit
 pandas
+numpy
 plotly
+altair
 yfinance
 pyarrow
 histdata
 beautifulsoup4
+requests
