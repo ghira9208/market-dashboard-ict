@@ -120,7 +120,7 @@
 <div id="ohlcOverlay"></div>
 <div id="countdownOverlay"></div>
 <button id="fitBtn" title="Fit all loaded data">⤢ Fit</button>
-<button id="measureBtn" title="Click two points on a candle to measure price/%/bars between them. Right-click the chart to clear.">📏 Measure</button>
+<button id="measureBtn" title="Click two points on a candle to measure price/%/bars between them. Right-click the chart to clear, or click Measure again to turn it off and clear.">📏 Measure</button>
 <button id="scaleBtn" title="Toggle log/arithmetic price scale">LOG</button>
 <script>
 window.__ictDebug = { errors: [] };
@@ -246,6 +246,26 @@ const chart = LC.createChart(container, {
 // bar actually closing). See the autoscaleInfoProvider below for why this
 // exists — declared up here since candleSeries' options close over it.
 let formingBarTime = null;
+
+// How many decimals THIS instrument's prices need to stay meaningful —
+// fixed at 2 everywhere used to mean a GBPUSD chart showed "1.35" for
+// every candle in a move that's actually 1.3465 -> 1.3546 (real, visible
+// movement on the actual chart, invisible in the OHLC readout and axis),
+// and a sub-cent altcoin would round to "0.00" outright. Recomputed once
+// per full reload (see the setData call below) from the loaded data's own
+// last close — not on every poll tick, since the instrument itself only
+// changes on a ticker/timeframe switch, and a per-tick recompute could
+// make the axis/readout precision flicker mid-session on a boundary price.
+// Shared by the axis/crosshair (priceFormat below), the OHLC readout
+// (renderOhlc), and the Measure tool (formatMeasurePrice) so all three
+// agree on one precision for the same instrument, rather than each
+// picking its own and showing O/H/L/C at different decimal counts.
+let currentPriceDecimals = 2;
+function computePriceDecimals(price) {
+  if (!(price > 0)) return 2;
+  const decimals = 5 - Math.floor(Math.log10(price));
+  return Math.max(2, Math.min(10, decimals));
+}
 
 const candleSeries = chart.addSeries(LC.CandlestickSeries, {
   upColor: '#30D158', downColor: '#FF453A', borderVisible: false,
@@ -405,6 +425,46 @@ function maybeAdoptIntendedTimeRange() {
 // after this function picks its own auto-fit spacing.
 let candleWidthFactor = 1;
 
+// Set from options.always_fit (see handleRender) — the HTF/LTF mini
+// reference panels want to always show their whole (small, fixed-size
+// tail(N)) window fitted, never carrying forward a preserved calendar
+// window/bar-count the way the main chart deliberately does across a
+// timeframe switch (see savedTimeRange's own comment below). Without
+// this, a mini panel's persistent iframe (its key never changes on a TF
+// switch, unlike the main chart's) inherited that SAME preservation
+// logic after its own first render, which is right for "keep my exact
+// zoom across an unbounded history" but wrong for "just show me the
+// last N candles, tidy, every time."
+let alwaysFit = false;
+
+// Set from options.future_margin_frac (see handleRender) — the main
+// chart only. Direct request: "default the chart to about 60% of the
+// width to the right to make room for the trades" (the active-trade box
+// and rebalance-chain boxes, both drawn starting at the present and
+// extending rightward — see app.py's own _entry_x/future_edge-anchored
+// rectangles). fitContentWhenReady's own full-fit call below is what
+// actually applies this, extending its `to` past the real data's own
+// last index so the loaded bars occupy only (1 - this fraction) of the
+// resulting visible width instead of all of it.
+let futureMarginFrac = 0;
+
+// Set from options.preserve_logical_range (see handleRender) — a plain
+// synchronous save/restore of the exact visible logical range around a
+// full reload, instead of this file's own calendar-time restore logic
+// (timeRangeStillValid/savedVisibleBarCount below). Correct ONLY for a
+// caller whose dataset exclusively grows at the end and never shifts bar
+// 0 (bar replay: the same history, one more bar revealed each tick) —
+// the live chart's own ticker/TF switches change what bar 0 even IS, so
+// they still need the heavier calendar-conversion path; this is a
+// narrower, simpler alternative for the one caller that doesn't.
+let preserveLogicalRange = false;
+
+// How many of the most recent real bars fitContentWhenReady shows by
+// default when futureMarginFrac is also set — see its own call site for
+// why this has to be a bounded, reasonable window rather than the full
+// fitted history.
+const DEFAULT_VISIBLE_BARS = 120;
+
 // A single setVisibleLogicalRange() call to a drastically different zoom
 // level than the current one doesn't reliably land — confirmed directly:
 // requesting the jump from a 7-bar-wide view to the full ~9200-bar series
@@ -464,7 +524,38 @@ function fitContentWhenReady() {
     // by construction, not an approximation of it.
     const data = candleSeries.data();
     if (data.length) {
-      setFullLogicalRange(0, data.length - 1, 3);
+      if (futureMarginFrac > 0) {
+        // A bounded RECENT window, not the full fitted history stretched
+        // by the margin — extending 0..length-1 itself (thousands of
+        // bars on a deep chart) by another 2.5x hits the exact same
+        // library rendering-width ceiling this function's own comment
+        // above already documents for fitContent() (confirmed directly:
+        // produced a nonsensically over-zoomed result, not a wide view
+        // with empty space). DEFAULT_VISIBLE_BARS + proportional margin
+        // stays comfortably inside that ceiling, and is what a trader
+        // wants to default to seeing anyway — recent price action, not
+        // years of candles compressed to a smear.
+        const lastIdx = data.length - 1;
+        const visibleBars = Math.min(DEFAULT_VISIBLE_BARS, data.length);
+        // Confirmed directly: setVisibleLogicalRange silently clamps `to`
+        // back down to data.length-1 the instant it's asked for anything
+        // past the series' own last real point — even by a single index —
+        // no matter how the request got there. This formula's own margin
+        // math ends up past that ceiling by construction (lastIdx IS
+        // data.length-1, so adding any positive margin to it always
+        // exceeds data.length-1), so a caller wanting a genuine future
+        // margin has to have padded the series with real (if invisible)
+        // trailing bars beforehand — the same anchor-bar technique this
+        // component's own backfill code already uses elsewhere. Clamping
+        // here means that padding is what actually determines how much
+        // margin shows, rather than this formula silently asking for more
+        // than exists and getting the whole margin discarded instead.
+        const to = Math.min(lastIdx + visibleBars * (futureMarginFrac / (1 - futureMarginFrac)), lastIdx);
+        const from = Math.max(0, lastIdx - visibleBars + 1);
+        setFullLogicalRange(from, to, 3);
+      } else {
+        setFullLogicalRange(0, data.length - 1, 3);
+      }
     } else {
       chart.timeScale().fitContent();
     }
@@ -489,6 +580,22 @@ new ResizeObserver(() => {
   // clientHeight jump from 0 to their real values), so re-sending here
   // catches exactly that transition and self-heals it.
   if (lastFrameHeight) setFrameHeight(lastFrameHeight);
+  // Same "computed against a hidden, 0-width container" failure mode as
+  // the frame-height issue just above, but for the chart's own fit
+  // instead — confirmed directly as the actual cause of the mini panels'
+  // "not fitted" look: a chart living inside the side panel's Charts tab
+  // (not the tab visible on first render) has its OWN first
+  // fitContentWhenReady() call land while container.clientWidth is
+  // still 0 (the tab hasn't been opened yet), computing barSpacing
+  // against that instead of the chart's real eventual width — the
+  // library doesn't self-correct this once real width arrives, leaving
+  // the candles compressed into a sliver against a since-stale,
+  // absurdly wide logical range. Re-fitting here, gated on alwaysFit so
+  // this doesn't fight the main chart's own deliberately-preserved zoom
+  // on every ordinary window resize, re-runs once real dimensions are
+  // actually available — clientWidth > 0 skips the (still-hidden) resize
+  // event that reports 0, so this doesn't chase its own tail.
+  if (alwaysFit && container.clientWidth > 0) fitContentWhenReady();
 }).observe(container);
 
 // lightweight-charts has no built-in "reset zoom" gesture (no
@@ -590,10 +697,17 @@ function resolveTimeCoordinate(chart, series, time) {
 }
 
 class RectangleRenderer {
-  constructor(p1, p2, fillColor, borderColor, label, borderWidth, fillColorTo, extendToEdge) {
+  constructor(p1, p2, fillColor, borderColor, label, borderWidth, fillColorTo, extendToEdge, bodyLines) {
     this._p1 = p1; this._p2 = p2; this._fillColor = fillColor; this._borderColor = borderColor;
     this._label = label; this._borderWidth = borderWidth || 1; this._fillColorTo = fillColorTo || null;
     this._extendToEdge = extendToEdge || false;
+    // Direct request: "for every trade, within the fill area, should
+    // contain text with all confluences to consider about it" — a list
+    // of short strings stacked top-left inside the zone's own fill,
+    // distinct from `label` (the single right-anchored identifier every
+    // other zone already uses — kept as-is so this stays additive).
+    // Optional; only the rebalance chain's own boxes pass it today.
+    this._bodyLines = bodyLines || null;
   }
   draw(target) {
     target.useBitmapCoordinateSpace((scope) => {
@@ -649,10 +763,51 @@ class RectangleRenderer {
       if (this._label && this._borderColor) {
         ctx.save();
         ctx.font = `${Math.round(10 * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
+        // Direct request: "hide writings for areas that are shorter than
+        // the width of the level/area... avoid overlapping text... don't
+        // want a circus." Measures the REAL rendered text width against
+        // the zone's own actual pixel width at the CURRENT zoom, not a
+        // fixed bar-count guess — a narrow zone just skips its label
+        // instead of spilling into whatever's next to it, and the label
+        // naturally reappears once the user zooms in enough for it to
+        // fit on its own.
+        const textWidth = ctx.measureText(this._label).width;
+        if (textWidth + 8 * scope.horizontalPixelRatio <= h.length) {
+          ctx.fillStyle = this._borderColor;
+          ctx.textBaseline = 'middle';
+          ctx.textAlign = 'right';
+          ctx.fillText(this._label, h.position + h.length - 4 * scope.horizontalPixelRatio, v.position + v.length / 2);
+        }
+        ctx.restore();
+      }
+      // bodyLines: stacked top-left, inside the fill — same width-check
+      // discipline as `label` above (measure the REAL text, skip what
+      // doesn't fit), plus a height check since this is multiple lines
+      // stacked vertically, not one. A line too wide for the zone is
+      // skipped outright, never truncated or shrunk to fit — a clipped
+      // half-sentence reads worse than no sentence, and this box is
+      // wide enough to read once the user zooms in anyway. Capped by
+      // however many WHOLE lines the zone's own height actually fits;
+      // zero room means zero lines, not a cropped one poking out the
+      // bottom border.
+      if (this._bodyLines && this._bodyLines.length && this._borderColor) {
+        ctx.save();
+        const fontPx = 9;
+        ctx.font = `${Math.round(fontPx * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
         ctx.fillStyle = this._borderColor;
-        ctx.textBaseline = 'middle';
-        ctx.textAlign = 'right';
-        ctx.fillText(this._label, h.position + h.length - 4 * scope.horizontalPixelRatio, v.position + v.length / 2);
+        ctx.textBaseline = 'top';
+        ctx.textAlign = 'left';
+        const padX = 5 * scope.horizontalPixelRatio, padY = 5 * scope.verticalPixelRatio;
+        const lineHeight = fontPx * 1.5 * scope.verticalPixelRatio;
+        const maxWidth = h.length - padX * 2;
+        const maxLines = Math.floor((v.length - padY * 2) / lineHeight);
+        let drawn = 0;
+        for (const line of this._bodyLines) {
+          if (drawn >= maxLines) break;
+          if (ctx.measureText(line).width > maxWidth) continue;
+          ctx.fillText(line, h.position + padX, v.position + padY + drawn * lineHeight);
+          drawn++;
+        }
         ctx.restore();
       }
     });
@@ -676,15 +831,16 @@ class RectanglePaneView {
   renderer() {
     return new RectangleRenderer(this._p1, this._p2, this._source.fillColor, this._source.borderColor,
                                   this._source.label, this._source.borderWidth, this._source.fillColorTo,
-                                  this._source.extendToEdge);
+                                  this._source.extendToEdge, this._source.bodyLines);
   }
 }
 
 class RectanglePrimitive {
-  constructor(p1, p2, fillColor, borderColor, label, borderWidth, fillColorTo, extendToEdge) {
+  constructor(p1, p2, fillColor, borderColor, label, borderWidth, fillColorTo, extendToEdge, bodyLines) {
     this.p1 = p1; this.p2 = p2; this.fillColor = fillColor; this.borderColor = borderColor;
     this.label = label || null; this.borderWidth = borderWidth || 1; this.fillColorTo = fillColorTo || null;
     this.extendToEdge = extendToEdge || false;
+    this.bodyLines = bodyLines || null;
     this._paneViews = [new RectanglePaneView(this)];
   }
   attached({ chart, series }) { this.chart = chart; this.series = series; }
@@ -962,6 +1118,14 @@ class HLineRenderer {
         // same visual weight as every other reference line on the chart.
         const fontPx = this._dashed ? 10 : 12;
         ctx.font = `${this._dashed ? '' : 'bold '}${Math.round(fontPx * scope.verticalPixelRatio)}px -apple-system, sans-serif`;
+        // Same width-based hiding as RectangleRenderer's own labels —
+        // only meaningful for a DASHED line, whose drawn extent is its
+        // own real (possibly narrow) t0..t1 segment; a non-dashed line
+        // always stretches to the pane's own right edge (see x2 above),
+        // so it always has room and skips this check entirely.
+        const textWidth = ctx.measureText(this._label).width;
+        const fitsWidth = !this._dashed || textWidth + 8 * scope.horizontalPixelRatio <= Math.abs(x2 - x1);
+        if (!fitsWidth) { ctx.restore(); return; }
         ctx.fillStyle = this._color;
         // Above-price/bullish lines (BSL, EQH, VAH, a bullish structure
         // break, ...) sit above their own line; below-price/bearish ones
@@ -1107,7 +1271,7 @@ class MeasurePrimitive {
 }
 
 function formatMeasurePrice(v) {
-  return Math.abs(v) < 10 ? v.toFixed(5) : v.toFixed(2);
+  return v.toFixed(currentPriceDecimals);
 }
 
 function measureLabel(p1, p2) {
@@ -1292,18 +1456,36 @@ function safeSeriesUpdate(bar, volBar) {
  * ------------------------------------------------------------------- */
 // Same trick as Python's own _ny_fake_utc_seconds (see app.py) — the WS
 // feed's timestamps are genuine UTC (Binance), but every bar this chart
-// already has came from Python re-labeling NY wall-clock digits as if
-// they were UTC (lightweight-charts has no timezone setting of its own).
-// Skipping this on the WS path would place every live tick ~4-5h off the
-// historical candles it's supposed to be updating — confirmed by working
-// through exactly what _ny_fake_utc_seconds does before writing this,
-// not by trial and error against a visibly-wrong chart.
-const NY_FMT = new Intl.DateTimeFormat('en-US', {
-  timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
-  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-});
+// already has came from Python re-labeling display_tz's wall-clock digits
+// as if they were UTC (lightweight-charts has no timezone setting of its
+// own). Skipping this on the WS path would place every live tick hours
+// off the historical candles it's supposed to be updating — confirmed by
+// working through exactly what _ny_fake_utc_seconds does before writing
+// this, not by trial and error against a visibly-wrong chart.
+//
+// displayTz/DISPLAY_FMT are mutable (not a single module-level const the
+// way this started, back when the whole app only ever showed NY time) —
+// theme.render_timezone_selector() lets the user change which zone every
+// chart displays, and handleRender's own args.display_tz below rebuilds
+// this Intl formatter whenever that selection actually changes, so the
+// live-tick path always matches whatever zone the historical bars this
+// same render already carry were encoded in.
+let displayTz = 'America/New_York';
+let DISPLAY_FMT = buildDisplayFmt(displayTz);
+function buildDisplayFmt(tz) {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+}
+function setDisplayTz(tz) {
+  if (tz && tz !== displayTz) {
+    displayTz = tz;
+    DISPLAY_FMT = buildDisplayFmt(tz);
+  }
+}
 function nyFakeUtcSeconds(realUtcMs) {
-  const parts = NY_FMT.formatToParts(new Date(realUtcMs));
+  const parts = DISPLAY_FMT.formatToParts(new Date(realUtcMs));
   const get = (type) => parseInt(parts.find((p) => p.type === type).value, 10);
   let hour = get('hour');
   if (hour === 24) hour = 0; // some engines report midnight as "24" with hour12:false
@@ -1383,10 +1565,10 @@ function renderOhlc(bar, hovering) {
   // caption to say what's actually being shown.
   document.getElementById('ohlcOverlay').innerHTML =
     `<span class="sym" style="color:${color}">${ohlc.ticker || ''}</span>` +
-    `<span class="lbl"> &nbsp;O</span> <span class="val">${bar.open.toFixed(2)}</span>` +
-    `<span class="lbl"> &nbsp;H</span> <span class="val">${bar.high.toFixed(2)}</span>` +
-    `<span class="lbl"> &nbsp;L</span> <span class="val">${bar.low.toFixed(2)}</span>` +
-    `<span class="lbl"> &nbsp;C</span> <span class="val" style="color:${hovering ? '#98989d' : color}">${bar.close.toFixed(2)}</span>` +
+    `<span class="lbl"> &nbsp;O</span> <span class="val">${bar.open.toFixed(currentPriceDecimals)}</span>` +
+    `<span class="lbl"> &nbsp;H</span> <span class="val">${bar.high.toFixed(currentPriceDecimals)}</span>` +
+    `<span class="lbl"> &nbsp;L</span> <span class="val">${bar.low.toFixed(currentPriceDecimals)}</span>` +
+    `<span class="lbl"> &nbsp;C</span> <span class="val" style="color:${hovering ? '#98989d' : color}">${bar.close.toFixed(currentPriceDecimals)}</span>` +
     (hovering ? `<span class="src"> &nbsp;·&nbsp; hover</span>`
                : (ohlc.source ? `<span class="src"> &nbsp;·&nbsp; ${ohlc.source}</span>` : ''));
   renderCountdown();
@@ -1459,28 +1641,38 @@ chart.subscribeClick((param) => {
   sendToStreamlit('streamlit:setComponentValue', { value: Date.now(), dataType: 'json' });
 });
 
+// Shared by both clear paths below: turning the tool off, and right-click.
+// Detaches every completed AND in-progress measurement, leaving nothing
+// on the chart — confirmed directly as a real complaint otherwise: a
+// finished measurement used to persist indefinitely once the tool was
+// switched off (only a still-dangling, incomplete first click got
+// cleaned up), with no obvious way to remove it short of remembering
+// the right-click gesture.
+function clearAllMeasurements() {
+  measurePrimitives.forEach((p) => candleSeries.detachPrimitive(p));
+  measurePrimitives = [];
+  measureA = null;
+}
+
 document.getElementById('measureBtn').addEventListener('click', () => {
   measureMode = !measureMode;
   document.getElementById('measureBtn').classList.toggle('active', measureMode);
   container.style.cursor = measureMode ? 'crosshair' : '';
-  if (!measureMode && measureA) {
-    // Turning the tool off mid-pick — drop the dangling first-click dot
-    // rather than leaving an orphaned point nothing will ever complete.
-    const dangling = measurePrimitives.pop();
-    if (dangling) candleSeries.detachPrimitive(dangling);
-    measureA = null;
-  }
+  if (!measureMode) clearAllMeasurements();
 });
 
 // Right-click = clear, the standard convention for a drawing tool's own
-// "start over" gesture — only intercepted while the tool is actually in
-// use, so the browser's normal context menu still works otherwise.
+// "start over" gesture — works any time there's actually something to
+// clear (mid-measurement, or a completed one left over from before the
+// tool was switched off), so it stays available as an explicit "remove
+// this" even after measureMode itself has gone back to false. The
+// browser's own context menu is only suppressed when there's something
+// of ours to clear — otherwise this is a no-op and the normal menu still
+// opens.
 container.addEventListener('contextmenu', (e) => {
-  if (!measureMode) return;
+  if (!measureA && measurePrimitives.length === 0) return;
   e.preventDefault();
-  measurePrimitives.forEach((p) => candleSeries.detachPrimitive(p));
-  measurePrimitives = [];
-  measureA = null;
+  clearAllMeasurements();
 });
 
 // Per-category "did this actually change since last render" tracking —
@@ -1551,7 +1743,7 @@ function applyOverlays(overlays) {
     (overlays.rectangles || []).forEach((r) => {
       const rect = new RectanglePrimitive(
         { time: r.t0, price: r.p0 }, { time: r.t1, price: r.p1 }, r.fill, r.border || null, r.label || null,
-        r.border_width || 1, r.fill_to || null, r.extend_to_edge || false
+        r.border_width || 1, r.fill_to || null, r.extend_to_edge || false, r.body_lines || null
       );
       candleSeries.attachPrimitive(rect);
       activeRectangles.push(rect);
@@ -1624,6 +1816,22 @@ function applyIndicators(ind) {
     s.setData(ind.rsi);
     s.createPriceLine({ price: 70, color: 'rgba(255,255,255,0.25)', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: '70' });
     s.createPriceLine({ price: 30, color: 'rgba(255,255,255,0.25)', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: '30' });
+    indicatorSeries.push(s);
+    nextPane += 1;
+    numFixedPanes += 1;
+  }
+
+  if (ind.atr && ind.atr.length) {
+    // Unlike RSI (0-100, fixed bounds, worth marking 30/70) ATR has no
+    // fixed range at all — it's in the instrument's own raw price units,
+    // so it auto-scales to whatever this ticker/timeframe's own recent
+    // range is. No reference lines make sense here the way they do for
+    // RSI; the pane's own auto-scaling IS the useful read (is the line
+    // climbing = volatility expanding, falling = contracting).
+    const s = chart.addSeries(LC.LineSeries, {
+      color: '#5E5CE6', lineWidth: 1, priceLineVisible: false, lastValueVisible: true,
+    }, nextPane);
+    s.setData(ind.atr);
     indicatorSeries.push(s);
     nextPane += 1;
     numFixedPanes += 1;
@@ -1704,8 +1912,9 @@ function applyIndicators(ind) {
 
 function handleRender(args) {
   if (!args) return;
-  const { bars, fingerprint, overlays, options, height, tick_labels, indicators } = args;
+  const { bars, fingerprint, overlays, options, height, tick_labels, indicators, display_tz } = args;
   if (height) { lastFrameHeight = height; setFrameHeight(height); }
+  setDisplayTz(display_tz);
 
   tickLabels = tick_labels || {};
   volumeSeries.applyOptions({ visible: !options || options.volume !== false });
@@ -1715,6 +1924,17 @@ function handleRender(args) {
   // own for space. See the .hide-ohlc rule below.
   document.body.classList.toggle('hide-ohlc', !!(options && options.hide_ohlc));
   candleWidthFactor = (options && options.candle_width_factor) || 1;
+  alwaysFit = !!(options && options.always_fit);
+  futureMarginFrac = (options && options.future_margin_frac) || 0;
+  preserveLogicalRange = !!(options && options.preserve_logical_range);
+  // Idempotent and cheap (unlike the logical-range settling this file's
+  // retry helpers exist for) — just applied straight through every render
+  // when the caller passes it. Undefined leaves createChart's own default
+  // (see rightOffset there) untouched, so every existing caller (the main
+  // chart) keeps its already-tuned padding exactly as before.
+  if (options && options.right_offset !== undefined) {
+    chart.timeScale().applyOptions({ rightOffset: options.right_offset });
+  }
 
   const noDataEl = document.getElementById('noDataOverlay');
   const errorMessage = options && options.error_message;
@@ -1855,6 +2075,16 @@ function handleRender(args) {
       : null;
   }
 
+  // preserveLogicalRange's own capture: the exact logical {from, to} on
+  // screen RIGHT NOW, read synchronously (no debounce, no settle-tracking)
+  // — valid to reapply as-is after setData() only because this caller's
+  // own dataset never shifts bar 0, so index N still means the same bar
+  // it did a moment ago. Read here, before setData() touches anything,
+  // same reasoning as savedPriceRange/savedTimeRange above.
+  const savedExactLogicalRange = (preserveLogicalRange && effectiveFullReload && hasRenderedOnce)
+    ? chart.timeScale().getVisibleLogicalRange()
+    : null;
+
   // Overlays/indicators are rebuilt every render, independent of
   // isFullReload — a layer checkbox toggling on/off, or the
   // mitigated/opacity settings changing, doesn't touch the underlying
@@ -1867,6 +2097,14 @@ function handleRender(args) {
   applyIndicators(indicators || {});
 
   if (effectiveFullReload) {
+    // Recomputed from THIS dataset's own last close, before setData — a
+    // ticker/timeframe switch is exactly the moment the right precision
+    // can change (leaving a forex chart for a crypto one, or vice versa).
+    const lastClose = candleBars.length ? candleBars[candleBars.length - 1].close : null;
+    currentPriceDecimals = computePriceDecimals(lastClose);
+    candleSeries.applyOptions({
+      priceFormat: { type: 'price', precision: currentPriceDecimals, minMove: Math.pow(10, -currentPriceDecimals) },
+    });
     candleSeries.setData(candleBars);
     volumeSeries.setData(volBars);
     // Preferred: land on the exact same calendar window, converted to
@@ -1878,9 +2116,25 @@ function handleRender(args) {
     // with the real data off past one edge.
     const newFirst = candleBars.length ? candleBars[0].time : null;
     const newLast = candleBars.length ? candleBars[candleBars.length - 1].time : null;
-    const timeRangeStillValid = savedTimeRange && newFirst !== null &&
+    const timeRangeStillValid = !alwaysFit && savedTimeRange && newFirst !== null &&
       savedTimeRange.to >= newFirst && savedTimeRange.from <= newLast;
-    if (timeRangeStillValid) {
+    if (savedExactLogicalRange) {
+      // The whole point of preserveLogicalRange: reapply the exact same
+      // {from, to} that was on screen a moment ago, synchronously, right
+      // now — no calendar conversion, no waiting for a settle event to
+      // report back what actually landed. Correct specifically because
+      // bar 0 never moves for this caller (see this option's own
+      // declaration comment) — the indices captured above still point at
+      // the same bars in the just-rebuilt series.
+      chart.timeScale().setVisibleLogicalRange(savedExactLogicalRange);
+      lastKnownLogicalRange = savedExactLogicalRange;
+      adoptNextSettle = false;
+    } else if (alwaysFit) {
+      // Skip past the calendar-window/bar-count restore entirely — see
+      // alwaysFit's own comment above. Always lands here on every full
+      // reload (ticker/TF switch), not just first mount.
+      fitContentWhenReady();
+    } else if (timeRangeStillValid) {
       // Converting to LOGICAL indices into the NEW candleBars array first,
       // then calling setVisibleLogicalRange (a position-based API, not a
       // time-based one) — confirmed directly to land exactly on the
@@ -1937,11 +2191,22 @@ function handleRender(args) {
       // path, so lastIntendedTimeRange just adopts whatever this actually
       // shows, rather than carrying forward a window that was never
       // available here in the first place.
-      const newTo = candleBars.length - 1;
+      // futureMarginFrac > 0: same margin fitContentWhenReady applies on
+      // a fresh load, kept here too since THIS branch — not that one —
+      // is what actually fires on an ordinary timeframe switch once any
+      // zoom state has been saved (i.e. almost always, past the very
+      // first render). Shifts the window rightward by that same
+      // fraction of its own width rather than changing the zoom density
+      // (savedVisibleBarCount) itself — the user's prior zoom level is
+      // still honored, just re-centered to leave room on the right.
+      const lastRealIdx = candleBars.length - 1;
+      const newTo = futureMarginFrac > 0
+        ? lastRealIdx + savedVisibleBarCount * futureMarginFrac
+        : lastRealIdx;
       const newFrom = Math.max(0, newTo - savedVisibleBarCount);
       setLogicalRangeReliably(newFrom, newTo, 3);
       lastKnownLogicalRange = { from: newFrom, to: newTo };
-      lastIntendedTimeRange = { from: candleBars[newFrom].time, to: candleBars[newTo].time };
+      lastIntendedTimeRange = { from: candleBars[newFrom].time, to: candleBars[Math.min(lastRealIdx, Math.round(newTo))].time };
       adoptNextSettle = false;
     } else {
       // No saved state to restore at all (genuinely first load). Left to
@@ -2024,6 +2289,7 @@ Object.assign(window.__ictDebug, {
     mode: measureMode, pendingA: measureA,
     lines: measurePrimitives.map((p) => ({ p1: p.p1, p2: p.p2, label: p.label })),
   }),
+  getViewState: () => ({ futureMarginFrac, hasRenderedOnce, lastKnownLogicalRange, lastIntendedTimeRange }),
 });
 </script>
 </body></html>

@@ -1,8 +1,9 @@
 """Standard technical indicators — plain pandas, no ICT-specific logic (see
-fvg.py for that). Kept separate since these are generic/well-known formulas
-anyone would recognize, not this project's own detection logic."""
+detectors.py for that). Kept separate since these are generic/well-known
+formulas anyone would recognize, not this project's own detection logic."""
 
 import numpy as np
+import pandas as pd
 
 
 def ema(series, period):
@@ -36,6 +37,29 @@ def bollinger_bands(series, period=20, num_std=2):
     return basis + num_std * std, basis, basis - num_std * std
 
 
+def atr(df, period=14):
+    """Average True Range — Wilder's own smoothed measure of how much a
+    price typically moves per bar, in the instrument's raw price units
+    (not a percentage, not bounded). Needs the full OHLC, not just Close,
+    unlike ema/rsi/macd/bollinger_bands above — True Range for a bar is
+    the LARGEST of: that bar's own high-low, the gap up from the prior
+    close to this bar's high, or the gap down to this bar's low —
+    capturing a gap/overnight move a plain high-low range would miss
+    entirely. Smoothed the same Wilder's EWM way rsi() above already
+    does (alpha=1/period, not a plain rolling mean) — the standard,
+    industry-default variant, so this reads the same as ATR(14) on any
+    other charting platform."""
+    h_col, l_col, c_col = ("High", "Low", "Close") if "High" in df else ("high", "low", "close")
+    high, low, close = df[h_col], df[l_col], df[c_col]
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
 def volume_profile(df, n_buckets=24, value_area_pct=0.70):
     """Approximates a volume profile (how much volume traded at each PRICE
     level, not each time bar) from plain OHLCV — a real tick-level profile
@@ -62,7 +86,16 @@ def volume_profile(df, n_buckets=24, value_area_pct=0.70):
     of the total distributed volume, built by repeatedly extending
     whichever side (above the current band or below it) holds the next
     largest neighboring bucket — the standard "expand from POC" value-area
-    algorithm."""
+    algorithm. "hvn_indices"/"lvn_indices": up to 3 indices each into
+    `buckets` — High/Low Volume Nodes, the profile's other local peaks/
+    valleys beyond just POC (see their own comment below for the exact
+    rule), busiest-first for hvn / thinnest-first for lvn. Either can be
+    empty on a profile too flat/noisy to clear the prominence filter.
+    "shape"/"shape_label"/"shape_description": classic Market Profile
+    shape typing (see its own comment below) — shape is a stable machine
+    key ("normal"/"p_shape"/"b_shape"/"double_distribution"), shape_label
+    the display name, shape_description one plain-language sentence on
+    what it means for how this session traded."""
     h_col, l_col = ("High", "Low") if "High" in df else ("high", "low")
     v_col = "Volume" if "Volume" in df else ("volume" if "volume" in df else None)
     if v_col is None:
@@ -140,5 +173,90 @@ def volume_profile(df, n_buckets=24, value_area_pct=0.70):
          "volume": float(bucket_volumes[i]), "volume_frac": float(bucket_volumes[i] / max_vol)}
         for i in range(n_buckets)
     ]
+
+    # High/Low Volume Nodes — a real profile usually has more than one
+    # meaningful cluster, not just the single busiest bucket (POC): a
+    # High Volume Node is a local peak where trading concentrated (price
+    # tends to stall/consolidate there if revisited), a Low Volume Node a
+    # local valley where little did (price tends to move THROUGH fast if
+    # revisited, since there's little resting interest to absorb it) —
+    # the standard "fast market" read professional order-flow desks pull
+    # off a profile beyond just POC/VAH/VAL. "Local peak/valley" = higher/
+    # lower than BOTH neighbors (an edge bucket compares to its one
+    # neighbor only). Filtered by a minimum prominence relative to the
+    # busiest bucket, not just "any local wiggle" — confirmed directly:
+    # without a threshold, a real 24-bucket profile flagged 8-10 "peaks,"
+    # most just one bucket taller than its immediate neighbor by a few
+    # percent, nothing a trader would actually call a distinct node.
+    # poc_idx is excluded from HVN candidates — it's already the global
+    # max (trivially also a local one) and gets its own separate marker.
+    def _is_local_peak(i):
+        left_ok = i == 0 or bucket_volumes[i] > bucket_volumes[i - 1]
+        right_ok = i == n_buckets - 1 or bucket_volumes[i] > bucket_volumes[i + 1]
+        return left_ok and right_ok
+
+    def _is_local_valley(i):
+        left_ok = i == 0 or bucket_volumes[i] < bucket_volumes[i - 1]
+        right_ok = i == n_buckets - 1 or bucket_volumes[i] < bucket_volumes[i + 1]
+        return left_ok and right_ok
+
+    hvn_indices = sorted(
+        (i for i in range(n_buckets) if i != poc_idx and _is_local_peak(i) and bucket_volumes[i] >= 0.35 * max_vol),
+        key=lambda i: bucket_volumes[i], reverse=True,
+    )[:3]
+    lvn_indices = sorted(
+        (i for i in range(n_buckets) if _is_local_valley(i) and bucket_volumes[i] <= 0.15 * max_vol),
+        key=lambda i: bucket_volumes[i],
+    )[:3]
+
+    # Classic Market Profile shape typing (Steidlmayer's own terminology,
+    # still the standard professional vocabulary for "what kind of day/
+    # session was this"), read straight off the same bucket distribution:
+    #
+    # Double Distribution — a real SECOND cluster far enough from POC to
+    # be its own separate node (reusing the HVN filter above, not a fresh
+    # threshold) rather than just a wide-but-single hump. Reads as "the
+    # market spent real time in two distinct zones" — typically a trend
+    # day that broke cleanly out of one balance area into another, or a
+    # session with two separate news-driven regimes. Checked first: a
+    # profile can look lopsided toward one third by the upper/lower-share
+    # test below even while its real story is "two peaks," so this takes
+    # priority over that read.
+    #
+    # Otherwise, where the bulk of volume actually sits divides into
+    # three plain-language reads: P-shape (heavy in the upper third —
+    # short-covering/bullish acceptance, price rallied and volume built
+    # up AT the highs, not on the way there), b-shape (mirror, heavy in
+    # the lower third — bearish distribution, a top forming/acceptance at
+    # lower prices), or Normal/Balanced (volume centered, the standard
+    # bell-curve rotational read — no strong directional conviction
+    # either way). 0.45 (vs. an even one-third split's own 0.333) is
+    # "meaningfully more than its fair share," not "technically greater."
+    if any(abs(i - poc_idx) >= 0.35 * n_buckets for i in hvn_indices):
+        shape, shape_label = "double_distribution", "Double Distribution"
+        shape_description = ("Two separate value areas — the market spent real time in two distinct zones, "
+                              "often seen on a trend day that broke out of one balance into another.")
+    else:
+        third = max(1, n_buckets // 3)
+        total_vol = float(bucket_volumes.sum())
+        upper_share = float(bucket_volumes[-third:].sum()) / total_vol
+        lower_share = float(bucket_volumes[:third].sum()) / total_vol
+        if upper_share >= 0.45:
+            shape, shape_label = "p_shape", "P-shape"
+            shape_description = ("Bullish acceptance — heavy trading concentrated near the top of the range, "
+                                  "consistent with a rally that's being accepted at these higher prices, not "
+                                  "just wicking through them.")
+        elif lower_share >= 0.45:
+            shape, shape_label = "b_shape", "b-shape"
+            shape_description = ("Bearish distribution — heavy trading concentrated near the bottom of the "
+                                  "range, consistent with a decline being accepted at these lower prices, not "
+                                  "just wicking through them.")
+        else:
+            shape, shape_label = "normal", "Normal/Balanced"
+            shape_description = ("Rotational — volume centered around one area with no strong directional "
+                                  "conviction either way, the standard 'balanced auction' read.")
+
     return {"buckets": buckets, "poc_price": poc_price,
-            "value_area_high": float(bucket_highs[hi_idx]), "value_area_low": float(bucket_lows[lo_idx])}
+            "value_area_high": float(bucket_highs[hi_idx]), "value_area_low": float(bucket_lows[lo_idx]),
+            "hvn_indices": hvn_indices, "lvn_indices": lvn_indices,
+            "shape": shape, "shape_label": shape_label, "shape_description": shape_description}

@@ -1,36 +1,40 @@
 """
 "Best trade right now" for whatever ticker/timeframe the ICT Terminal is
 currently showing — the one thing the rest of this project's live-setup
-pipeline never actually does. research/signals.py already turns a detected
-zone into a concrete entry/stop/target/status box and looks up whether
-Edge Lab has ever proven a pattern family works (Benjamini-Hochberg
-correction + held-up holdout, GBPUSD=X only); research/live_scan.py +
-signals_app.py already do that across a fixed watchlist on an hourly cron.
-Nothing ranks candidates against each other or ties any of it to the
-ticker actually on screen right now — that's what this module adds, not a
-new detection layer or a new entry/stop/target formula.
+pipeline never actually does. research/setups.py already turns a detected
+zone into a concrete entry/stop/target/status box; nothing ranks
+candidates against each other or ties any of it to the ticker actually on
+screen right now — that's what this module adds, not a new detection
+layer or a new entry/stop/target formula.
 
-Presentation-agnostic like research/signals.py itself — app.py owns all
+Presentation-agnostic like research/setups.py itself — app.py owns all
 the Streamlit rendering, this module owns only the candidate-building and
 ranking, so it stays usable (and testable) without a running Streamlit
 process.
 
-Ranking is deliberately validation-first: Edge Lab's pass/fail is the only
-statistically proven signal anywhere in this project, and it only ever
-covers GBPUSD=X. A "confluence" score — how many of the OTHER currently-
-active ICT reads agree with a candidate's own direction — is a
-discretionary tiebreaker on top of that, not a second proof. For most
-tickers (anything that isn't GBPUSD=X) there will never be a validated
-candidate at all; ranking still works, it just never fools itself into
-calling a confluence-only pick "proven."
+Ranking used to be validation-first (Edge Lab's own Benjamini-Hochberg-
+corrected pass/fail, GBPUSD=X only) with confluence as a tiebreaker.
+Removed per direct request after Edge Lab's own trial-running code
+(edge_lab/agent.py and friends) turned out to be missing from the project
+entirely — never committed, unrecoverable from git history — leaving the
+whole mechanism permanently stuck at "only ever tested GBPUSD=X, and
+can't test anything else even if asked." Ranking is confluence-only now:
+the more independently-agreeing ICT reads a candidate has, the higher it
+ranks — see TF_PAIRS and _weighted_confluence_score below for how a
+higher-timeframe agreement counts for more than the same agreement on the
+entry timeframe itself, not just a tiebreak on top of something else.
 """
 
 import numpy as np
 import pandas as pd
 
-from fvg import (
+import news
+from detectors import (
     current_dealing_range,
+    detect_breaker_blocks,
+    detect_equal_highs_lows,
     detect_fvgs,
+    detect_ifvgs,
     detect_liquidity_levels,
     detect_liquidity_reactions,
     detect_liquidity_sweeps,
@@ -39,12 +43,7 @@ from fvg import (
     detect_swings,
 )
 from indicators import ema, macd, rsi
-from research.signals import (
-    EDGE_LAB_TICKER,
-    EVENT_TYPE_TO_HYPOTHESIS,
-    compute_setup,
-    load_edge_lab_validation,
-)
+from research.setups import compute_setup
 
 EVENT_TYPE_LABELS = {"fvg": "FVG", "order_block": "Order Block", "liquidity_reaction": "Liquidity Reaction",
                       "ma_fvg": "MA+FVG"}
@@ -58,49 +57,242 @@ EVENT_TYPE_LABELS = {"fvg": "FVG", "order_block": "Order Block", "liquidity_reac
 MA_FVG_PERIODS = (20, 50)
 
 
-def _validation_rank(event_type, ticker):
-    """0-3, mirroring research.signals.validation_badge's own lookup (same
-    data, same meaning) but as an orderable number instead of display text
-    — a small parallel helper rather than changing validation_badge's
-    existing (label, tone) return contract that signals_app.py already
-    relies on. 3 = validated (BH-significant AND holdout passed), 2 =
-    train-significant only, 1 = tested but nothing significant yet, 0 =
-    Edge Lab has never touched this ticker at all."""
-    if ticker != EDGE_LAB_TICKER:
-        return 0
-    hyp = EVENT_TYPE_TO_HYPOTHESIS.get(event_type)
-    v = load_edge_lab_validation().get(hyp)
-    if v is None:
-        return 1
-    return 3 if v["validated"] else 2
+# Higher-timeframe "context" paired with a lower-timeframe "entry" — the
+# standard ICT top-down read (establish bias on the bigger picture, place
+# the actual trade on a smaller one) rather than treating every timeframe
+# as its own independent, disconnected scan. Per direct request/examples:
+# 1W context for a 4h entry (a macro-swing read), 4h context for a 5m
+# entry (an intraday-scalp read), with 1D-for-1h bridging the gap between
+# them — three profiles (swing/day/scalp trader), not an exhaustive
+# cross-product of every timeframe against every other one, which would
+# mostly just re-test the same bias against itself at slightly different
+# zoom levels. Labels match TIMEFRAMES' own keys (app.py/crypto_app.py).
+TF_PAIRS = [("1W", "4h"), ("1D", "1h"), ("4h", "5m")]
+
+# How much more a context-timeframe confluence factor counts than the
+# same factor on the entry timeframe itself — per direct request ("HTF
+# also weights more than LTF confluences"). 2x is a plain, easy-to-explain
+# multiplier: a setup confirmed on both timeframes outscores one confirmed
+# on the entry timeframe alone by exactly the context-side factors' own
+# weight, not some opaque tuned constant.
+CONTEXT_WEIGHT = 2
 
 
-def _confluence_score(direction, entry_price, df):
-    """0-4 tally of how many OTHER currently-active ICT reads agree with a
-    candidate's own direction — reusing the exact detectors app.py's live
-    chart already draws, not a new indicator. A tiebreaker, not a proof;
-    see this module's own docstring."""
-    score = 0
+def _equal_level_divergence_inputs(df):
+    """The two expensive, df-level (not candidate-level) inputs
+    _equal_level_rsi_divergence needs — split out so best_trade_now can
+    compute them ONCE per dataframe and hand them to every candidate's
+    own _confluence_score call, instead of each call recomputing them
+    fresh. Confirmed directly via cProfile as a real, newly-introduced
+    cost otherwise: detect_equal_highs_lows is @st.cache_data-decorated,
+    but the cache LOOKUP itself hashes the whole dataframe every call —
+    cheap once, expensive when _confluence_score (and so this) runs once
+    per candidate, times two for a context+entry pair, across every
+    ticker in a watchlist scan. 568 calls on a real 10-ticker scan
+    measured ~18s of cumulative time inside Streamlit's own cache-hashing
+    machinery alone — not the detector, the repeated hashing to check
+    it. Returns (clusters, rsi_series); both direction-agnostic, so one
+    computation serves every candidate's bullish AND bearish checks."""
+    clusters = detect_equal_highs_lows(df)
+    close = df["Close"] if "Close" in df else df["close"]
+    return clusters, rsi(close)
 
+
+def _equal_level_rsi_divergence_clusters(direction, clusters, rsi_series):
+    """A 5th confluence factor: which Equal High/Low cluster(s) in
+    `direction`'s own favor (equal LOWS for a bullish read, equal HIGHS
+    for bearish — see detect_equal_highs_lows) show RSI divergence
+    between their first and most recent touch? Price revisiting roughly
+    the same level while momentum is already fading between the two
+    touches is the classic precursor to a liquidity sweep + reversal —
+    equal highs/lows are themselves a known resting-liquidity magnet
+    (detect_equal_highs_lows' own docstring), and divergence says the
+    move drawing price back into that pool is already running out of
+    steam. Same "does this OTHER currently-active ICT read agree" spirit
+    as the other four factors below, not a new detector. clusters/
+    rsi_series: this df's own _equal_level_divergence_inputs() output —
+    always passed in (not computed here) so many calls against the SAME
+    df, across many candidates and both directions, share one computation
+    rather than each paying for its own.
+
+    Returns the list of matching clusters (empty if none) — every
+    genuinely divergent cluster, not just the first found, so a caller
+    (see _confluence_score) can show exactly which one(s) actually
+    backed this factor rather than only a yes/no."""
+    kind = "equal_low" if direction == "bullish" else "equal_high"
+    matching = [c for c in clusters if c["type"] == kind]
+    r = rsi_series
+    out = []
+    for c in matching:
+        if c["start"] not in r.index or c["end"] not in r.index:
+            continue
+        rsi_start, rsi_end = r.loc[c["start"]], r.loc[c["end"]]
+        if pd.isna(rsi_start) or pd.isna(rsi_end):
+            continue
+        if direction == "bullish" and rsi_end > rsi_start:
+            out.append(c)
+        elif direction == "bearish" and rsi_end < rsi_start:
+            out.append(c)
+    return out
+
+
+# Plain-language description of each confluence factor, in the SAME
+# order _confluence_score checks them — lets a caller show WHICH factors
+# actually backed one specific trade (the sidebar scan results' own
+# per-pick breakdown, see app.py/crypto_app.py), not just the tally.
+# Worded the same plain-words-no-jargon way as this module's own
+# _CONFLUENCE_HELP text in app.py/crypto_app.py.
+_CONFLUENCE_FACTOR_LABELS = [
+    "Priced on the discount/premium side that favors this direction",
+    "Most recent structure break agrees with this direction",
+    "An unmitigated order block backs this direction",
+    "Resting liquidity sits in this trade's favor",
+    "An equal-high/low pool shows RSI already diverging into it",
+]
+
+
+def _confluence_base_inputs(df):
+    """The four df-level (not candidate-level) inputs the ORIGINAL four
+    confluence factors need — split out for the exact same reason
+    _equal_level_divergence_inputs was. current_dealing_range/
+    detect_structure_breaks/detect_order_blocks/detect_liquidity_levels are
+    all @st.cache_data-decorated, but the cache LOOKUP itself hashes the
+    whole dataframe every call; _confluence_score used to call all four
+    fresh on every candidate. Confirmed directly: fixing only the 5th
+    (equal-level/RSI) factor this same way barely moved a real 10-ticker
+    scan's total time (7.5s -> 6.663s), because these four PRE-EXISTING
+    calls were still paying the identical per-candidate hashing cost —
+    re-profiling after that first fix showed _confluence_score's own
+    cumulative time still dominated by exactly this pattern. best_trade_now
+    computes this ONCE per dataframe and hands it to every candidate's own
+    _confluence_score call. Returns (dealing_range, structure_breaks,
+    order_blocks, (above, below)) — all direction-agnostic, so one
+    computation serves every candidate's bullish AND bearish checks."""
     dr = current_dealing_range(df)
+    breaks = detect_structure_breaks(df)
+    obs = detect_order_blocks(df)
+    above, below = detect_liquidity_levels(df)
+    return dr, breaks, obs, (above, below)
+
+
+def _confluence_score(direction, entry_price, df, equal_level_inputs=None, base_inputs=None):
+    """0-5 tally of how many OTHER currently-active ICT reads agree with a
+    candidate's own direction — reusing the exact detectors app.py's live
+    chart already draws (plus one RSI check, see _equal_level_rsi_divergence),
+    not a new indicator layer. The sole ranking signal now (see this
+    module's own docstring on why Edge Lab's validation-first ranking was
+    removed) — used standalone for a single-timeframe candidate, or as
+    the two per-timeframe inputs _weighted_confluence_score combines for
+    a context+entry pair.
+
+    equal_level_inputs: this df's own _equal_level_divergence_inputs()
+    output. base_inputs: this df's own _confluence_base_inputs() output.
+    Both precomputed once by the caller (best_trade_now) and reused across
+    every candidate — None (compute fresh, here) only for a standalone/
+    one-off call outside that loop; every real hot-path call site passes
+    both in.
+
+    Returns (score, factor_details) — factor_details is one entry per
+    MATCHED factor: {"label": <plain description>, "zones": [...]}, each
+    zone a real price/time rectangle ({"kind": "rect", "top", "bottom",
+    "start", "end"}) or level ({"kind": "level", "price", "start",
+    "end"}) — "end": None means still open/live, draw through to the
+    chart's own future edge. This is the ACTUAL geometry that made the
+    factor match, not just its name — see app.py/crypto_app.py's "lock
+    trade" isolated view, which draws exactly these zones and nothing
+    else. score is always len(factor_details); kept as its own return
+    value so every existing ranking/filtering call site reading a plain
+    int doesn't need to change."""
+    details = []
+
+    dr, breaks, obs, (above, below) = base_inputs if base_inputs is not None else _confluence_base_inputs(df)
+
     if dr is not None:
         if (direction == "bullish" and entry_price < dr["eq"]) or \
            (direction == "bearish" and entry_price > dr["eq"]):
-            score += 1
+            details.append({
+                "label": _CONFLUENCE_FACTOR_LABELS[0],
+                "zones": [{"kind": "rect", "top": dr["top"], "bottom": dr["bottom"],
+                           "start": dr["start"], "end": None}],
+            })
 
-    breaks = detect_structure_breaks(df)
     if breaks and breaks[-1]["type"] == direction:
-        score += 1
+        b = breaks[-1]
+        details.append({
+            "label": _CONFLUENCE_FACTOR_LABELS[1],
+            "zones": [{"kind": "level", "price": b["level"], "start": b["start"], "end": None}],
+        })
 
-    obs = detect_order_blocks(df)
-    if any(not o["mitigated"] and o["type"] == direction for o in obs):
-        score += 1
+    # Most-recent-first, capped at 2 — detect_order_blocks returns EVERY
+    # unmitigated OB across the whole df, unbounded; a deep-history
+    # context timeframe can easily match 8+ of them, which would just
+    # trade one kind of chart clutter (every layer, all zones) for
+    # another (every matching OB, all zones) in the isolated "lock
+    # trade" view this feeds. Same reasoning liquidity's own detector
+    # already applies (nearest 2 above/below) — the most RECENT
+    # same-direction OB is what a trader actually means by "an
+    # unmitigated order block backs this," not an exhaustive list.
+    matching_obs = sorted((o for o in obs if not o["mitigated"] and o["type"] == direction),
+                          key=lambda o: o["start"], reverse=True)[:2]
+    if matching_obs:
+        details.append({
+            "label": _CONFLUENCE_FACTOR_LABELS[2],
+            "zones": [{"kind": "rect", "top": o["top"], "bottom": o["bottom"],
+                       "start": o["start"], "end": None} for o in matching_obs],
+        })
 
-    above, below = detect_liquidity_levels(df)
+    matching_liq = above if direction == "bullish" else below
     if (direction == "bullish" and above) or (direction == "bearish" and below):
-        score += 1
+        details.append({
+            "label": _CONFLUENCE_FACTOR_LABELS[3],
+            "zones": [{"kind": "level", "price": lvl["price"], "start": lvl["time"], "end": None}
+                      for lvl in matching_liq],
+        })
 
-    return score
+    clusters, rsi_series = equal_level_inputs if equal_level_inputs is not None else _equal_level_divergence_inputs(df)
+    # Same most-recent-first, capped-at-2 reasoning as the order-block
+    # branch above — a long-history df can show several divergent
+    # clusters at once.
+    matching_clusters = sorted(_equal_level_rsi_divergence_clusters(direction, clusters, rsi_series),
+                               key=lambda c: c["end"], reverse=True)[:2]
+    if matching_clusters:
+        details.append({
+            "label": _CONFLUENCE_FACTOR_LABELS[4],
+            "zones": [{"kind": "rect", "top": c["top"], "bottom": c["bottom"],
+                       "start": c["start"], "end": c["end"]} for c in matching_clusters],
+        })
+
+    return len(details), details
+
+
+def _weighted_confluence_score(direction, entry_price, entry_df, context_df, context_weight=CONTEXT_WEIGHT,
+                                entry_equal_level_inputs=None, context_equal_level_inputs=None,
+                                entry_base_inputs=None, context_base_inputs=None):
+    """_confluence_score run on BOTH timeframes of a context+entry pair,
+    the context side counting `context_weight`x — checked with the SAME
+    entry_price against BOTH dataframes on purpose: "is this exact entry
+    still inside the bigger picture's own discount half / does the bigger
+    picture's own last structure break agree" is exactly the top-down
+    question a context timeframe is FOR, not a mismatched comparison.
+    0-5 entry-side + 0-5*context_weight context-side — no fixed maximum
+    quoted anywhere downstream (a plain "confluence N" display, not a
+    fraction), since the max shifts if context_weight or the factor count
+    ever does.
+
+    entry_equal_level_inputs/context_equal_level_inputs: see
+    _confluence_score's own equal_level_inputs param. entry_base_inputs/
+    context_base_inputs: see its base_inputs param. best_trade_now
+    precomputes all of these once per df and passes them straight through.
+
+    Returns (total_score, entry_details, context_details) — see
+    _confluence_score's own return value for what the detail lists are."""
+    entry_score, entry_details = _confluence_score(direction, entry_price, entry_df,
+                                                     equal_level_inputs=entry_equal_level_inputs,
+                                                     base_inputs=entry_base_inputs)
+    context_score, context_details = _confluence_score(direction, entry_price, context_df,
+                                                         equal_level_inputs=context_equal_level_inputs,
+                                                         base_inputs=context_base_inputs)
+    return entry_score + context_score * context_weight, entry_details, context_details
 
 
 def _zone_is_open(zone):
@@ -120,45 +312,6 @@ def _zone_is_open(zone):
     zero behavior change there."""
     filled_key = "filled" if "filled" in zone else "mitigated"
     return not zone[filled_key] and not zone.get("expired", False)
-
-
-def _zone_at(zone, j):
-    """Reconstructs what a fresh detect_fvgs/detect_order_blocks(df.iloc
-    [:j+1], ...) call would have said about THIS exact zone at bar j,
-    using its recorded "history" (see detect_fvgs' own record_history
-    docstring) instead of re-scanning. Returns None when the zone doesn't
-    exist yet as of bar j — its own confirming/breakout candle (
-    "formation_i") hasn't closed yet, so a live trader watching bar j
-    wouldn't have seen it at all.
-
-    Zones only ever shrink (consequent encroachment is monotonic — see
-    detect_fvgs' own clamp comment), so "state as of j" is always exactly
-    the last recorded checkpoint at or before j, or the untouched raw
-    bounds if price hasn't reached it yet by j. This is what turns the
-    backtest engine's walk-forward loop from re-detecting every zone from
-    scratch at every bar (confirmed directly: 11 seconds on a real 4,334-
-    bar combo) into one detection pass plus a cheap per-bar lookup."""
-    if j < zone["formation_i"]:
-        return None
-    # raw_top/raw_bottom (FVG) or _formation_top/_formation_bottom (Order
-    # Block, which has no raw_* fields — see detect_order_blocks' own
-    # comment) — either way, this zone's bounds before anything ever
-    # touched it. Deliberately NOT included in the returned dict below
-    # under the raw_top/raw_bottom names for an Order Block: _zone_bounds
-    # (pricing) keys specifically off those names, and OB pricing was
-    # never changed to use pre-encroachment bounds the way FVG's was —
-    # spreading `zone` as-is preserves that distinction automatically,
-    # since only FVG zones carry raw_top/raw_bottom under those names.
-    active_top = zone.get("raw_top", zone.get("_formation_top"))
-    active_bottom = zone.get("raw_bottom", zone.get("_formation_bottom"))
-    for pos, top_at, bottom_at in zone["history"]:
-        if pos > j:
-            break
-        active_top, active_bottom = top_at, bottom_at
-    filled = active_top <= active_bottom
-    expiry_bar = zone["expiry_bar"]
-    expired = (not filled) and (expiry_bar is not None) and (j >= expiry_bar)
-    return {**zone, "top": active_top, "bottom": active_bottom, "filled": filled, "expired": expired}
 
 
 def _candidates(df):
@@ -223,25 +376,209 @@ def ma_fvg_starts(df):
     return {zone["start"] for _, zone in _ma_fvg_candidates(df)}
 
 
-def best_trade_now(df, ticker, interval, provider, top_n=3, event_types=None, direction=None, min_confluence=0):
+def _pattern_zones(df, event_type, direction):
+    """Every PAST occurrence (open or long since filled — this is a
+    historical count, not a live-candidate one) of `event_type` on `df`,
+    filtered to `direction`. Shared helper for pattern_win_rate; the
+    same four detectors _candidates()/_ma_fvg_candidates() already draw
+    from, so "this many past FVGs" here means the exact same thing it
+    means everywhere else in this module.
+
+    order_block/liquidity_reaction specifically ask for record_history=True
+    here (NOT how _candidates()'s own live detection calls these same
+    detectors — a separate cache entry, zero effect on that path) so each
+    zone carries _formation_top/_formation_bottom — see pattern_win_rate's
+    own use of _zone_formation_bounds for why a HISTORICAL win-rate can't
+    use these detectors' default, fully-encroached top/bottom the way a
+    LIVE candidate correctly does."""
+    if event_type == "fvg":
+        return [g for g in detect_fvgs(df) if g["type"] == direction]
+    if event_type == "order_block":
+        return [o for o in detect_order_blocks(df, record_history=True) if o["type"] == direction]
+    if event_type == "liquidity_reaction":
+        return [r for r in detect_liquidity_reactions(df, record_history=True) if r["type"] == direction]
+    if event_type == "ma_fvg":
+        return [z for t, z in _ma_fvg_candidates(df) if t == "ma_fvg" and z["type"] == direction]
+    return []
+
+
+def _zone_formation_bounds(zone):
+    """The zone's own boundaries AS FORMED, before any later consequent
+    encroachment — raw_top/raw_bottom for FVG (and ma_fvg, which inherits
+    them via its own {**g, ...} spread from a FVG zone), _formation_top/
+    _formation_bottom for order_block/liquidity_reaction (only present
+    when detected with record_history=True — see _pattern_zones above).
+    Falls back to the zone's plain top/bottom for any zone shape that
+    truly has neither (defensive; every event_type _pattern_zones can
+    produce provides one or the other in practice).
+
+    Why this matters, confirmed directly as a real bug otherwise: `df` in
+    pattern_win_rate spans the FULL available history, so a zone's own
+    top/bottom (as detect_fvgs/detect_order_blocks compute them) reflect
+    EVERY touch that ever happened to it, all the way up to the dataset's
+    last row — not what it looked like back when history first_touch
+    happened. For an old zone, that's often encroached all the way down
+    to a sliver (top==bottom) by "today," even though it was a full-size,
+    genuinely tradeable zone at first_touch time. Entry/stop computed off
+    that shrunk-by-hindsight size makes risk artificially tiny, and with
+    an unbounded forward scan (years of bars) even pure noise eventually
+    moves 2x a near-zero risk — every pattern tested came back at a
+    suspicious flat 100% hit rate this way, in both directions, which a
+    real edge (or lack of one) never would. Formation-time bounds are
+    what a trader actually saw when the trade would have triggered."""
+    top = zone.get("raw_top", zone.get("_formation_top", zone["top"]))
+    bottom = zone.get("raw_bottom", zone.get("_formation_bottom", zone["bottom"]))
+    return top, bottom
+
+
+def pattern_win_rate(df, event_type, direction, min_events=20, news_blackout_mask=None):
+    """Historical probability THIS pattern's own entry — snapped to the
+    zone's own edge, opposite edge stop, fixed 2R target, the EXACT same
+    formula best_trade_now uses for a live pick (see its own docstring)
+    — reaches its target before its stop, measured across every PAST
+    occurrence of this event_type+direction on `df`. Direct request:
+    "aggregate a probability for trades to reach target/stop."
+
+    A different question from app.py's own _historical_win_rates: that
+    one asks "did price move favorably before the NEXT pattern formed
+    (any pattern, fixed hold, no real stop)" — this one asks "did THIS
+    EXACT trade (real entry/sl/tp, as best_trade_now would size it right
+    now) actually hit its own target first, historically." Scanned
+    forward from each zone's own first_touch — best_trade_now's own live
+    "ideal entry" premise is "wait for price to retrace back to the
+    zone's own edge," so the historical equivalent has to wait for that
+    same retrace, not just count from formation. A zone that never got
+    touched again (first_touch is None) never actually triggers a trade,
+    so it's excluded here entirely — same convention fvg_event_win_rate
+    already uses elsewhere in this file. (An earlier version of this
+    function scanned from formation instead, on the reasoning that
+    best_trade_now's own premise is "assume the retrace happens" rather
+    than "wait for it" — confirmed directly as wrong: every single
+    pattern/ticker/direction tested came back at a suspicious flat 100%
+    hit rate, because the formation candle's own confirmation bar is
+    already riding the displacement's own momentum toward the target,
+    making it trivially easy to hit almost immediately. first_touch is
+    the point a live trader's resting order would actually fill.)
+
+    Entry/stop use each zone's own FORMATION-time bounds (see
+    _zone_formation_bounds), not its final top/bottom — a second,
+    separate bug found alongside the first_touch one above: `df` spans
+    the FULL available history, so a zone's plain top/bottom reflect
+    every touch that ever happened to it up to the dataset's LAST row,
+    not what it looked like at first_touch time. An old zone is often
+    encroached down to a sliver by "today" even though it was full-size
+    when first touched — entry/stop off that shrunk-by-hindsight size
+    made risk artificially tiny, and over an unbounded forward scan even
+    pure noise eventually moves 2x a near-zero risk. This was the actual
+    cause of the still-100%-everywhere result the first_touch fix alone
+    didn't resolve.
+
+    news_blackout_mask: None (default, unchanged behavior) or a boolean
+    array aligned to df.index (see news.blackout_mask) — a zone whose own
+    execution bar (exec_pos) falls inside a blackout window is excluded
+    from the count entirely, same convention _score_events uses for the
+    event-driven win rates elsewhere in this module.
+
+    Returns (rate, n, sufficient) — rate is None when n == 0 (nothing
+    ever resolved either way within the available history, e.g. a
+    ticker with almost no data yet)."""
+    zones = _pattern_zones(df, event_type, direction)
+    if not zones:
+        return None, 0, False
+
+    idx = df.index
+    pos_by_time = {t: i for i, t in enumerate(idx)}
+    high = (df["High"] if "High" in df else df["high"]).to_numpy()
+    low = (df["Low"] if "Low" in df else df["low"]).to_numpy()
+    n = len(df)
+
+    wins = total = 0
+    for zone in zones:
+        entry_pos = pos_by_time.get(zone.get("first_touch"))
+        if entry_pos is None:
+            continue  # never got touched again -- this trade never actually triggers
+        # +1, not the touch bar itself: a live system reacting to "price
+        # just touched the zone" couldn't have traded the touch bar's own
+        # close — same no-lookahead convention _score_events already uses
+        # for fvg_event_win_rate's own entries (exec_pos = entry_pos + 1).
+        exec_pos = entry_pos + 1
+        if exec_pos >= n:
+            continue
+        if news_blackout_mask is not None and news_blackout_mask[exec_pos]:
+            continue
+        form_top, form_bottom = _zone_formation_bounds(zone)
+        entry = form_top if direction == "bullish" else form_bottom
+        sl = form_bottom if direction == "bullish" else form_top
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
+        tp = entry + risk * 2 if direction == "bullish" else entry - risk * 2
+
+        fwd_high, fwd_low = high[exec_pos:], low[exec_pos:]
+        if direction == "bullish":
+            hit_tp, hit_sl = fwd_high >= tp, fwd_low <= sl
+        else:
+            hit_tp, hit_sl = fwd_low <= tp, fwd_high >= sl
+        tp_i = int(hit_tp.argmax()) if hit_tp.any() else None
+        sl_i = int(hit_sl.argmax()) if hit_sl.any() else None
+        if tp_i is None and sl_i is None:
+            continue  # never resolved either way within available history
+
+        total += 1
+        # SL wins a same-bar tie — same conservative rule compute_setup's
+        # own historical resolution already uses elsewhere in this project.
+        if tp_i is not None and (sl_i is None or tp_i < sl_i):
+            wins += 1
+
+    if total == 0:
+        return None, 0, False
+    return wins / total, total, total >= min_events
+
+
+def best_trade_now(df, ticker, interval, provider, top_n=3, event_types=None, direction=None, min_confluence=0,
+                    context_df=None, news_blackout=None):
     """The top `top_n` currently-active candidates for `ticker` at `interval`
     (already-fetched `df`, e.g. app.py's own main chart data — this does no
-    fetching of its own), ranked (validation_rank, confluence_score,
-    closest-to-entry) descending. `interval` is a plain fetch-interval
-    string ("1d", "60m", ...) — matched against research.signals.LOOKBACK
-    for how long a setup stays "live"; an interval that dict doesn't
-    recognize just falls back to its own generic default, not an error.
-    Returns [] when nothing currently active resolves — an honest empty
-    result, not a forced pick.
+    fetching of its own), ranked by confluence (closest-to-entry breaks
+    ties) descending. `interval` is a plain fetch-interval string ("1d",
+    "60m", ...) — matched against research.setups.LOOKBACK for how long a
+    setup stays "live"; an interval that dict doesn't recognize just falls
+    back to its own generic default, not an error. Returns [] when nothing
+    currently active resolves — an honest empty result, not a forced pick.
 
     event_types/direction/min_confluence: optional pre-ranking filters —
     "only consider FVG+MA-FVG candidates," "bullish only," "confluence >=
     2" — for a user who wants to steer WHICH pattern the pick comes from
     rather than just seeing whatever the ranking alone would surface.
-    None/0 (the defaults) mean unfiltered, byte-identical to this
-    function's behavior before these params existed — scan_watchlist below
-    never passes them, so the sidebar scan stays exactly as unfiltered as
-    it's always been."""
+    None/0 (the defaults) mean unfiltered.
+
+    context_df: optional — a HIGHER timeframe's own already-fetched df
+    (see TF_PAIRS) for a top-down "does the bigger picture agree" read.
+    When given, ranking uses _weighted_confluence_score (the context
+    side counts CONTEXT_WEIGHT x) instead of `df`'s own confluence alone
+    — a candidate confirmed on both timeframes outranks one confirmed on
+    just the entry timeframe, which outranks one with no confluence at
+    all. None (the default) preserves the original single-timeframe
+    behavior exactly.
+
+    news_blackout: None (default, unchanged behavior) or a
+    (minutes_before, minutes_after) pair - pattern_win_rate's own hit-rate
+    stat then excludes any historical trade that would have opened inside
+    a high-impact news window for `ticker`'s own relevant currencies (see
+    news.blackout_mask). Computed once here since every candidate below
+    shares the same df/ticker."""
+    _news_blackout_mask = (news.blackout_mask(df.index, ticker, news_blackout[0], news_blackout[1])
+                            if news_blackout else None)
+    # Computed ONCE per df here, not once per candidate inside the loop
+    # below (a genuine, measured perf regression otherwise — see
+    # _equal_level_divergence_inputs' and _confluence_base_inputs' own
+    # docstrings: Streamlit's own cache-key hashing, not the detection
+    # itself, dominates when these run once per candidate).
+    _entry_equal_inputs = _equal_level_divergence_inputs(df)
+    _context_equal_inputs = _equal_level_divergence_inputs(context_df) if context_df is not None else None
+    _entry_base_inputs = _confluence_base_inputs(df)
+    _context_base_inputs = _confluence_base_inputs(context_df) if context_df is not None else None
+    _win_rate_cache = {}
     ranked = []
     for event_type, zone in _candidates(df) + _ma_fvg_candidates(df):
         if event_types is not None and event_type not in event_types:
@@ -258,6 +595,35 @@ def best_trade_now(df, ticker, interval, provider, top_n=3, event_types=None, di
         setup = compute_setup(row, df)
         if setup is None or setup["status"] != "active":
             continue
+        # Snap entry to the zone's own NEAR edge — the classic ICT "resting
+        # limit order into the gap/block" convention — instead of
+        # compute_setup's own entry (the close of whichever bar its `end`
+        # falls on, which for every still-OPEN candidate here is always the
+        # dataframe's own last bar, i.e. current price; see that function's
+        # own docstring). Direct request: "I want it to snap, to show me
+        # the ideal [entry]." compute_setup's stop already sits at the
+        # zone's OPPOSITE edge (bottom for bullish, top for bearish) — using
+        # the near edge as entry makes risk exactly the zone's own height,
+        # not "however far price currently happens to be from the edge."
+        # Both bullish (top=entry > bottom=sl) and bearish (bottom=entry <
+        # top=sl) hold by construction for any genuinely open zone (top >
+        # bottom), which is the only kind _candidates()/_ma_fvg_candidates()
+        # ever emit — kept behind the ordering/positivity guards below
+        # anyway, as a safety net, not because either is expected to fire.
+        setup["entry_price"] = zone["top"] if setup["direction"] == "bullish" else zone["bottom"]
+        _risk = abs(setup["entry_price"] - setup["sl_price"])
+        if _risk <= 0:
+            continue
+        setup["tp_price"] = (setup["entry_price"] + _risk * 2 if setup["direction"] == "bullish"
+                              else setup["entry_price"] - _risk * 2)
+        # risk/reward_risk/distance_pct all quoted compute_setup's OLD
+        # entry — recompute against the snapped one so the R:R and
+        # "how far price still has to move to reach entry" both stay
+        # honest (distance_pct also feeds the ranking tiebreak's own
+        # -abs(distance_pct), closest-to-live-first).
+        setup["risk"] = _risk
+        setup["reward_risk"] = abs(setup["tp_price"] - setup["entry_price"]) / _risk
+        setup["distance_pct"] = (setup["current_price"] - setup["entry_price"]) / setup["entry_price"] * 100
         # compute_setup's own stop formula (sl_price = the zone's own
         # bottom/top) quietly assumes the zone actually BRACKETS current
         # price — true for a genuinely live zone, but a currently-open FVG
@@ -278,24 +644,253 @@ def best_trade_now(df, ticker, interval, provider, top_n=3, event_types=None, di
         else:
             if not (setup["tp_price"] < setup["entry_price"] < setup["sl_price"]):
                 continue
-        setup["confluence_score"] = _confluence_score(setup["direction"], setup["entry_price"], df)
+        # Same stale-zone family as the ordering check above, one level
+        # further: an unusually wide zone (risk far larger than entry
+        # itself — confirmed directly scanning multiple timeframes at
+        # once, which surfaces coarser TFs' own wider zones far more
+        # often than a single-timeframe call ever used to) can pass the
+        # ordering check while still landing sl_price or tp_price at or
+        # below zero — a real instrument's price never does that, so a
+        # target of -10830 is exactly as broken a recommendation as one
+        # with sl/tp on the wrong side, just a different way to get there.
+        if setup["sl_price"] <= 0 or setup["tp_price"] <= 0:
+            continue
+        # confluence_entry_details/confluence_context_details: the actual
+        # zones/levels behind WHICH factors backed this specific trade —
+        # not just the tally already in confluence_score. See
+        # app.py/crypto_app.py's own per-result breakdown popover and
+        # "lock trade" isolated chart view.
+        if context_df is not None:
+            _total, _entry_details, _context_details = _weighted_confluence_score(
+                setup["direction"], setup["entry_price"], df, context_df,
+                entry_equal_level_inputs=_entry_equal_inputs, context_equal_level_inputs=_context_equal_inputs,
+                entry_base_inputs=_entry_base_inputs, context_base_inputs=_context_base_inputs)
+            setup["confluence_score"] = _total
+            setup["confluence_entry_details"] = _entry_details
+            setup["confluence_context_details"] = _context_details
+        else:
+            _score, _details = _confluence_score(setup["direction"], setup["entry_price"], df,
+                                                  equal_level_inputs=_entry_equal_inputs,
+                                                  base_inputs=_entry_base_inputs)
+            setup["confluence_score"] = _score
+            setup["confluence_entry_details"] = _details
+            setup["confluence_context_details"] = []
         if setup["confluence_score"] < min_confluence:
             continue
-        setup["validation_rank"] = _validation_rank(event_type, ticker)
+        # The trigger zone itself — what this candidate actually IS, not
+        # just what backs it (see confluence_entry_details above). Every
+        # candidate here came from _candidates()/_ma_fvg_candidates(),
+        # which only ever emit currently-OPEN zones, so "end": None
+        # (still live, draw through to the chart's own future edge) is
+        # always correct here, not a per-zone check.
+        setup["source_zone"] = {"kind": "rect", "top": zone["top"], "bottom": zone["bottom"],
+                                 "start": zone["start"], "end": None}
+        # Direct request: "aggregate a probability for trades to reach
+        # target/stop" — historical P(this exact entry/sl/tp formula
+        # hits target before stop), see pattern_win_rate's own docstring.
+        # Cached per (event_type, direction) within this call, not
+        # recomputed per candidate — several candidates sharing the same
+        # zone type + direction (e.g. two open bullish FVGs) would
+        # otherwise re-scan the same history twice for an identical
+        # answer, the same "compute once per df" reasoning as the
+        # confluence inputs above.
+        _wr_key = (event_type, setup["direction"])
+        if _wr_key not in _win_rate_cache:
+            _win_rate_cache[_wr_key] = pattern_win_rate(df, event_type, setup["direction"],
+                                                         news_blackout_mask=_news_blackout_mask)
+        _wr_rate, _wr_n, _wr_sufficient = _win_rate_cache[_wr_key]
+        setup["hit_rate"] = _wr_rate
+        setup["hit_rate_n"] = _wr_n
+        setup["hit_rate_sufficient"] = _wr_sufficient
         ranked.append(setup)
 
-    ranked.sort(key=lambda s: (s["validation_rank"], s["confluence_score"], -abs(s["distance_pct"])), reverse=True)
+    ranked.sort(key=lambda s: (s["confluence_score"], -abs(s["distance_pct"])), reverse=True)
     return ranked[:top_n]
 
 
-def scan_watchlist(dfs_by_ticker, interval, top_n=8):
+# ---------------------------------------------------------------------------
+# "Where is price more likely to head next" — direct request: rank every
+# currently-open level (FVG/IFVG/Order Block/Breaker Block/resting
+# liquidity) by an actual historical PROBABILITY OF BEING VISITED, not raw
+# proximity. This is a genuinely different question from best_trade_now's
+# own hit_rate: that one asks "if this exact trade were taken, does it
+# reach target before stop" — this one asks "does price even reach this
+# level AT ALL," with no trade construction involved. Deliberately its own
+# statistic (_level_touch_rates below), not a repurposing of pattern_win_
+# rate/fvg_event_win_rate, which both already assume a trade was entered
+# and score its outcome — a level nobody entered a trade at can still be
+# "visited" or not, and that's the only thing being measured here.
+#
+# The core idea: how far a level sat from price WHEN IT FORMED predicts,
+# historically, how likely it is to get touched at all — a level that
+# formed 0.2% from price is a near-certain eventual touch; one that formed
+# 8% away may never get revisited. Bucketing by that formation-time
+# distance and asking "of all levels like this one, what fraction
+# eventually got touched" turns raw proximity into an actual, ticker-
+# specific probability instead of an assumption that "closer = more
+# likely" holds the same way for every zone type.
+_DISTANCE_BUCKETS = [
+    (0.0, 0.005, "0-0.5%"), (0.005, 0.015, "0.5-1.5%"),
+    (0.015, 0.03, "1.5-3%"), (0.03, float("inf"), "3%+"),
+]
+
+
+def _distance_bucket(pct):
+    for lo, hi, label in _DISTANCE_BUCKETS:
+        if lo <= pct < hi:
+            return label
+    return _DISTANCE_BUCKETS[-1][2]
+
+
+def _zone_mid(zone):
+    if "top" in zone and "bottom" in zone:
+        return (zone["top"] + zone["bottom"]) / 2
+    return zone["price"]
+
+
+def _swing_touch_events(df):
+    """Every swing high/low ever confirmed (detect_swings), each tagged
+    with whether it EVER later got wicked through ("swept" — the same
+    untouched-high/low check detect_liquidity_levels already does inline,
+    just run against every swing in history instead of only the currently-
+    live ones) and formed as a point (price, not a top/bottom range) so it
+    slots into the same distance-bucket machinery as FVG/OB/IFVG/Breaker
+    below. Returns a plain list of {"start","price","first_touch"} dicts —
+    first_touch is a placeholder timestamp (not the real sweep time, which
+    this doesn't need) whenever swept=True, None otherwise, matching every
+    other zone type's own "was this ever touched" field name."""
+    high_col = "High" if "High" in df else "high"
+    low_col = "Low" if "Low" in df else "low"
+    high_arr = df[high_col].to_numpy()
+    low_arr = df[low_col].to_numpy()
+    highs, lows = detect_swings(df)
+    out = []
+    for h in highs:
+        after = high_arr[h["pos"] + 1:]
+        swept = after.size > 0 and bool((after >= h["price"]).any())
+        out.append({"start": h["time"], "price": h["price"], "first_touch": h["time"] if swept else None})
+    for l in lows:
+        after = low_arr[l["pos"] + 1:]
+        swept = after.size > 0 and bool((after <= l["price"]).any())
+        out.append({"start": l["time"], "price": l["price"], "first_touch": l["time"] if swept else None})
+    return out
+
+
+_LEVEL_DETECTORS = {
+    "FVG": lambda df: detect_fvgs(df),
+    "IFVG": lambda df: detect_ifvgs(df),
+    "Order Block": lambda df: detect_order_blocks(df),
+    "Breaker Block": lambda df: detect_breaker_blocks(df),
+    "Liquidity": _swing_touch_events,
+}
+
+
+def _historical_touch_rates(df, min_events=10):
+    """{level_type: {distance_bucket: (rate, n)}} — the empirical fraction
+    of every historical level of this type, formed at roughly this
+    distance from price at the time, that ever got touched. n below
+    min_events isn't dropped (a caller decides what to do with a thin
+    sample), just flagged via the 3rd tuple element."""
+    close = df["Close"] if "Close" in df else df["close"]
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+    out = {}
+    for level_type, detector in _LEVEL_DETECTORS.items():
+        try:
+            zones = detector(df)
+        except Exception:
+            zones = []
+        buckets = {}
+        for z in zones:
+            pos = pos_by_time.get(z["start"])
+            if pos is None:
+                continue
+            price_then = float(close.iloc[pos])
+            if price_then <= 0:
+                continue
+            pct = abs(_zone_mid(z) - price_then) / price_then
+            bucket = _distance_bucket(pct)
+            counts = buckets.setdefault(bucket, [0, 0])
+            counts[0] += 1
+            if z.get("first_touch") is not None:
+                counts[1] += 1
+        out[level_type] = {b: (touched / total, total, total >= min_events)
+                            for b, (total, touched) in buckets.items() if total > 0}
+    return out
+
+
+def rank_levels_by_visit_probability(df, current_price, top_n=10, min_events=10):
+    """The actual answer to "where is price more likely to head next":
+    every currently-open level across FVG/IFVG/Order Block/Breaker Block/
+    resting liquidity, ranked by the historical touch-rate for its own
+    type + how far it sits from price right now (see this section's own
+    module comment for the full reasoning). A level whose bucket has too
+    thin a historical sample (< min_events) still appears — ranked below
+    every level with a real sample, via the sort key's own ordering — with
+    "sufficient": False so a caller can label it "not enough history" the
+    same honest way pattern_win_rate's own callers already do, instead of
+    silently pretending a 3-event sample is as trustworthy as a 300-event
+    one.
+
+    Returns a list of {"type","zone","distance_pct","probability","n",
+    "sufficient"}, sorted by (sufficient, probability) descending — a real,
+    well-supported probability always outranks an insufficient-data one
+    regardless of the raw number, which could be a fluke."""
+    hist_rates = _historical_touch_rates(df, min_events=min_events)
+
+    open_by_type = {
+        "FVG": [g for g in detect_fvgs(df) if not g["filled"]],
+        "IFVG": [z for z in detect_ifvgs(df) if z.get("first_touch") is None],
+        "Order Block": [o for o in detect_order_blocks(df) if not o["mitigated"]],
+        "Breaker Block": [z for z in detect_breaker_blocks(df) if z.get("first_touch") is None],
+    }
+    live_highs, live_lows = detect_liquidity_levels(df, n_above=top_n, n_below=top_n)
+    open_by_type["Liquidity"] = (
+        [{"start": h["time"], "price": h["price"], "kind": "BSL"} for h in live_highs]
+        + [{"start": l["time"], "price": l["price"], "kind": "SSL"} for l in live_lows]
+    )
+
+    if current_price <= 0:
+        return []
+
+    ranked = []
+    for level_type, zones in open_by_type.items():
+        rates = hist_rates.get(level_type, {})
+        for z in zones:
+            mid = _zone_mid(z)
+            pct = abs(mid - current_price) / current_price
+            bucket = _distance_bucket(pct)
+            rate, n, sufficient = rates.get(bucket, (None, 0, False))
+            ranked.append({
+                "type": level_type, "zone": z, "price": mid, "distance_pct": pct * 100,
+                "probability": rate, "n": n, "sufficient": sufficient,
+            })
+
+    ranked.sort(key=lambda r: (r["sufficient"], r["probability"] if r["probability"] is not None else -1),
+                reverse=True)
+    return ranked[:top_n]
+
+
+def scan_watchlist(dfs_by_ticker, interval, top_n=8, context_dfs_by_ticker=None):
     """The multi-symbol version of best_trade_now — each ticker's own single
     best candidate (best_trade_now(..., top_n=1)), combined across every
     ticker in `dfs_by_ticker` ({ticker: already-fetched df}) and ranked
-    against each other the same way (validation_rank, confluence_score,
-    closest-to-entry). For a sidebar/watchlist view: "which symbol has the
-    best-supported setup right now," not "what's the best setup on the one
-    symbol already on screen."
+    against each other by confluence. For a sidebar/watchlist view: "which
+    symbol has the best-supported setup right now," not "what's the best
+    setup on the one symbol already on screen."
+
+    context_dfs_by_ticker: optional {ticker: already-fetched HIGHER-
+    timeframe df} — when given, each ticker's candidate is scored with
+    that ticker's own context_df (see best_trade_now's own context_df
+    param / _weighted_confluence_score), the same top-down context+entry
+    read scan_timeframes uses, just one fixed pair (TF_PAIRS[0], "1W"
+    context for the "4h" entry every caller here already uses) instead of
+    trying every pair — trying all of TF_PAIRS per ticker would mean
+    fetching 2 dataframes x 3 pairs for every ticker in the watchlist at
+    once, a real fetch-cost multiplier this sidebar scan doesn't need to
+    pay for a single representative top-down read. None (the default)
+    preserves the original single-timeframe behavior exactly — a ticker
+    missing from this dict (or whose context df is None/empty) just falls
+    back to plain confluence, not an error.
 
     Fetching stays the caller's job — same reason best_trade_now takes an
     already-fetched df instead of a ticker to fetch itself: this module
@@ -308,9 +903,90 @@ def scan_watchlist(dfs_by_ticker, interval, top_n=8):
     for ticker, df in dfs_by_ticker.items():
         if df is None or df.empty:
             continue
-        ranked.extend(best_trade_now(df, ticker, interval, provider=None, top_n=1))
-    ranked.sort(key=lambda s: (s["validation_rank"], s["confluence_score"], -abs(s["distance_pct"])), reverse=True)
+        context_df = (context_dfs_by_ticker or {}).get(ticker)
+        if context_df is not None and context_df.empty:
+            context_df = None
+        ranked.extend(best_trade_now(df, ticker, interval, provider=None, top_n=1, context_df=context_df))
+    ranked.sort(key=lambda s: (s["confluence_score"], -abs(s["distance_pct"])), reverse=True)
     return ranked[:top_n]
+
+
+def scan_timeframes(dfs_by_pair, ticker, top_n=8):
+    """The multi-timeframe sibling of scan_watchlist — same idea, turned
+    sideways: instead of "which SYMBOL has the best setup right now" (one
+    timeframe, every ticker), this is "which of THIS symbol's context+
+    entry timeframe PAIRS (see TF_PAIRS) has the best setup right now."
+    Each pair's own single best candidate — best_trade_now(entry_df,
+    ..., top_n=1, context_df=context_df), the higher timeframe read as
+    top-down context, not just another independent timeframe to flatten
+    against every other one — combined across every pair in `dfs_by_pair`
+    and ranked against each other by confluence (context-side counting
+    CONTEXT_WEIGHT x, see _weighted_confluence_score). Not "what's active
+    on whatever timeframe happens to already be charted," which is all a
+    single best_trade_now call on its own can answer.
+
+    dfs_by_pair: {(context_tf, entry_tf): (context_df, entry_df,
+    entry_fetch_interval)} — the two tf labels are this app's own short
+    timeframe keys ("4h", "1D", ...matching TIMEFRAMES, and TF_PAIRS'
+    own shape), entry_fetch_interval is the yfinance-style interval
+    string best_trade_now needs for its own LOOKBACK lookup (see its own
+    docstring). Each returned candidate carries its own "timeframe"
+    (the ENTRY tf — for jumping the chart there on click, since that's
+    where the trade actually sits) and "context_timeframe" keys on top
+    of everything best_trade_now already returns. A pair whose fetch
+    failed or came back empty on either side is just skipped, not an
+    error — a partial scan is still a useful scan."""
+    ranked = []
+    for (context_tf, entry_tf), (context_df, df, fetch_interval) in dfs_by_pair.items():
+        if df is None or df.empty or context_df is None or context_df.empty:
+            continue
+        picks = best_trade_now(df, ticker, fetch_interval, provider=None, top_n=1, context_df=context_df)
+        for p in picks:
+            p["timeframe"] = entry_tf
+            p["context_timeframe"] = context_tf
+        ranked.extend(picks)
+    ranked.sort(key=lambda s: (s["confluence_score"], -abs(s["distance_pct"])), reverse=True)
+    return ranked[:top_n]
+
+
+def rebalance_chain(setups, current_price):
+    """Reorders `setups` (e.g. scan_timeframes' own output for one ticker)
+    into a greedy nearest-price walk instead of confluence rank — direct
+    request: "rank them by distance... from that place, which one is the
+    closest, and so on... I want to see what the market maker's pattern
+    might look like." Each setup's own entry_price is already the IDEAL
+    entry (best_trade_now snaps it to the zone's own near edge — see its
+    own docstring), i.e. the price that "rebalances"/hunts into that
+    zone; the theory this chain visualizes is that price travels to the
+    nearest un-hunted zone, rebalances it, then turns toward whichever
+    remaining zone is nearest FROM THERE — a plausible step-by-step
+    delivery path through the levels, not just a flat list.
+
+    Starting from `current_price`, repeatedly picks whichever remaining
+    setup's entry_price is closest to the PREVIOUS step's own price
+    (current_price for the first step) and appends it, until every setup
+    has been placed exactly once. A pure greedy nearest-neighbor tour —
+    it does not attempt to minimize total path length across all setups
+    (that's a much harder problem, and not what "closest, then closest
+    from there" asks for); it only ever asks "closest to where we just
+    got to."
+
+    Returns a list of {"setup": <original dict, untouched>, "from_price",
+    "to_price", "distance"} in visiting order — "distance" is SIGNED
+    (to_price - from_price), so a positive value means that hop is
+    upward, negative downward."""
+    remaining = list(setups)
+    chain = []
+    from_price = current_price
+    while remaining:
+        nxt = min(remaining, key=lambda s: abs(s["entry_price"] - from_price))
+        chain.append({
+            "setup": nxt, "from_price": from_price,
+            "to_price": nxt["entry_price"], "distance": nxt["entry_price"] - from_price,
+        })
+        from_price = nxt["entry_price"]
+        remaining.remove(nxt)
+    return chain
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +1047,7 @@ def _next_exit(exit_positions, after_pos):
     return int(exit_positions[i]) if i < len(exit_positions) else None
 
 
-def _score_events(df, entries, exit_positions, min_events):
+def _score_events(df, entries, exit_positions, min_events, news_blackout_mask=None):
     """entries: [(entry_pos, direction), ...]. Executes one bar after each
     entry_pos (that bar's open), holds until the next exit_positions entry
     (that bar's close) — raw return, sign-flipped for bearish so a "win"
@@ -379,6 +1055,14 @@ def _score_events(df, entries, exit_positions, min_events):
     left in the dataset (ran off the end) is dropped, same as the fixed-bar
     version dropping an entry with insufficient forward bars — an
     unresolved trade isn't a scoreable one either way.
+
+    news_blackout_mask: None (default, unchanged behavior) or a boolean
+    array aligned to df.index (see news.blackout_mask) — an entry whose
+    OWN execution bar (exec_pos, not entry_pos) falls inside a blackout
+    window is dropped too, same as a real trader skipping a setup that
+    would have opened right into a high-impact release rather than taking
+    it and hoping the spread/slippage doesn't eat the edge.
+
     Returns {"bullish": (rate, n, sufficient), "bearish": (...)}."""
     open_ = (df["Open"] if "Open" in df else df["open"]).to_numpy()
     close = (df["Close"] if "Close" in df else df["close"]).to_numpy()
@@ -387,6 +1071,8 @@ def _score_events(df, entries, exit_positions, min_events):
     for entry_pos, direction in entries:
         exec_pos = entry_pos + 1
         if exec_pos >= n_bars:
+            continue
+        if news_blackout_mask is not None and news_blackout_mask[exec_pos]:
             continue
         exit_pos = _next_exit(exit_positions, exec_pos)
         if exit_pos is None:
@@ -405,15 +1091,18 @@ def _score_events(df, entries, exit_positions, min_events):
     return out
 
 
-def fvg_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20):
+def fvg_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20,
+                        news_blackout_mask=None):
     """FVG win rate under the event-driven exit rule (see module comment
     above) — touch = first_touch (unchanged from the fixed-bar version),
-    exit = the next chosen event type forming."""
+    exit = the next chosen event type forming. news_blackout_mask: see
+    _score_events."""
     idx = df.index
     pos_by_time = {t: i for i, t in enumerate(idx)}
     entries = [(pos_by_time[g["first_touch"]], g["type"])
                for g in detect_fvgs(df) if g["first_touch"] is not None]
-    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events)
+    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events,
+                          news_blackout_mask=news_blackout_mask)
 
 
 def fvg_run_up_stats(df, min_events=20):
@@ -468,30 +1157,35 @@ def fvg_run_up_stats(df, min_events=20):
     return out
 
 
-def order_block_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20):
+def order_block_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20,
+                                news_blackout_mask=None):
     """Order Block win rate under the event-driven exit rule — touch =
     first_touch (unchanged from the fixed-bar version), exit = the next
-    chosen event type forming."""
+    chosen event type forming. news_blackout_mask: see _score_events."""
     idx = df.index
     pos_by_time = {t: i for i, t in enumerate(idx)}
     entries = [(pos_by_time[ob["first_touch"]], ob["type"])
                for ob in detect_order_blocks(df) if ob["first_touch"] is not None]
-    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events)
+    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events,
+                          news_blackout_mask=news_blackout_mask)
 
 
-def liquidity_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20):
+def liquidity_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20,
+                              news_blackout_mask=None):
     """External-range-liquidity win rate under the event-driven exit rule
     — touch = the sweep itself (direction convention matches
     detect_liquidity_sweeps' own `type`: sweeping a high points bearish,
     sweeping a low points bullish), exit = the next chosen event type
-    forming."""
+    forming. news_blackout_mask: see _score_events."""
     idx = df.index
     pos_by_time = {t: i for i, t in enumerate(idx)}
     entries = [(pos_by_time[sweep["end"]], sweep["type"]) for sweep in detect_liquidity_sweeps(df)]
-    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events)
+    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events,
+                          news_blackout_mask=news_blackout_mask)
 
 
-def ma_fvg_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20, periods=MA_FVG_PERIODS):
+def ma_fvg_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), min_events=20, periods=MA_FVG_PERIODS,
+                           news_blackout_mask=None):
     """MA+FVG win rate — the one case where "touch" genuinely means
     something different from plain FVG: entry is the first bar an EMA
     (MA_FVG_PERIODS) actually reaches the gap's own ORIGINAL [raw_bottom,
@@ -499,7 +1193,8 @@ def ma_fvg_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), mi
     formation and its recorded fill point, or the last bar if it never
     filled) — "the indicator's own level," not "price touched anywhere in
     the zone." Exit = the next chosen event type forming, same as every
-    other event-driven win rate here."""
+    other event-driven win rate here. news_blackout_mask: see
+    _score_events."""
     close = df["Close"] if "Close" in df else df["close"]
     idx = df.index
     pos_by_time = {t: i for i, t in enumerate(idx)}
@@ -519,7 +1214,8 @@ def ma_fvg_event_win_rate(df, exit_types=("fvg", "order_block", "liquidity"), mi
                 break
         if touch_pos is not None:
             entries.append((touch_pos, g["type"]))
-    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events)
+    return _score_events(df, entries, _exit_positions(df, set(exit_types)), min_events,
+                          news_blackout_mask=news_blackout_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +1347,7 @@ RULE_DETECTOR_LABELS = {"fvg": "FVG", "order_block": "Order Block", "liquidity":
 # Target/Stop each pick their own independently (e.g. entry at 75% of the
 # zone, stop at 25%), rather than one shared point for all three. Kept as
 # an ordered list (not just a set of valid values) since both app.py's and
-# backtest_app.py's sliders build their step options directly from it.
+# backtest_ui.py's sliders build their step options directly from it.
 #
 # "near"/"far" is relative to CURRENT PRICE, not the zone's own raw
 # bottom/top — see _zone_point_price's own docstring for why: a "below"
@@ -794,50 +1490,126 @@ def _zone_point_price(zone, zone_point, side):
 # that class of bug structurally impossible rather than a discipline you
 # have to remember).
 
-def _resolve_fvg_cached(raw, rule, current_price, as_of_bar, origin_out):
+def _build_zone_tracker(zones):
+    """Wraps a raw detect_fvgs/detect_order_blocks zone list for the
+    incremental as_of_bar walk backtest_custom_rule performs — zones
+    sorted by formation_i once, with per-zone history-checkpoint state
+    advanced forward-only as as_of_bar increases across calls, instead of
+    re-scanning EVERY zone's full history from scratch (including zones
+    long since closed) on every single resolve_rule call. Confirmed
+    directly via cProfile as the dominant cost of a real backtest run:
+    the old per-call full-history rescan this replaces (_zone_at, called
+    once per zone per resolve_rule call) alone accounted for ~4.8s of a
+    real 4.4s BTC-USD/4h/730d/FVG-anchored run.
+
+    Never mutates a raw zone dict (those come straight from detect_fvgs/
+    detect_order_blocks, which are @st.cache_data-cached and may be
+    shared with other callers) — all tracked state lives in this
+    tracker's own side-dict, keyed by index into `zones`.
+
+    Correctness relies on as_of_bar only ever increasing across calls
+    within one backtest_custom_rule run (see its own docstring — i only
+    ever grows across that loop) — advancing forward from the tracker's
+    own last-seen bar each time, never restarting from scratch, is what
+    makes this safe rather than a lookahead risk: a zone's state as of
+    bar j never depends on anything after j regardless of when it's
+    computed, so replaying the same checkpoints in the same order just
+    once, instead of once per call, changes nothing about the result."""
+    order = sorted(range(len(zones)), key=lambda idx: zones[idx]["formation_i"])
+    return {"zones": zones, "order": order, "open_ptr": 0, "active": {}, "last_j": -1}
+
+
+def _advance_zone_tracker(tracker, j):
+    zones = tracker["zones"]
+    order = tracker["order"]
+    active = tracker["active"]
+    ptr = tracker["open_ptr"]
+    n = len(order)
+    while ptr < n and zones[order[ptr]]["formation_i"] <= j:
+        idx = order[ptr]
+        zone = zones[idx]
+        active[idx] = {
+            "hist_ptr": 0,
+            "top": zone.get("raw_top", zone.get("_formation_top")),
+            "bottom": zone.get("raw_bottom", zone.get("_formation_bottom")),
+        }
+        ptr += 1
+    tracker["open_ptr"] = ptr
+    closed = []
+    for idx, state in active.items():
+        zone = zones[idx]
+        hist = zone["history"]
+        hp = state["hist_ptr"]
+        hn = len(hist)
+        while hp < hn and hist[hp][0] <= j:
+            _, state["top"], state["bottom"] = hist[hp]
+            hp += 1
+        state["hist_ptr"] = hp
+        filled = state["top"] <= state["bottom"]
+        expiry_bar = zone["expiry_bar"]
+        if filled or ((expiry_bar is not None) and (j >= expiry_bar)):
+            closed.append(idx)
+    for idx in closed:
+        del active[idx]
+    tracker["last_j"] = j
+
+
+def _resolve_zone_tracker_cached(tracker, rule, current_price, as_of_bar, origin_out):
+    if tracker["last_j"] != as_of_bar:
+        _advance_zone_tracker(tracker, as_of_bar)
+    zones = tracker["zones"]
     side = rule.get("side", "above")
-    zones = [z for z in (_zone_at(g, as_of_bar) for g in raw) if z is not None and _zone_is_open(z)]
-    z = _nth_zone_on_side(zones, current_price, side, rule.get("n", 1))
+    open_zones = [{**zones[idx], "top": state["top"], "bottom": state["bottom"],
+                    "filled": False, "expired": False}
+                  for idx, state in tracker["active"].items()]
+    z = _nth_zone_on_side(open_zones, current_price, side, rule.get("n", 1))
     if z is not None and origin_out is not None:
         origin_out["time"] = z["start"]
     return _zone_point_price(z, rule.get("zone_point", 0.5), side) if z else None
+
+
+def _resolve_fvg_cached(raw, rule, current_price, as_of_bar, origin_out):
+    return _resolve_zone_tracker_cached(raw, rule, current_price, as_of_bar, origin_out)
 
 
 def _resolve_order_block_cached(raw, rule, current_price, as_of_bar, origin_out):
-    side = rule.get("side", "above")
-    zones = [z for z in (_zone_at(o, as_of_bar) for o in raw) if z is not None and _zone_is_open(z)]
-    z = _nth_zone_on_side(zones, current_price, side, rule.get("n", 1))
-    if z is not None and origin_out is not None:
-        origin_out["time"] = z["start"]
-    return _zone_point_price(z, rule.get("zone_point", 0.5), side) if z else None
+    return _resolve_zone_tracker_cached(raw, rule, current_price, as_of_bar, origin_out)
+
+
+def _first_touch_bar(arr, pos, price, above):
+    """First bar index after `pos` where `arr` reaches/crosses `price` —
+    None if it never does across the rest of the series. `above=True` for
+    a swing high's own resistance level (touched once a later high >=
+    price); False for a swing low's support level (touched once a later
+    low <= price). Computed ONCE per swing point with a single vectorized
+    numpy scan, replacing a fresh array-slice-plus-.all() scan repeated at
+    EVERY as_of_bar call in the walk-forward loop (confirmed directly via
+    cProfile: ~1.3s of a real 4.4s run, called ~1M times total)."""
+    after = arr[pos + 1:]
+    mask = (after >= price) if above else (after <= price)
+    hits = np.nonzero(mask)[0]
+    return int(pos + 1 + hits[0]) if hits.size > 0 else None
 
 
 def _resolve_liquidity_cached(raw, rule, current_price, as_of_bar, origin_out):
     j = as_of_bar
-    high_arr, low_arr = raw["high_arr"], raw["low_arr"]
-
-    def _untouched_high(point):
-        after = high_arr[point["pos"] + 1: j + 1]
-        return after.size == 0 or bool((after < point["price"]).all())
-
-    def _untouched_low(point):
-        after = low_arr[point["pos"] + 1: j + 1]
-        return after.size == 0 or bool((after > point["price"]).all())
-
     # Confirmed directly this is lookahead-safe, not just faster:
     # detect_swings is a single forward-only pass whose state at bar i
     # depends only on bars 0..i, so filtering the FULL run's own output by
     # confirmed_pos <= j is bit-for-bit identical to what a fresh
     # detect_swings(df.iloc[:j+1]) call would have produced — same swings,
     # same confirmation bars, just computed once instead of redundantly at
-    # every bar (see detect_swings' own pos/confirmed_pos docstring).
+    # every bar (see detect_swings' own pos/confirmed_pos docstring). Same
+    # reasoning covers pre-computed "first touch" bars below: a point's
+    # own future price path never depends on which bar you ask "was this
+    # touched yet" from.
     live_highs = sorted(
-        (h for h in raw["highs"]
-         if h["confirmed_pos"] <= j and h["price"] > current_price and _untouched_high(h)),
+        (h for h, touch in zip(raw["highs"], raw["high_touch"])
+         if h["confirmed_pos"] <= j and h["price"] > current_price and (touch is None or touch > j)),
         key=lambda h: h["price"])
     live_lows = sorted(
-        (l for l in raw["lows"]
-         if l["confirmed_pos"] <= j and l["price"] < current_price and _untouched_low(l)),
+        (l for l, touch in zip(raw["lows"], raw["low_touch"])
+         if l["confirmed_pos"] <= j and l["price"] < current_price and (touch is None or touch > j)),
         key=lambda l: l["price"], reverse=True)
     levels = live_highs if rule.get("side", "above") == "above" else live_lows
     n = rule.get("n", 1)
@@ -848,15 +1620,23 @@ def _resolve_liquidity_cached(raw, rule, current_price, as_of_bar, origin_out):
     return levels[n - 1]["price"]
 
 
-_DETECTOR_BUILDERS = {
-    "fvg": lambda full_df, max_scan_bars: detect_fvgs(full_df, max_scan_bars=max_scan_bars, record_history=True),
-    "order_block": lambda full_df, max_scan_bars: detect_order_blocks(full_df, max_scan_bars=max_scan_bars,
-                                                                        record_history=True),
-    "liquidity": lambda full_df, max_scan_bars: (lambda highs, lows: {
+def _build_liquidity_tracker(full_df):
+    highs, lows = detect_swings(full_df)
+    high_arr = (full_df["High"] if "High" in full_df else full_df["high"]).to_numpy()
+    low_arr = (full_df["Low"] if "Low" in full_df else full_df["low"]).to_numpy()
+    return {
         "highs": highs, "lows": lows,
-        "high_arr": (full_df["High"] if "High" in full_df else full_df["high"]).to_numpy(),
-        "low_arr": (full_df["Low"] if "Low" in full_df else full_df["low"]).to_numpy(),
-    })(*detect_swings(full_df)),
+        "high_touch": [_first_touch_bar(high_arr, h["pos"], h["price"], above=True) for h in highs],
+        "low_touch": [_first_touch_bar(low_arr, l["pos"], l["price"], above=False) for l in lows],
+    }
+
+
+_DETECTOR_BUILDERS = {
+    "fvg": lambda full_df, max_scan_bars: _build_zone_tracker(
+        detect_fvgs(full_df, max_scan_bars=max_scan_bars, record_history=True)),
+    "order_block": lambda full_df, max_scan_bars: _build_zone_tracker(
+        detect_order_blocks(full_df, max_scan_bars=max_scan_bars, record_history=True)),
+    "liquidity": lambda full_df, max_scan_bars: _build_liquidity_tracker(full_df),
 }
 _DETECTOR_RESOLVERS = {
     "fvg": _resolve_fvg_cached,
@@ -965,7 +1745,7 @@ def resolve_rule(rule, df, current_price, max_scan_bars=None, origin_out=None, c
 
 def backtest_custom_rule(df, entry_rule, exit_rule, stop_rule, max_signals=100, max_scan_bars=500,
                           session=None, min_rr=None, min_stop_pct=None, min_stop_abs=None,
-                          max_trades_per_session=None, cost_pct=None):
+                          max_trades_per_session=None, cost_pct=None, news_blackout_mask=None):
     """Walks df bar by bar, taking ONE trade at a time — resolves
     entry/exit/stop using ONLY df.iloc[:i+1] (everything up to and
     including the current bar), the same no-lookahead discipline
@@ -1051,6 +1831,14 @@ def backtest_custom_rule(df, entry_rule, exit_rule, stop_rule, max_signals=100, 
     sweeps at different cost_pct settings stay comparable on that number;
     net_r is where the honest, cost-adjusted economics live instead.
 
+    news_blackout_mask: None (default, unchanged behavior) or a boolean
+    array aligned to df.index (see news.blackout_mask) - same gating as
+    `session` above (a NEW trade can't OPEN on a blacked-out bar; an
+    already-open trade is still managed normally regardless), just keyed
+    on high-impact news windows instead of time-of-day. The two compose:
+    passing both means a bar must be in-session AND outside every
+    blackout window before a new trade can open there.
+
     Returns {"trades": [{"entry_time","exit_time","entry","stop",
     "target","won","bars_held","is_long","net_r","entry_origin_time",
     "exit_origin_time","stop_origin_time"}], "n", "wins", "win_rate",
@@ -1104,6 +1892,9 @@ def backtest_custom_rule(df, entry_rule, exit_rule, stop_rule, max_signals=100, 
     while i < n_bars and len(trades) < max_signals:
         if in_trade is None:
             if in_session is not None and not in_session[i]:
+                i += 1
+                continue
+            if news_blackout_mask is not None and news_blackout_mask[i]:
                 i += 1
                 continue
             if day_of_bar is not None:
@@ -1161,7 +1952,20 @@ def backtest_custom_rule(df, entry_rule, exit_rule, stop_rule, max_signals=100, 
                 s = resolve_rule(stop_rule, df, price, origin_out=s_origin, cache=cache, as_of_bar=i)
                 candidate = None
                 if e is not None and x is not None and s is not None:
-                    is_long = x > e
+                    # bool(...) here (and on hit_stop/hit_target below) —
+                    # confirmed directly as the cause of a real bug: high/
+                    # low/close are numpy arrays, so a plain `x > e`-style
+                    # comparison against one of their scalar elements
+                    # yields numpy.bool_, not a native bool. `is_long`/
+                    # `won` get stored straight into the trade dict this
+                    # function returns, which the chart's Streamlit
+                    # component eventually serializes to JSON — and
+                    # numpy's bool scalar isn't JSON-serializable (surfaced
+                    # as "Could not fetch <ticker>: ... TypeError('Object
+                    # of type bool is not JSON serializable')", since
+                    # NumPy 2.x's bool scalar type is literally named
+                    # "bool", not "bool_" like older versions).
+                    is_long = bool(x > e)
                     sane = (s < e < x) if is_long else (s > e > x)
                     if sane:
                         risk = abs(e - s)
@@ -1184,11 +1988,11 @@ def backtest_custom_rule(df, entry_rule, exit_rule, stop_rule, max_signals=100, 
         else:
             t = in_trade
             if t["is_long"]:
-                hit_stop = low[i] <= t["stop"]
-                hit_target = high[i] >= t["target"]
+                hit_stop = bool(low[i] <= t["stop"])
+                hit_target = bool(high[i] >= t["target"])
             else:
-                hit_stop = high[i] >= t["stop"]
-                hit_target = low[i] <= t["target"]
+                hit_stop = bool(high[i] >= t["stop"])
+                hit_target = bool(low[i] <= t["target"])
             if hit_stop or hit_target:
                 won = hit_target and not hit_stop
                 risk = abs(t["entry"] - t["stop"])

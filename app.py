@@ -2,15 +2,17 @@
 Markets — the ICT terminal scoped to highly liquid markets only (forex
 majors, major indices, commodities), not a universal ticker search. See
 crypto_app.py for the separate Bitcoin/crypto counterpart; the two share
-every underlying module (fvg.py, theme.py, data.py, recommender.py,
+every underlying module (detectors.py, theme.py, data.py, recommender.py,
 ict_chart) and differ only in which curated symbol lists their own ticker
 picker shows. Independent of market-dashboard — see README.md for why.
 """
 
 import concurrent.futures
 import json
+import math
 import os
 import threading
+import time
 from datetime import time as dtime
 
 import pandas as pd
@@ -18,27 +20,39 @@ import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 import backtest_ui
+import news
 import theme
 from data import get_latest_bars, get_yf_ohlcv, is_ticker_alive, resample_ohlc, warm_in_background
-from fvg import (
+from detectors import (
     current_dealing_range,
+    detect_breaker_blocks,
     detect_equal_levels,
     detect_fvgs,
+    detect_ifvgs,
     detect_liquidity_levels,
     detect_liquidity_reactions,
+    detect_naked_pocs,
     detect_order_blocks,
+    detect_poor_highs_lows,
     detect_structure_breaks,
     detect_swings,
+    historical_zone_scanner,
+    merge_zone_engines,
+    poc_migration,
+    recent_zone_tracker,
 )
 from ict_chart import ict_chart
-from indicators import bollinger_bands, ema, macd, rsi, volume_profile
+from indicators import atr, bollinger_bands, ema, macd, rsi, volume_profile
 from recommender import (
+    CONTEXT_WEIGHT,
     EVENT_TYPE_LABELS,
     EXIT_EVENT_LABELS,
     INDICATOR_SPECS,
     MA_FVG_PERIODS,
     RULE_DETECTOR_LABELS,
+    TF_PAIRS,
     backtest_custom_rule,
+    best_trade_now,
     fvg_event_win_rate,
     fvg_run_up_stats,
     liquidity_event_win_rate,
@@ -46,8 +60,11 @@ from recommender import (
     ma_fvg_starts,
     order_block_event_win_rate,
     point_level_indicator_matches,
+    rank_levels_by_visit_probability,
+    rebalance_chain,
     resolve_rule,
     rule_describe,
+    scan_timeframes,
     scan_watchlist,
     zone_indicator_matches,
 )
@@ -67,6 +84,23 @@ def _hex_to_rgba(hex_color, alpha):
     hex_color = hex_color.lstrip("#")
     r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
+
+
+def _price_decimals(price):
+    """How many decimals a price needs to stay meaningful, based on its
+    own magnitude rather than a fixed assumption — a 2-decimal default
+    (fine for a $65,000 BTC print) rounds a $1.35 forex pair's real
+    movement away entirely (1.3465 -> 1.3546 all reads as "1.35"), and
+    would show "0.00" outright for a fraction-of-a-cent altcoin. Same
+    log-scale reasoning as the chart's own JS-side computePriceDecimals
+    (ict_chart/frontend/index.html) — kept independent rather than shared
+    since one's Python and one's JS, but the formula must stay identical:
+    5 significant digits above the decimal point's own order of
+    magnitude, clamped to [2, 10]."""
+    if price is None or price <= 0:
+        return 2
+    decimals = 5 - math.floor(math.log10(price))
+    return max(2, min(10, decimals))
 
 
 def _win_rate_label(wr, precision=0):
@@ -115,7 +149,7 @@ def _nearest_by_price(zones, current_price, n, top_key="top", bottom_key="bottom
 # reimplementing FVG/OB backtesting a second time — same detection logic
 # the chart itself draws, same retracement-entry timing discipline.
 #
-# Deliberately NOT the full permutation test research/backtest.py runs for
+# Deliberately NOT the full permutation test research/evidence.py runs for
 # Research Lab/Edge Lab — that's 5000 random-direction trials, built for a
 # considered, one-at-a-time verdict, not something to re-run on every chart
 # rerun for every zone. This is a plain raw-return win rate: enough for a
@@ -126,7 +160,8 @@ _WIN_RATE_MIN_EVENTS = 20
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _historical_win_rates(ticker, tf_label, layer, provider, exit_types=tuple(EXIT_EVENT_LABELS.keys())):
+def _historical_win_rates(ticker, tf_label, layer, provider, exit_types=tuple(EXIT_EVENT_LABELS.keys()),
+                           news_blackout=None):
     """{"bullish": (win_rate, n, sufficient), "bearish": (...)} for this
     ticker's own available history at tf_label. `sufficient` is False when
     fewer than _WIN_RATE_MIN_EVENTS qualifying events were found — the win
@@ -149,7 +184,13 @@ def _historical_win_rates(ticker, tf_label, layer, provider, exit_types=tuple(EX
     the hold — user-controlled via the Settings popover's own "Win rate"
     section. Raw return, no spread/cost deduction — this is "did price
     move in the expected direction over the hold," not a claim about what
-    a real fill would have net after cost."""
+    a real fill would have net after cost.
+
+    news_blackout: None (default, unchanged behavior) or a (minutes_before,
+    minutes_after) pair - a plain hashable tuple, not the mask itself, so
+    st.cache_data's own argument-hashing keys different settings into
+    different cache entries correctly; the mask is computed below, after
+    `df` is loaded, from `ticker` + this pair (see news.blackout_mask)."""
     conf = TIMEFRAMES[tf_label]
     fetch_interval = conf["fetch_interval"]
     period = INTERVAL_MAX_PERIOD.get(fetch_interval, "60d")
@@ -162,9 +203,10 @@ def _historical_win_rates(ticker, tf_label, layer, provider, exit_types=tuple(EX
     if len(df) < 50:
         return {}
 
+    nb_mask = news.blackout_mask(df.index, ticker, news_blackout[0], news_blackout[1]) if news_blackout else None
     fn = {"FVG": fvg_event_win_rate, "Order Block": order_block_event_win_rate,
           "MA+FVG": ma_fvg_event_win_rate, "Liquidity": liquidity_event_win_rate}[layer]
-    return fn(df, exit_types=exit_types, min_events=_WIN_RATE_MIN_EVENTS)
+    return fn(df, exit_types=exit_types, min_events=_WIN_RATE_MIN_EVENTS, news_blackout_mask=nb_mask)
 
 
 _EPOCH = pd.Timestamp("1970-01-01")
@@ -173,11 +215,15 @@ _EPOCH = pd.Timestamp("1970-01-01")
 def _ny_fake_utc_seconds(ts):
     """lightweight-charts has no timezone setting — it always renders a
     UTCTimestamp's UTC wall-clock digits. The standard workaround: convert
-    to the timezone you actually want shown (America/New_York, matching ICT
-    kill-zone convention), strip the tz label, and encode THOSE digits as
-    if they were UTC."""
-    ny = ts.tz_convert("America/New_York").tz_localize(None)
-    return int((ny - _EPOCH).total_seconds())
+    to the timezone the user's own theme.render_top_bar() selector has
+    picked (theme.get_display_tz(), America/New_York by default — the
+    original, still-matching-ICT-kill-zone-convention choice before that
+    selector existed), strip the tz label, and encode THOSE digits as if
+    they were UTC. Name kept as "_ny_..." since America/New_York is still
+    the default/most common case and every call site already uses this
+    name — only the body changed, not what callers need to know."""
+    disp = ts.tz_convert(theme.get_display_tz()).tz_localize(None)
+    return int((disp - _EPOCH).total_seconds())
 
 
 def _ny_fake_utc_seconds_vec(idx):
@@ -201,8 +247,8 @@ def _ny_fake_utc_seconds_vec(idx):
     [_ny_fake_utc_seconds(ts) for ts in idx] already produced everywhere
     this replaces it, so no caller downstream of the list itself needs to
     change."""
-    ny_idx = idx.tz_convert("America/New_York").tz_localize(None)
-    return ((ny_idx - _EPOCH) // pd.Timedelta(seconds=1)).tolist()
+    disp_idx = idx.tz_convert(theme.get_display_tz()).tz_localize(None)
+    return ((disp_idx - _EPOCH) // pd.Timedelta(seconds=1)).tolist()
 
 
 def _series_to_points(series):
@@ -338,12 +384,26 @@ CURATED_INDICES = {
 }
 # Deliberately just the three commodities themselves (via their front-month
 # futures contract, the standard way to chart spot-adjacent commodity price
-# on Yahoo) — not the FULL futures chain (index/bond futures like ES=F/
-# ZB=F), which would just duplicate what CURATED_INDICES's own cash tickers
-# already cover under a different symbol.
+# on Yahoo) — not the full index-futures chain, which is its own category
+# below for a real reason, not a duplicate of it.
 CURATED_COMMODITIES = {
     "GC=F": ("Gold Futures", "Commodities"), "SI=F": ("Silver Futures", "Commodities"),
     "CL=F": ("Crude Oil Futures", "Commodities"),
+}
+# Index futures (their own category, not folded into Commodities) — the
+# direct futures counterpart of four of CURATED_INDICES's own cash tickers
+# (NQ<->^IXIC, ES<->^GSPC, YM<->^DJI, RTY<->^RUT). Genuinely NOT a duplicate
+# of the cash index despite tracking the same underlying: Yahoo's cash
+# index feed only carries the regular 9:30-16:00 ET session, while these
+# trade nearly 24/5 on CME Globex — confirmed directly, 1m bars for all
+# four span 00:00 ET onward, not just cash-session hours. That's the whole
+# point of adding them: real overnight/pre-market price action a cash
+# index never shows at all, at 1-minute resolution (the finest free data
+# that exists for a CME-listed future — true tick data is a licensed
+# product, not available here or anywhere for free).
+CURATED_INDEX_FUTURES = {
+    "NQ=F": ("Nasdaq-100 Futures", "Futures"), "ES=F": ("S&P 500 Futures", "Futures"),
+    "YM=F": ("Dow Jones Futures", "Futures"), "RTY=F": ("Russell 2000 Futures", "Futures"),
 }
 CURATED_FOREX = {
     "EURUSD=X": ("Euro / US Dollar", "Forex"), "GBPUSD=X": ("British Pound / US Dollar", "Forex"),
@@ -361,6 +421,7 @@ def _build_ticker_info():
     (see crypto_app.py for the crypto-only counterpart)."""
     info = dict(CURATED_INDICES)
     info.update(CURATED_COMMODITIES)
+    info.update(CURATED_INDEX_FUTURES)
     info.update(CURATED_FOREX)
     return info
 
@@ -372,7 +433,7 @@ TICKER_UNIVERSE = list(TICKER_INFO.keys())
 # The ticker menu's top-level category buttons. Order here is the order
 # the buttons render in.
 TICKER_CATEGORIES = {
-    "Forex": ["Forex"], "Indices": ["Indices"], "Commodities": ["Commodities"],
+    "Forex": ["Forex"], "Indices": ["Indices"], "Commodities": ["Commodities"], "Futures": ["Futures"],
 }
 
 # Display label <-> internal id for data.py's provider chain (see its own
@@ -477,7 +538,21 @@ _TF_BAR_SECONDS = {
 # machine handles it fine — the working ^IXIC/1W case needed ~1500-2700
 # total, no issue) while still capping the worst case regardless of how
 # extreme the timeframe mismatch is.
-_MAX_TOTAL_TILES = 5000
+#
+# Lowered from 5000 to 1500 after a SEPARATE finding, once the batched-
+# primitive + viewport-culling fix existed (see GhostCandleBatchPaneView's
+# own comment in ict_chart/frontend/index.html): that fix only helps once
+# the user has manually zoomed in — a freshly loaded/reloaded chart calls
+# fitContentWhenReady(), which fits the WHOLE series including every
+# backfill tile, so the "visible range" filter is a no-op right at load
+# time, the single most common moment. That same profiling measured 4,500
+# tiles (this cap's old ceiling, and confirmed live via __ictDebug on a
+# real multi-layer session) at 143ms p99 frame time — every sub-30fps
+# frame eliminated only after dropping to 1,479 (21.5ms p99). 1500 lands
+# at that already-measured-smooth point; backfill DEPTH is unaffected
+# (governed by bfdf.tail(1500) above, a different cap) — only the
+# staircase's own granularity coarsens somewhat at extreme zoom-out.
+_MAX_TOTAL_TILES = 1500
 
 
 def _backfill_timeframe(tf_label):
@@ -493,7 +568,8 @@ def _backfill_timeframe(tf_label):
     return None
 
 
-ICT_LAYERS = ["FVG", "Order Blocks", "Swing Points", "Equal Highs/Lows", "Market Structure", "Premium/Discount", "Liquidity"]
+ICT_LAYERS = ["FVG", "IFVG", "Order Blocks", "Breaker Block", "Swing Points", "Equal Highs/Lows",
+              "Market Structure", "Premium/Discount", "Liquidity", "Naked POC", "Poor High/Low"]
 # All off for a brand-new session — a first-time load shouldn't dump every
 # layer onto the chart at once. Returning users don't see this default at
 # all: their own on/off choice per layer is persisted (see .last_state.json
@@ -507,6 +583,49 @@ ICT_LAYERS = ["FVG", "Order Blocks", "Swing Points", "Equal Highs/Lows", "Market
 # prompting it.
 LAYER_DEFAULTS = {name: False for name in ICT_LAYERS}
 LAYER_DEFAULTS["Premium/Discount"] = True
+
+# How many candles late each layer's own read typically is, for the same
+# reason every other hover-help in this app spells out real numbers
+# instead of vague reassurance — confirmed directly by measuring
+# detect_swings' own confirmed_pos - pos gap on real data (DOT-USD, 5m/
+# 1h/4h all landed within the same range): median 2 candles, 90% confirm
+# within 4, occasionally into double digits on a slow, grinding reversal.
+# It's ATR-relative, not a fixed bar count (see detect_swings' own
+# docstring) — "typically" is doing real work in that number, not a
+# rounding of something exact. FVG/Order Blocks are a different KIND of
+# lag entirely: a fixed, ~1-candle structural delay (confirmed the
+# instant their own defining candle closes), not a reversal to wait out.
+# Naked POC/Poor High-Low are lagged by construction, not by detection —
+# neither can exist before the session that produces them has fully
+# closed.
+_SWING_LAG = ("ATR-based, not a fixed bar count — a swing isn't confirmed until price reverses far "
+              "enough away from it. Measured directly on real data: median 2 candles late, 90% confirm "
+              "within 4, occasionally more on a slow, grinding reversal.")
+LAYER_LAG_HELP = {
+    "FVG": "Confirmed the instant its own 3rd candle closes — a fixed, ~1-candle structural delay, "
+           "not a reversal to wait out.",
+    "IFVG": "An FVG that gets fully broken through WITH a close beyond it, not just a wick — confirmed "
+            "the instant that breaking candle closes, same fixed structural delay as plain FVG.",
+    "Order Blocks": "Confirmed the instant the displacement candle that breaks through it closes — "
+                     "same fixed, small structural delay as FVG, not reversal-based.",
+    "Breaker Block": "An Order Block that gets fully broken through WITH a close beyond it, not just a "
+                      "wick — confirmed the instant that breaking candle closes, same fixed structural "
+                      "delay as plain Order Blocks.",
+    "Swing Points": _SWING_LAG,
+    "Equal Highs/Lows": f"Built on Swing Points, so it inherits the same lag. {_SWING_LAG}",
+    "Market Structure": ("The break itself fires the instant a candle CLOSES beyond the level — but "
+                          "that level is a confirmed Swing Point, so it isn't even a pending level to "
+                          "break until Swing Points' own lag has passed. " + _SWING_LAG),
+    "Premium/Discount": ("The box's own top/bottom are confirmed Swing Points, so it carries the same "
+                          "lag before either boundary is even set. " + _SWING_LAG),
+    "Liquidity": ("Resting levels are confirmed Swing Points too, so the same lag applies before a "
+                  "high/low even becomes a tracked level. " + _SWING_LAG),
+    "Naked POC": "Lagged by construction, not by detection — a session's own POC isn't final until "
+                 "that full session closes, so this can only ever speak about YESTERDAY's session "
+                 "at the earliest, never today's still-forming one.",
+    "Poor High/Low": "Same as Naked POC — only knowable once the full session that produced it has "
+                      "closed, so today's own high/low can't be judged poor or clean until today ends.",
+}
 
 # Kill zones apply only below 1h — a 1h+ candle either barely fits inside a
 # 2-hour session window (leaving a nearly-empty, visually broken chart) or
@@ -827,13 +946,25 @@ def _render_mini_chart(ticker, chart_id):
     # day candle has nothing meaningful to tick every second.
     if refresh_interval is not None:
         refresh_interval = 1
+    # Daily+ TFs (refresh_interval still None here) don't need per-second
+    # CANDLE redraws, but the panel's own "current price" readout is a
+    # different thing — that still needs to eventually catch up to the
+    # live price. Confirmed directly as a real bug: a daily+ mini panel
+    # left alone (nothing ELSE on the page happening to force a rerun)
+    # showed a genuinely stale last price — a large, real gap from the
+    # true live one, not a rounding nitpick. fragment_interval is what
+    # actually goes to @st.fragment below; refresh_interval keeps its
+    # EXACT original meaning (None vs 1) for the splice-logic gate just
+    # below, untouched — this only adds a slow floor under the "never
+    # reruns on its own at all" case, it doesn't change intraday behavior.
+    fragment_interval = refresh_interval if refresh_interval is not None else 45
     # Read from session_state rather than a passed-in arg — this function is
     # a plain module-level def (not nested inside the settings popover's own
     # scope the way _render_chart is), same reason fvg_show_volume below is
     # read the same way.
     data_source = DATA_SOURCES.get(st.session_state.get("fvg_data_source", "Auto"), "auto")
 
-    @st.fragment(run_every=refresh_interval)
+    @st.fragment(run_every=fragment_interval)
     def _inner():
         try:
             df = get_yf_ohlcv(ticker, period=tf_conf["period"], interval=tf_conf["fetch_interval"], provider=data_source)
@@ -998,10 +1129,27 @@ def _render_mini_chart(ticker, chart_id):
                           # Plain candles at a glance — no O/H/L/C/source
                           # heading competing with the main chart's own
                           # for space in this smaller panel.
-                          "hide_ohlc": True},
+                          "hide_ohlc": True,
+                          # Always show the whole (small, fixed tail(N))
+                          # window fitted on every timeframe switch — this
+                          # panel's own iframe persists across a TF switch
+                          # (key stays chart_id, not tf_key; see the
+                          # comment above), so without this it inherited
+                          # the main chart's calendar-window-preservation
+                          # behavior instead, which reads as "not fitted"
+                          # for a small reference panel that should always
+                          # just show everything it's currently holding.
+                          "always_fit": True,
+                          # A bit more breathing room after the last candle
+                          # than the main chart's own 8 (see createChart's
+                          # rightOffset) — requested directly, this panel's
+                          # smaller width made the default margin read as
+                          # too tight.
+                          "right_offset": 14},
                 ohlc={"ticker": "", "source": tf_key, "symbol": ticker, "interval": tf_key},
                 height=380,
                 key=f"ict_chart_mini_{chart_id}",
+                display_tz=theme.get_display_tz(),
             )
             _select_chart(chart_id, clicked)
         except Exception as e:
@@ -1070,7 +1218,7 @@ for _name in ICT_LAYERS:
     st.session_state.setdefault(f"fvg_layer_{_name}", _saved_layer.get("on", LAYER_DEFAULTS[_name]))
     st.session_state.setdefault(f"fvg_tf_{_name}", _saved_layer.get("tf", "Chart TF"))
 
-theme.render_project_nav("Markets")
+theme.render_top_bar("Markets")
 
 st.session_state.setdefault("selected_chart", "main")
 selected_chart = st.session_state["selected_chart"]
@@ -1104,6 +1252,161 @@ for _cid in CHART_IDS:
         _prefetch_specs.append((get_latest_bars, (ticker, _tf_conf["fetch_interval"]), {"provider": _prefetch_data_source}))
 _prefetch(_prefetch_specs)
 
+def _confluence_breakdown_md(setup, entry_tf, context_tf=None):
+    """Plain-language rundown of exactly which confluence factors backed
+    THIS ONE trade. Shown directly as the scan-result button's own
+    `help=` tooltip (see both sidebar scan loops below) — a fixed,
+    identical-on-every-row explanation of the general methodology used to
+    live there instead, which meant hovering any of 3+ results in a scan
+    showed the exact same text three times over; per-result content is
+    what's actually worth surfacing per row."""
+    entry_labels = [d["label"] for d in (setup.get("confluence_entry_details") or [])]
+    context_labels = [d["label"] for d in (setup.get("confluence_context_details") or [])]
+    lines = [f"**{entry_tf} entry** — {len(entry_labels)} of 5 factors agree:"]
+    lines += [f"- {f}" for f in entry_labels] if entry_labels else ["- none currently agree"]
+    if context_tf:
+        lines.append("")
+        lines.append(f"**{context_tf} context** (counts {CONTEXT_WEIGHT}x) — {len(context_labels)} of 5 factors agree:")
+        lines += [f"- {f}" for f in context_labels] if context_labels else ["- none currently agree"]
+    return "\n".join(lines)
+
+
+def _confluence_body_lines(entity):
+    """Compact on-chart confluence COUNT for a trade's own box fill (see
+    _trade_box_overlays/_rebalance_chain_overlays' own body_lines param)
+    — direct request: "I just want amount of confluences for live feed,"
+    walking back the earlier full-sentence-per-factor version (still
+    available in full via the sidebar's own scan-result hover — see
+    _confluence_breakdown_md — this is only the on-chart headline
+    number). Works for either a best_trade_now/scan_timeframes setup
+    dict or an _active_scan_pick dict — both carry the same two field
+    names."""
+    entry_n = len(entity.get("confluence_entry_details") or [])
+    context_details = entity.get("confluence_context_details")
+    if context_details:
+        return [f"{entry_n} entry + {len(context_details)} HTF confluences"]
+    return [f"{entry_n} confluences"]
+
+
+def _scan_pick_overlays(scan_pick, future_edge, ts_to_x):
+    """The isolated "lock trade" view: draw JUST this one trade's own
+    trigger zone plus the specific zones that backed each matched
+    confluence factor — nothing else, no other layer's clutter (direct
+    request: "I want to see all the confluences ... with those exact
+    zones, nothing else"). Replaces the normal rectangles/price_lines
+    entirely at the call site below rather than adding to them.
+
+    ts_to_x: the caller's own _ny_fake_utc_seconds — converts a real
+    timestamp into THIS chart's x-axis regardless of which timeframe is
+    currently displayed. Real timestamps are absolute, so this still
+    places a zone correctly even when it came from a DIFFERENT
+    timeframe's own dataframe than what's on screen right now (the whole
+    point of the lock checkbox: pin the trade, then browse timeframes
+    freely). Returns (rectangles, price_lines)."""
+    direction = scan_pick["direction"]
+    trigger_color = theme.NEON_GREEN if direction == "bullish" else theme.NEON_MAGENTA
+    rectangles, price_lines = [], []
+
+    def _end_x(end_ts):
+        return future_edge if end_ts is None else ts_to_x(end_ts)
+
+    src = scan_pick.get("source_zone")
+    if src:
+        # Gold border — the same "premium, confluence-backed zone" visual
+        # language every other layer on this chart already uses (see
+        # theme.CONFLUENCE_GOLD's own other call sites), reused here for
+        # consistency rather than inventing a new meaning for gold.
+        rectangles.append({
+            "t0": ts_to_x(src["start"]), "t1": _end_x(src["end"]), "p0": src["bottom"], "p1": src["top"],
+            "fill": _hex_to_rgba(trigger_color, 0.18), "fill_to": None,
+            "border": theme.CONFLUENCE_GOLD, "border_width": 2, "label": scan_pick.get("label"),
+        })
+
+    # Supporting confluence zones — thin, muted cyan outlines so they
+    # read as corroborating evidence, not competing primary zones next
+    # to the trigger's own gold-bordered one.
+    for details_key in ("confluence_entry_details", "confluence_context_details"):
+        for factor in scan_pick.get(details_key) or []:
+            for z in factor["zones"]:
+                if z["kind"] == "rect":
+                    rectangles.append({
+                        "t0": ts_to_x(z["start"]), "t1": _end_x(z["end"]), "p0": z["bottom"], "p1": z["top"],
+                        "fill": _hex_to_rgba(theme.NEON_CYAN, 0.05), "fill_to": None,
+                        "border": _hex_to_rgba(theme.NEON_CYAN, 0.5), "border_width": 1, "label": factor["label"],
+                    })
+                else:  # "level"
+                    price_lines.append({
+                        "t0": ts_to_x(z["start"]), "t1": _end_x(z["end"]), "price": z["price"],
+                        "color": _hex_to_rgba(theme.NEON_CYAN, 0.6), "title": "", "line_width": 1, "dashed": True,
+                        "above": bool(z["price"] >= scan_pick["entry"]),
+                    })
+    return rectangles, price_lines
+
+
+def _rebalance_chain_overlays(chain, chart_edge_x, slice_seconds):
+    """Draws each rebalance_chain step as its OWN forward-projected risk/
+    reward box — the EXACT SAME solid flat fill + visible border the
+    Backtest tab's own "Show these trades on the chart" already draws
+    for a resolved trade (see _render_chart's own backtest-trades block),
+    not a gradient. Direct request: "During the backtest, the areas are
+    rendered a specific way. I want exactly that for the active trade...
+    the box should be printed from present to future a bit. Then the
+    next trade chained from that future point to the next" — each step
+    starts exactly where the previous one's box ends (chart_edge_x for
+    the first is the ACTIVE trade's own box end, see _active_box_t1),
+    forming one continuous chained sequence rather than independent
+    slices. Numbered so the sequence reads left to right exactly as the
+    sidebar's own chain list does: closest hunted level first, then
+    whichever's closest from there.
+
+    chart_edge_x: where the first step's box starts. slice_seconds:
+    width of each step's box; NOT real elapsed time (this is a
+    projection, not a forecast timestamp) — just wide enough to read
+    comfortably at whatever timeframe is currently charted.
+
+    The step's own "N. ctx→entry Pattern" identifier is drawn as the
+    REWARD rectangle's own right-anchored label (not a separate price-
+    line title) — reusing the exact same convention every other zone on
+    this chart already uses, and the exact same width-based hiding (see
+    RectangleRenderer's own comment) instead of a bespoke placement.
+    Reward, not risk: best_trade_now's fixed 2R target means the reward
+    box is always twice the risk box's own height, so it has more room
+    for both this label and the confluence body_lines below. The
+    confluence factors behind THIS step (same ones the sidebar's own ℹ️
+    popover breaks down) are drawn as body_lines inside that same
+    rectangle's fill — direct request: "within the fill area, should
+    contain text with all confluences to consider about it." Returns
+    (rectangles, price_lines)."""
+    rectangles, price_lines = [], []
+    t = chart_edge_x
+    for i, step in enumerate(chain):
+        t0, t1 = t, t + slice_seconds
+        t = t1
+        setup = step["setup"]
+        entry, sl, tp = setup["entry_price"], setup["sl_price"], setup["tp_price"]
+        _pattern = EVENT_TYPE_LABELS.get(setup["event_type"], setup["event_type"])
+        rectangles.append({"t0": t0, "t1": t1, "p0": entry, "p1": sl,
+                            "fill": _hex_to_rgba(theme.NEON_MAGENTA, 0.10),
+                            "border": _hex_to_rgba(theme.NEON_MAGENTA, 0.9)})
+        rectangles.append({"t0": t0, "t1": t1, "p0": entry, "p1": tp,
+                            "fill": _hex_to_rgba(theme.NEON_GREEN, 0.10),
+                            "border": _hex_to_rgba(theme.NEON_GREEN, 0.9),
+                            "label": f"{i + 1}. {setup['context_timeframe']}→{setup['timeframe']} {_pattern}",
+                            "body_lines": _confluence_body_lines(setup)})
+        # A plain, bounded entry marker — dashed (not the solid/glow
+        # style the always-open active trade uses), since a NON-dashed
+        # line stretches to the pane's own right edge regardless of t1
+        # (see HLineRenderer's own comment): every step's line would
+        # overshoot into every later box instead of staying inside its
+        # own, exactly the overlap the "avoid overlapping text... don't
+        # want a circus" request is about.
+        price_lines.append({
+            "t0": t0, "t1": t1, "price": entry, "color": _hex_to_rgba(theme.NEON_AMBER, 0.7),
+            "title": "", "line_width": 1, "dashed": True, "above": True,
+        })
+    return rectangles, price_lines
+
+
 # Sidebar: a multi-symbol scan across the whole watchlist — collapsed by
 # default (initial_sidebar_state="collapsed" above), so the chart stays
 # the primary view. This is deliberately where the "advanced, scan
@@ -1113,24 +1416,42 @@ _prefetch(_prefetch_specs)
 # split attention with.
 with st.sidebar:
     st.subheader("🎯 Signals")
-    st.caption("Scans every symbol on this watchlist for its own single "
-               "best currently-active setup, ranked the same way as the "
-               "on-chart pick (Edge Lab validation first, confluence "
-               "second) — see which symbol has the strongest read right "
-               "now, not just whatever's already charted.")
-    if st.button("🔍 Scan watchlist", key="signals_scan_btn", width="stretch"):
+    # Explanations live in each button's own hover (help=), not as a
+    # standing caption -- direct request: don't put explanatory text in my
+    # face every time I open this, spoon-feed the actual results instead.
+    if st.button("🔍 Scan watchlist", key="signals_scan_btn", width="stretch",
+                 help="Scans every symbol on this watchlist for its own single best currently-active setup on "
+                      "4h, with 1W context weighted in (see recommender.py's own TF_PAIRS[0]) — see which "
+                      "symbol has the strongest read right now, not just whatever's already charted."):
         _scan_conf = TIMEFRAMES["4h"]
+        # TF_PAIRS[0] ("1W" context for the "4h" entry this scan already
+        # uses) — one representative top-down read per ticker, not every
+        # pair (see scan_watchlist's own docstring on why trying all of
+        # TF_PAIRS here would multiply fetch cost across the whole
+        # watchlist for little extra signal).
+        _scan_context_tf, _ = TF_PAIRS[0]
+        _scan_context_conf = TIMEFRAMES[_scan_context_tf]
         _scan_specs = [(get_yf_ohlcv, (t, _scan_conf["period"], _scan_conf["fetch_interval"], _prefetch_data_source), {})
                        for t in TICKER_UNIVERSE]
+        _scan_specs += [(get_yf_ohlcv, (t, _scan_context_conf["period"], _scan_context_conf["fetch_interval"],
+                                         _prefetch_data_source), {}) for t in TICKER_UNIVERSE]
         _prefetch(_scan_specs)
         _scan_dfs = {}
+        _scan_context_dfs = {}
         for _t in TICKER_UNIVERSE:
             try:
                 _scan_dfs[_t] = get_yf_ohlcv(_t, period=_scan_conf["period"], interval=_scan_conf["fetch_interval"],
                                               provider=_prefetch_data_source)
             except Exception:
                 _scan_dfs[_t] = None
-        st.session_state["_signals_scan"] = scan_watchlist(_scan_dfs, _scan_conf["fetch_interval"], top_n=8)
+            try:
+                _scan_context_dfs[_t] = get_yf_ohlcv(_t, period=_scan_context_conf["period"],
+                                                       interval=_scan_context_conf["fetch_interval"],
+                                                       provider=_prefetch_data_source)
+            except Exception:
+                _scan_context_dfs[_t] = None
+        st.session_state["_signals_scan"] = scan_watchlist(
+            _scan_dfs, _scan_conf["fetch_interval"], top_n=8, context_dfs_by_ticker=_scan_context_dfs)
 
     _scan_results = st.session_state.get("_signals_scan")
     if _scan_results is None:
@@ -1138,18 +1459,149 @@ with st.sidebar:
     elif not _scan_results:
         st.caption("Scanned — nothing currently active anywhere on the watchlist right now.")
     else:
-        # Validation rank as a dot, not the full validation_badge sentence
-        # signals_app.py used — this list needs to stay scannable at a
-        # glance, not a full recommender.py's set of separate calls into
-        # research.signals per row.
-        _rank_dot = {3: "🟢", 2: "🟡", 1: "🟠", 0: "⚪"}
+        _scan_context_tf_label, _scan_entry_tf_label = TF_PAIRS[0]
         for _s in _scan_results:
-            _dot = _rank_dot.get(_s["validation_rank"], "⚪")
             _pattern = EVENT_TYPE_LABELS.get(_s["event_type"], _s["event_type"])
-            _label = f"{_dot} {_s['ticker']} · {_pattern} ({_s['direction']}) · {_s['confluence_score']}/4"
-            if st.button(_label, key=f"sig_jump_{_s['ticker']}_{_s['event_type']}_{_s['start']}", width="stretch"):
+            _label = f"{_s['ticker']} · {_pattern} ({_s['direction']}) · confluence {_s['confluence_score']}"
+            if st.button(_label, key=f"sig_jump_{_s['ticker']}_{_s['event_type']}_{_s['start']}", width="stretch",
+                         help=_confluence_breakdown_md(_s, _scan_entry_tf_label, _scan_context_tf_label)):
+                # Every scan_watchlist candidate is on the fixed "4h" entry
+                # timeframe (_scan_conf above) — jump the chart there too,
+                # not just the ticker, and snapshot the exact entry/stop/
+                # target like the "Scan timeframes" section below already
+                # does. Without this, clicking a result switched ticker but
+                # left whatever timeframe/rule was already active driving
+                # the Entry/SL/TP lines — showing something the scan never
+                # actually picked, or nothing at all.
                 st.session_state["fvg_ticker"] = _s["ticker"]
+                st.session_state[TF_KEY_BY_CHART["main"]] = "4h"
+                st.session_state["_active_scan_pick"] = {
+                    "ticker": _s["ticker"], "timeframe": "4h", "direction": _s["direction"],
+                    "entry": _s["entry_price"], "stop": _s["sl_price"], "target": _s["tp_price"],
+                    "label": f"{_pattern} ({_s['direction']})",
+                    "context_timeframe": _scan_context_tf_label,
+                    "source_zone": _s["source_zone"],
+                    "confluence_entry_details": _s["confluence_entry_details"],
+                    "confluence_context_details": _s["confluence_context_details"],
+                }
+                st.session_state["_scan_pick_locked"] = False
+                st.session_state.pop("_active_chart_rule", None)
                 st.rerun()
+
+    st.divider()
+    if st.button("🔍 Scan timeframes", key="tf_scan_btn", width="stretch",
+                 help=f"Scans every context+entry timeframe pair ({ticker}, see recommender.py's own TF_PAIRS "
+                      "— e.g. 1W context for a 4h entry, 4h context for a 5m entry) for its own single best "
+                      "currently-active setup, ranked by confluence — the higher (context) timeframe's own "
+                      "agreement counts more than the entry timeframe's own. Picking a result jumps the chart "
+                      "to the ENTRY timeframe and shows that exact entry/stop/target."):
+        _tf_pair_tfs = sorted({tf for _pair in TF_PAIRS for tf in _pair})
+        _tf_scan_specs = [
+            (get_yf_ohlcv, (ticker, TIMEFRAMES[_tf]["period"], TIMEFRAMES[_tf]["fetch_interval"],
+                            _prefetch_data_source), {})
+            for _tf in _tf_pair_tfs
+        ]
+        _prefetch(_tf_scan_specs)
+        _tf_dfs = {}
+        for _tf_label in _tf_pair_tfs:
+            _tf_conf = TIMEFRAMES[_tf_label]
+            try:
+                _tf_df = get_yf_ohlcv(ticker, period=_tf_conf["period"], interval=_tf_conf["fetch_interval"],
+                                       provider=_prefetch_data_source)
+                if _tf_conf["resample"] and not _tf_df.empty:
+                    _tf_df = resample_ohlc(_tf_df, _tf_conf["resample"])
+                _tf_dfs[_tf_label] = (_tf_df, _tf_conf["fetch_interval"])
+            except Exception:
+                _tf_dfs[_tf_label] = (None, None)
+        _dfs_by_pair = {}
+        for _context_tf, _entry_tf in TF_PAIRS:
+            _context_df, _ = _tf_dfs[_context_tf]
+            _entry_df, _entry_interval = _tf_dfs[_entry_tf]
+            _dfs_by_pair[(_context_tf, _entry_tf)] = (_context_df, _entry_df, _entry_interval)
+        _tf_scan_results = scan_timeframes(_dfs_by_pair, ticker, top_n=8)
+        st.session_state["_tf_scan"] = _tf_scan_results
+        # rebalance_chain: direct request — "rank them by distance...
+        # which one is the closest? and so on" — reordered by nearest-
+        # price walk instead of confluence rank, starting from current
+        # price. Needs a real "right now" price, independent of whichever
+        # timeframe happens to be charted — the FINEST timeframe among
+        # this scan's own already-fetched dfs is the most current read
+        # available without a fresh fetch.
+        _finest_tf = min(_tf_pair_tfs, key=lambda tf: _TF_BAR_SECONDS[tf])
+        _finest_df, _ = _tf_dfs[_finest_tf]
+        if _tf_scan_results and _finest_df is not None and not _finest_df.empty:
+            _chain_c_col = "Close" if "Close" in _finest_df else "close"
+            _current_price_for_chain = float(_finest_df[_chain_c_col].iloc[-1])
+            st.session_state["_tf_scan_chain"] = rebalance_chain(_tf_scan_results, _current_price_for_chain)
+        else:
+            st.session_state["_tf_scan_chain"] = []
+
+    _tf_results = st.session_state.get("_tf_scan")
+    if _tf_results is None:
+        st.caption("Not scanned yet this session.")
+    elif not _tf_results:
+        st.caption("Scanned — nothing currently active on any timeframe pair right now.")
+    else:
+        for _s in _tf_results:
+            _pattern = EVENT_TYPE_LABELS.get(_s["event_type"], _s["event_type"])
+            _label = (f"{_s['context_timeframe']}→{_s['timeframe']} · {_pattern} ({_s['direction']}) · "
+                      f"confluence {_s['confluence_score']}")
+            _tf_jump_clicked = st.button(
+                _label, key=f"tfsig_jump_{_s['timeframe']}_{_s['event_type']}_{_s['start']}", width="stretch",
+                help=_confluence_breakdown_md(_s, _s["timeframe"], _s["context_timeframe"]))
+            if _tf_jump_clicked:
+                st.session_state[TF_KEY_BY_CHART["main"]] = _s["timeframe"]
+                # A static snapshot (fixed prices, see _active_scan_pick's
+                # own read-site comment), NOT a resolve_rule-style rule —
+                # this candidate came from one specific zone at scan time;
+                # re-resolving "nearest FVG below price" live could land on
+                # a DIFFERENT zone entirely if price has since moved,
+                # silently swapping what's shown for something the scan
+                # never actually picked. Clearing _active_chart_rule keeps
+                # the two mechanisms from fighting over the same three
+                # lines — see backtest_ui.py's own row-selection code for
+                # the mirrored clear in the other direction.
+                st.session_state["_active_scan_pick"] = {
+                    "ticker": ticker, "timeframe": _s["timeframe"], "direction": _s["direction"],
+                    "entry": _s["entry_price"], "stop": _s["sl_price"], "target": _s["tp_price"],
+                    "label": f"{_pattern} ({_s['direction']})",
+                    "context_timeframe": _s["context_timeframe"],
+                    "source_zone": _s["source_zone"],
+                    "confluence_entry_details": _s["confluence_entry_details"],
+                    "confluence_context_details": _s["confluence_context_details"],
+                }
+                st.session_state["_scan_pick_locked"] = False
+                st.session_state.pop("_active_chart_rule", None)
+                st.rerun()
+
+    # Rebalance chain — direct request: rank these same results by
+    # DISTANCE instead of confluence, walking from current price to
+    # whichever entry is closest, then from THERE to whichever remaining
+    # one is closest, and so on. Each entry_price is already the IDEAL
+    # (zone-edge) entry, i.e. the price that "hunts"/rebalances that
+    # zone — chaining them this way sketches one plausible step-by-step
+    # path a market maker's own delivery might take through the levels,
+    # not just a flat confluence-ranked list.
+    _chain = st.session_state.get("_tf_scan_chain")
+    if _chain:
+        st.divider()
+        st.caption("⛓️ Rebalance chain — same results as above, walked by nearest price instead of "
+                   "confluence: closest entry to current price first, then whichever remaining entry "
+                   "is closest FROM there, and so on. One guess at the market's own step-by-step path "
+                   "through these levels.")
+        for _i, _step in enumerate(_chain, start=1):
+            _s = _step["setup"]
+            _pattern = EVENT_TYPE_LABELS.get(_s["event_type"], _s["event_type"])
+            _arrow = "▲" if _step["distance"] > 0 else "▼"
+            st.markdown(
+                f"**{_i}.** {_arrow} {abs(_step['distance']):,.2f} pts → **{_step['to_price']:,.2f}** "
+                f"— {_s['context_timeframe']}→{_s['timeframe']} {_pattern} ({_s['direction']})")
+        st.checkbox(
+            "Show chain on chart", key="_show_rebalance_chain",
+            help="Draws each step above as its own risk/reward box — same green-above-entry/"
+                 "red-below-entry shading the live Entry/SL/TP already gets — stacked side by side "
+                 "moving forward, numbered in the same order as the list above. Replaces every other "
+                 "layer on the chart with just this, same as the lock-trade view.")
 
 # A popover, not an expander — opening it floats the menu over the page
 # instead of pushing the chart down (the earlier expander-based version
@@ -1203,7 +1655,7 @@ with st.popover(f"🔍 {_ticker_label(ticker)} · change market", width="stretch
     elif _search_query.strip():
         st.caption("No matches.")
 
-# mtf_col used to carry the FULL Layers/Settings/Rules/Charts panel at a
+# mtf_col used to carry the FULL Layers/Strategy/Backtest/Settings/Charts panel at a
 # fixed 3/8 width, always reserved even while a panel was "collapsed" to
 # None (that state only ever hid the panel's own content via CSS
 # display:none — the column's own width allocation from st.columns is
@@ -1218,7 +1670,7 @@ with st.popover(f"🔍 {_ticker_label(ticker)} · change market", width="stretch
 # since nothing else is ever placed there. Fixed by dropping that column
 # split entirely — main_col alone now spans the full width — and instead
 # absolutely-positioning the trigger button into the main_col's own
-# top-right corner (see the CSS + "_menu_trigger_wrap" container further
+# top-left corner (see the CSS + "_menu_trigger_wrap" container further
 # down), which removes it from normal document flow so it reserves NO
 # layout space of its own, just floats over whatever's already there.
 #
@@ -1241,8 +1693,8 @@ with main_col:
     # Invisible marker + :has() (same pattern as .topnav-marker/.sec-chip/
     # .ref-tf-toggle elsewhere in theme.py) — scopes "position: relative"
     # to THIS specific stColumn only, so the menu-trigger button further
-    # down (position: absolute; top:0; right:0) anchors to main_col's own
-    # top-right corner, not the page's or some other column's. Tried
+    # down (position: absolute; top:0; left:0) anchors to main_col's own
+    # top-left corner, not the page's or some other column's. Tried
     # anchoring to a nested st.container(key=...) instead first and
     # confirmed directly that lands the button at the top of whichever
     # block that container wraps — if that's the block containing the
@@ -1327,7 +1779,7 @@ with main_col:
     # whether these controls just changed, so it picks up the fresh values
     # on its own very next tick even though this rerun never touched it
     # directly — a beat of catch-up latency instead of a full page reload.
-    # The 4 panels (Layers, Settings, Rules, Charts) used to be 3 separate
+    # The panels (Layers, Strategy, Backtest, Settings, Charts) used to be 3 separate
     # top-row popovers plus the mini HTF/LTF charts sitting in their own
     # column — consolidated into one side area you cycle through instead,
     # per direct request. st.tabs with on_change="rerun" is what makes the
@@ -1361,9 +1813,10 @@ with main_col:
     @st.fragment
     def _render_layer_controls():
         _prev_cc = st.session_state.get("_chart_controls")
-        _tab_layers, _tab_settings, _tab_rules, _tab_charts = st.tabs([
-            ":material/layers: Layers", ":material/tune: Settings",
-            ":material/rule: Rules", ":material/candlestick_chart: Charts",
+        _tab_layers, _tab_strategy, _tab_backtest, _tab_settings, _tab_charts = st.tabs([
+            ":material/layers: Layers", ":material/rule: Strategy",
+            ":material/monitoring: Backtest", ":material/tune: Settings",
+            ":material/candlestick_chart: Charts",
         ])
         with _tab_layers, st.container(key="_panel_layers"):
             # "Detectors" (the ICT pattern layers below) and "Indicators"
@@ -1393,7 +1846,7 @@ with main_col:
                     # No value= here — session_state is already seeded (see
                     # setdefault block above), from the persisted last-used
                     # state or LAYER_DEFAULTS, before this widget is created.
-                    on = st.checkbox(name, key=f"fvg_layer_{name}")
+                    on = st.checkbox(name, key=f"fvg_layer_{name}", help=LAYER_LAG_HELP.get(name))
                 with tf_col:
                     chosen_tf = st.selectbox(f"{name} timeframe", ["Chart TF"] + list(TIMEFRAMES.keys()),
                                               key=f"fvg_tf_{name}", label_visibility="collapsed",
@@ -1429,7 +1882,13 @@ with main_col:
             # defaults ON; RSI/MACD/Bollinger are just optional reading aids
             # with no strategy behind them here, so they default OFF.
             show_indicators = st.checkbox("MA", value=True, key="fvg_show_indicators",
-                                           help="Show/hide the EMA 20 / EMA 50 lines on the main chart.")
+                                           help="Show/hide the EMA 20 / EMA 50 lines on the main chart. "
+                                                "Updates the instant a candle closes — no separate "
+                                                "confirmation delay the way Swing Points has above — but "
+                                                "as a moving average it's a DIFFERENT kind of lag: it's "
+                                                "always reacting to price that already happened, smoothed "
+                                                "over its own 20/50-candle window, not confirming a "
+                                                "specific past pivot the way the ICT layers do.")
             _ind_tf_options = ["Chart TF"] + list(TIMEFRAMES.keys())
             indicator_tf = st.selectbox(
                 "MA timeframe", _ind_tf_options, index=0, key="fvg_indicator_tf",
@@ -1440,12 +1899,37 @@ with main_col:
                      "see a steadier, less noisy line laid over a more detailed chart.",
             )
             show_rsi = st.checkbox("Show RSI", value=False, key="fvg_show_rsi",
-                                    help="Adds an RSI (14) pane below the main chart.")
+                                    help="Adds an RSI (14) pane below the main chart. No confirmation "
+                                         "delay — updates on every closed candle — but as a smoothed "
+                                         "oscillator it's a lagging read of momentum that already "
+                                         "happened, not a leading signal.")
             show_macd = st.checkbox("Show MACD", value=False, key="fvg_show_macd",
-                                     help="Adds a MACD (12/26/9) pane below the main chart.")
+                                     help="Adds a MACD (12/26/9) pane below the main chart. Same "
+                                          "'updates instantly, but reads what already happened' "
+                                          "character as RSI above — built from two EMAs, so its own "
+                                          "lag is the smoothing kind, not a confirmation delay.")
             show_bb = st.checkbox("Show Bollinger Bands", value=False, key="fvg_show_bb",
                                    help="Adds Bollinger Bands (20-period, 2 std) over the candles "
-                                        "on the main chart.")
+                                        "on the main chart. Same smoothing-lag character as RSI/MACD "
+                                        "above — the basis line is a 20-candle moving average.")
+            show_atr = st.checkbox("Show ATR", value=False, key="fvg_show_atr",
+                                    help="Adds an ATR (14) pane below the main chart — how many "
+                                         "price units (not a percentage) this ticker has typically "
+                                         "moved per candle lately. Rising = volatility expanding, "
+                                         "falling = contracting. Useful for sizing a stop to the "
+                                         "market's own current noise level instead of a fixed "
+                                         "number, and for judging whether a big-looking candle was "
+                                         "actually unusual or just normal for this ticker right now. "
+                                         "Same smoothing-lag character as RSI/MACD/BB above, not a "
+                                         "confirmation delay — it's reacting to recent moves, not "
+                                         "waiting to confirm a specific one.")
+            # Volume used to be permanently-on base chart furniture (no toggle) —
+            # back to user-controlled, and defaulting off this time, on all three
+            # panels (main + both mini charts) sharing this one setting rather
+            # than three separate checkboxes for what's really one preference.
+            # Lives here next to Volume Profile (what draws on the chart), not
+            # in Settings (how it's configured) — moved per direct request.
+            show_volume = st.checkbox("Show volume", value=False, key="fvg_show_volume")
             show_volume_profile = st.checkbox(
                 "Volume Profile", value=False, key="fvg_show_volume_profile",
                 help="How much volume traded at each PRICE level (not each candle) over this "
@@ -1477,11 +1961,6 @@ with main_col:
             selected_kill_zones = st.multiselect("Kill zones", list(KILL_ZONES.keys()),
                                                   default=["NY AM (9:30–11:30 ET)"], key="fvg_kill_zones")
             show_mitigated = st.checkbox("Show mitigated/filled areas", value=False, key="fvg_show_mitigated")
-            # Volume used to be permanently-on base chart furniture (no toggle) —
-            # back to user-controlled, and defaulting off this time, on all three
-            # panels (main + both mini charts) sharing this one setting rather
-            # than three separate checkboxes for what's really one preference.
-            show_volume = st.checkbox("Show volume", value=False, key="fvg_show_volume")
             zone_opacity = st.slider("Zone opacity", 0.05, 0.6, 0.25, 0.05, key="fvg_zone_opacity")
             # "Auto" is Yahoo-first-with-fallback (unaffected by this control at
             # all). Picking a specific provider forces every panel + reference
@@ -1520,6 +1999,27 @@ with main_col:
                      "whichever comes first ends the trade. No fixed number of candles held either way.",
             )
             _win_rate_exit_types = tuple(_win_rate_exit_labels) or tuple(EXIT_EVENT_LABELS.keys())
+            _use_news_blackout = st.checkbox(
+                "Exclude high-impact news windows", value=False, key="fvg_use_news_blackout",
+                help="Drops any past trade the win-rate/backtest numbers above would otherwise count if it "
+                     "opened on a bar sitting inside a red-folder news window for this ticker's own "
+                     "currencies (e.g. USD news for GBPUSD=X) — real trades wouldn't take that entry either, "
+                     "spread and slippage blow out right around the release. Coverage: this week's real "
+                     "ForexFactory calendar, everything this app has itself observed live over time (grows "
+                     "automatically, starts empty), and US Non-Farm Payrolls (first Friday of the month, "
+                     "exact for any date). Other recurring events (FOMC, CPI) are only covered for weeks "
+                     "this app was actually running to see them live.")
+            if _use_news_blackout:
+                _nbc1, _nbc2 = st.columns(2)
+                with _nbc1:
+                    _news_blackout_before = st.selectbox("Minutes before", [5, 10, 15, 30], index=2,
+                                                          key="fvg_news_blackout_before")
+                with _nbc2:
+                    _news_blackout_after = st.selectbox("Minutes after", [5, 10, 15, 30], index=2,
+                                                         key="fvg_news_blackout_after")
+                _news_blackout = (_news_blackout_before, _news_blackout_after)
+            else:
+                _news_blackout = None
             _confluence_keys = st.multiselect(
                 "Indicator confluence", list(INDICATOR_SPECS.keys()), default=[],
                 format_func=lambda k: INDICATOR_SPECS[k]["label"], key="fvg_confluence_indicators",
@@ -1536,32 +2036,30 @@ with main_col:
                      "favors buyers or sellers. A match means that momentum reading agrees with the zone's "
                      "own direction.",
             )
-        with _tab_rules, st.container(key="_panel_rules"):
+        with _tab_strategy, st.container(key="_panel_strategy"):
             # Sweep IS the rule builder now — a single rule is just a sweep
             # with every range narrowed to one value (same engine, same
             # results table), so there's exactly one way to build/test a
             # rule instead of a separate hand-built-widget tool plus a
             # sweep tool sitting next to each other. Pick any result row
             # below and "Use this rule on the chart" to drive Entry/Stop/
-            # Target and the Backtest panel underneath — merged in per
+            # Target and the Backtest tab next door — merged in per
             # direct request. backtest_ui.py owns the actual render logic,
-            # shared with the standalone Backtest page (:8507) and Crypto's
-            # own Rules tab — same backtest_results.db underneath
-            # regardless of which of the three called it.
+            # shared with Crypto's own Strategy tab — same backtest_results.db
+            # underneath regardless of which of the two called it.
             st.caption(
                 "Build a rule as either 'current price' or the Nth-nearest FVG, Order Block, or Liquidity "
                 "level above or below it. Test one exact combo (narrow every range below to a single value) "
                 "or a whole grid of variations at once — then pick any result to drive the chart's Entry/"
-                "Stop/Target and see its full trade history in the Backtest panel below."
+                "Stop/Target and see its full trade history in the Backtest tab next door."
             )
             _sweep_tab, _heatmap_tab = st.tabs(["Sweep", "Heatmap"])
             with _sweep_tab:
-                backtest_ui.render_sweep_tab(TICKER_INFO, has_chart=True)
+                backtest_ui.render_sweep_tab(TICKER_INFO)
             with _heatmap_tab:
                 backtest_ui.render_heatmap_tab()
 
-            st.markdown("---")
-
+        with _tab_backtest, st.container(key="_panel_backtest"):
             # The currently active rule — whatever result row was last sent
             # here via "Use this rule on the chart" (backtest_ui.py writes
             # this exact key). None until a first selection is made, same
@@ -1594,8 +2092,8 @@ with main_col:
             with st.container(border=True):
                 st.markdown("**Backtest**")
                 if _active is None:
-                    st.caption("Select a result in Sweep above and click \"Use this rule on the chart\" — "
-                               "nothing active yet.")
+                    st.caption("Select a result in the Strategy tab's Sweep and click \"Use this rule on "
+                               "the chart\" — nothing active yet.")
                 else:
                     st.caption(
                         f"Active rule (found sweeping {_active['ticker']} / {_active['timeframe']}) — "
@@ -1645,7 +2143,8 @@ with main_col:
                             _rule_wr_layer = RULE_DETECTOR_LABELS[_entry_rule["detector"]]
                             _rule_wr_direction = "bullish" if _rule_direction == "Bullish" else "bearish"
                             _rule_wrs = _historical_win_rates(ticker, _rr_tf_label, _rule_wr_layer, data_source,
-                                                               exit_types=_win_rate_exit_types)
+                                                               exit_types=_win_rate_exit_types,
+                                                               news_blackout=_news_blackout)
                             _rule_wr_label = _win_rate_label(_rule_wrs.get(_rule_wr_direction))
                             _rule_wr_exit_names = "/".join(EXIT_EVENT_LABELS[k] for k in _win_rate_exit_types) \
                                 or "any of the exit triggers"
@@ -1710,7 +2209,7 @@ with main_col:
                         # redetection on a growing slice, every bar); on a
                         # real 730-day/4h BTC-USD combo this measured 11
                         # SECONDS. This whole block reruns on ANY interaction
-                        # anywhere in Layers/Settings/Rules/Charts (one
+                        # anywhere in Layers/Strategy/Backtest/Settings/Charts (one
                         # shared fragment) — recomputing unconditionally
                         # meant clicking an unrelated Layers checkbox paid
                         # that same 11s, every time, confirmed directly as
@@ -1807,10 +2306,12 @@ with main_col:
             "layers": layers, "layer_tf": layer_tf, "max_items_per_layer": max_items_per_layer,
             "selected_kill_zones": selected_kill_zones, "show_mitigated": show_mitigated,
             "show_volume": show_volume, "show_rsi": show_rsi, "show_macd": show_macd, "show_bb": show_bb,
+            "show_atr": show_atr,
             "show_ma": show_indicators, "ma_tf": indicator_tf, "show_volume_profile": show_volume_profile,
             "vp_anchor": vp_anchor, "vp_anchor_date": vp_anchor_date,
             "zone_opacity": zone_opacity, "data_source": data_source,
             "overlay_tf": overlay_tf, "win_rate_exit_types": _win_rate_exit_types,
+            "news_blackout": _news_blackout,
             "confluence_keys": _confluence_keys,
             "entry_rule": _entry_rule, "exit_rule": _exit_rule, "stop_rule": _stop_rule,
             # Not a chart-drawing input itself, but its own toggle needs to
@@ -1862,7 +2363,7 @@ with main_col:
     with main_col:
         # A genuine retracting menu — opens as a floating panel over the
         # chart instead of a permanently-reserved column. Same content as
-        # before (the icon-row-driven Layers/Settings/Rules/Charts cycle
+        # before (the icon-row-driven Layers/Strategy/Backtest/Settings/Charts cycle
         # inside _render_layer_controls, untouched), just no longer nailed
         # open. `_render_layer_controls` still calls st.rerun() in a
         # couple of places (the 1D+ forced-catch-up, and the sweep-
@@ -1873,20 +2374,23 @@ with main_col:
         # already did.
         #
         # The trigger button itself is absolutely-positioned into
-        # main_col's own top-right corner (a plain st.container(key=...)
+        # main_col's own top-left corner (a plain st.container(key=...)
         # doesn't reserve any layout space once its CSS position is
         # "absolute" — it's pulled clean out of the normal document flow,
         # floating over whatever would otherwise render there, confirmed
         # directly this leaves neither a horizontal gap beside it nor a
         # reserved column beneath it the way a dedicated st.columns()
         # split did before). main_col itself needs `position: relative`
-        # so "top: 0; right: 0" resolves against ITS OWN box (the whole
-        # chart column) rather than the page/viewport.
+        # so "top: 0; left: 0" resolves against ITS OWN box (the whole
+        # chart column) rather than the page/viewport. Left, not right, so
+        # this menu trigger and the Signals sidebar's own expand chevron
+        # (now flipped to the right, see theme.py's stSidebar/
+        # stExpandSidebarButton rules) don't compete for the same corner.
         #
         # st.popover's own default look is a small card anchored right
         # under its trigger button — per earlier direct request, restyled
-        # into an actual right-edge drawer instead: full viewport height,
-        # pinned to the right edge, sized to what its content actually
+        # into an actual left-edge drawer instead: full viewport height,
+        # pinned to the left edge, sized to what its content actually
         # needs instead of a cramped fixed popover box. st.popover has no
         # built-in way to ask for this shape, so this overrides its
         # floating-ui-computed inline position/size via a CSS rule with
@@ -1913,13 +2417,47 @@ with main_col:
             .st-key-_menu_trigger_wrap {
                 position: absolute !important;
                 top: 0 !important;
-                right: 0 !important;
+                left: 0 !important;
                 z-index: 100 !important;
                 width: auto !important;
+                /* Flexbox stretches an abspos flex item to the full cross
+                size of its original flex row unless told otherwise -
+                confirmed directly: this box's own rendered height was
+                991px (main_col's FULL height) versus its 40px content,
+                turning the entire right edge of the page into an
+                invisible hit-area that ate clicks meant for the chart's
+                own Fit button underneath. height:auto alone doesn't
+                override flex stretch sizing; align-self does. */
+                height: auto !important;
+                align-self: flex-start !important;
+                /* Belt-and-suspenders: even if some future change makes
+                this box tall again, clicks should fall through empty
+                space to whatever's under it rather than getting eaten. */
+                pointer-events: none !important;
+            }
+            .st-key-_menu_trigger_wrap * {
+                pointer-events: auto !important;
+            }
+            /* _render_layer_controls (what this popover opens into) is a
+               real @st.fragment, but its own content is expensive enough
+               that opening the drawer still measures ~1.7s from click to
+               the popover body actually mounting (confirmed directly via
+               performance.now() around a synthetic click) — a real
+               backend-render cost, not something this CSS file can fix.
+               Without any visual feedback in that window, a click reads
+               as "did nothing," and a second, impatient click during the
+               same window toggles the popover shut again before it ever
+               finished opening (confirmed as the mechanism behind a
+               direct report of "click too fast, doesn't open"). This is
+               a stopgap, not a fix for the underlying latency: an instant
+               pressed-state so the click itself is never in doubt, even
+               while the drawer is still on its way. */
+            .st-key-_menu_trigger_wrap button:active {
+                background: rgba(255,255,255,0.15) !important;
             }
             div[data-testid="stPopoverBody"][aria-label="☰"] {
                 position: fixed !important;
-                inset: 0 0 0 auto !important;
+                inset: 0 auto 0 0 !important;
                 transform: none !important;
                 height: 100vh !important;
                 max-height: 100vh !important;
@@ -1931,7 +2469,7 @@ with main_col:
                 min-width: 320px !important;
                 max-width: 92vw !important;
                 border-radius: 0 !important;
-                border-left: 1px solid rgba(255,255,255,0.15) !important;
+                border-right: 1px solid rgba(255,255,255,0.15) !important;
                 /* NOT overflow-y:auto here anymore — confirmed directly as
                    the cause of "can't resize after scrolling down": the
                    handle below is a plain child of THIS box, so scrolling
@@ -2017,7 +2555,7 @@ with main_col:
                 min-height: 0 !important;
                 overflow-y: auto !important;
             }
-            /* The Rules tab nests its OWN Sweep/Heatmap/Footprint
+            /* The Strategy tab nests its OWN Sweep/Heatmap/Footprint
                st.tabs() inside this same panel. Rather than making
                stTabPanel itself display:flex (which broke tab-switching,
                see above), the nested stTabs' own wrapper div is already
@@ -2033,26 +2571,28 @@ with main_col:
                Rules, which was never separately requested. */
             /* Deliberately NOT native CSS resize:horizontal (tried first) —
                confirmed directly this is a structurally bad fit for a
-               RIGHT-pinned panel: native resize assumes a fixed top-left
-               anchor with a free bottom-right corner the handle drags to a
-               new position, but this panel is the opposite (right edge
-               pinned, left edge free) — the handle itself sits glued to
-               the screen's own right edge no matter how far you drag,
-               since resizing never actually moves it, so the cursor and
-               the handle immediately disconnect. This is a real element
-               instead: a full-height strip at the panel's own LEFT edge
-               (where the moving edge actually is), dragged via JS (see
-               the st.html script below — plain st.markdown can't run
-               <script>, confirmed directly; unsafe_allow_javascript=True
+               pinned panel: native resize assumes a fixed top-left anchor
+               with a free bottom-right corner the handle drags to a new
+               position, but this panel has ITS OWN edge pinned (left,
+               below) and the opposite edge free — the handle itself sits
+               glued to the screen's own pinned edge no matter how far you
+               drag, since resizing never actually moves it, so the cursor
+               and the handle immediately disconnect. This is a real
+               element instead: a full-height strip at the panel's own
+               free edge (where the moving edge actually is), dragged via
+               JS (see the st.html script below — plain st.markdown can't
+               run <script>, confirmed directly; unsafe_allow_javascript=True
                is what actually executes it).
                ::after is the visible grip bar — a 4px accent line that
                brightens on hover. Sits ENTIRELY outside the panel's own
-               padding box now (left:-14px, width:14px — was -5px/10px) —
-               confirmed directly the old, narrower offset let the grip
-               bar's own paint area overlap the first few pixels of real
-               content (checkbox/label text right at the drawer's left
-               edge); fully clearing the padding needs more than half the
-               old hit area's width of clearance. */
+               padding box now (right:-14px, width:14px — was -5px/10px on
+               the left, before the drawer moved to the screen's left edge
+               and its free edge flipped to the right) — confirmed
+               directly the old, narrower offset let the grip bar's own
+               paint area overlap the first few pixels of real content
+               (checkbox/label text right at the drawer's free edge);
+               fully clearing the padding needs more than half the old hit
+               area's width of clearance. */
             .ict-drawer-resize-handle {
                 /* height:100vh instead of top:0;bottom:0 — confirmed
                    directly that bottom:0 resolves against the nearest
@@ -2062,7 +2602,7 @@ with main_col:
                    collapses to 0 rather than stretching. A fixed 100vh
                    sidesteps needing that containing-block chain to
                    resolve correctly at all. */
-                position: absolute; left: -14px; top: 0; height: 100vh; width: 14px;
+                position: absolute; right: -14px; top: 0; height: 100vh; width: 14px;
                 cursor: ew-resize; z-index: 50;
                 display: flex; align-items: center; justify-content: center;
             }
@@ -2122,7 +2662,12 @@ with main_col:
                 });
                 document.addEventListener('mousemove', (e) => {
                     if (!dragging || !panel) return;
-                    const newWidth = window.innerWidth - e.clientX;
+                    // Panel is pinned to the screen's LEFT edge, so its
+                    // width is just the cursor's distance from that edge
+                    // (was window.innerWidth - e.clientX for the old
+                    // right-pinned drawer, measuring from the right edge
+                    // instead).
+                    const newWidth = e.clientX;
                     const clamped = Math.max(320, Math.min(newWidth, window.innerWidth * 0.92));
                     panel.style.setProperty('width', clamped + 'px', 'important');
                 });
@@ -2139,7 +2684,7 @@ with main_col:
             unsafe_allow_javascript=True,
         )
         with st.container(key="_menu_trigger_wrap"):
-            with st.popover("☰", help="Layers, Settings, Rules & Charts"):
+            with st.popover("☰", help="Layers, Strategy, Backtest, Settings & Charts"):
                 st.markdown('<div class="ict-drawer-resize-handle"></div>', unsafe_allow_html=True)
                 _render_layer_controls()
 
@@ -2160,6 +2705,7 @@ with main_col:
     show_rsi = _cc.get("show_rsi", False)
     show_macd = _cc.get("show_macd", False)
     show_bb = _cc.get("show_bb", False)
+    show_atr = _cc.get("show_atr", False)
     show_indicators = _cc.get("show_ma", True)
     indicator_tf = _cc.get("ma_tf", "Chart TF")
     show_volume_profile = _cc.get("show_volume_profile", False)
@@ -2169,6 +2715,7 @@ with main_col:
     data_source = _cc.get("data_source", "auto")
     overlay_tf = _cc.get("overlay_tf", "4h")
     _win_rate_exit_types = _cc.get("win_rate_exit_types", tuple(EXIT_EVENT_LABELS.keys()))
+    _news_blackout = _cc.get("news_blackout")
     _confluence_keys = _cc.get("confluence_keys", [])
     _entry_rule = _cc.get("entry_rule", {"anchor": "current_price"})
     _exit_rule = _cc.get("exit_rule", {"anchor": "current_price"})
@@ -2215,7 +2762,7 @@ with main_col:
             # script's closure-captured copy from whenever it last fully
             # ran. _render_layer_controls is a SEPARATE fragment; a change
             # made there updates session_state without rerunning this one,
-            # so without this re-read, a Layers/Settings/Rules change
+            # so without this re-read, a Layers/Strategy/Settings change
             # wouldn't show up here until something else forced a full
             # rerun. Shadows the same-named outer-scope locals on purpose —
             # every reference below already uses these names unchanged.
@@ -2238,6 +2785,7 @@ with main_col:
             show_rsi = _cc.get("show_rsi", False)
             show_macd = _cc.get("show_macd", False)
             show_bb = _cc.get("show_bb", False)
+            show_atr = _cc.get("show_atr", False)
             show_indicators = _cc.get("show_ma", True)
             indicator_tf = _cc.get("ma_tf", "Chart TF")
             show_volume_profile = _cc.get("show_volume_profile", False)
@@ -2247,6 +2795,7 @@ with main_col:
             data_source = _cc.get("data_source", "auto")
             overlay_tf = _cc.get("overlay_tf", "4h")
             _win_rate_exit_types = _cc.get("win_rate_exit_types", tuple(EXIT_EVENT_LABELS.keys()))
+            _news_blackout = _cc.get("news_blackout")
             _confluence_keys = _cc.get("confluence_keys", [])
             _entry_rule = _cc.get("entry_rule", {"anchor": "current_price"})
             _exit_rule = _cc.get("exit_rule", {"anchor": "current_price"})
@@ -2278,6 +2827,7 @@ with main_col:
                              "error_message": f"No data for {ticker} at {tf_label}"},
                     ohlc={"ticker": ticker, "source": "—", "forming_bar_time": None},
                     height=1000,
+                    display_tz=theme.get_display_tz(),
                 )
                 _select_chart("main", clicked)
                 return
@@ -2344,6 +2894,7 @@ with main_col:
                              "error_message": f"No data for {ticker} at {tf_label}"},
                     ohlc={"ticker": ticker, "source": "—", "forming_bar_time": None},
                     height=1000,
+                    display_tz=theme.get_display_tz(),
                 )
                 _select_chart("main", clicked)
                 return
@@ -2430,6 +2981,15 @@ with main_col:
             # Confirmed directly trying to use this chart to plan a trade:
             # exact liquidity prices weren't answerable from the UI at all.
             liquidity_rows = []
+            # Same idea again for Naked POCs — see the detector's own
+            # docstring for what these are and why they persist across
+            # sessions instead of resetting with each new profile.
+            naked_poc_rows = []
+            # Set inside the Naked POC layer block below when it runs —
+            # stays None otherwise (feature off, or too little history for
+            # even 2 sessions), so the detail expander further down can
+            # check it safely either way.
+            _poc_mig = None
 
             # Entry/SL/TP for the single top-ranked currently-open FVG/Order
             # Block/Liquidity Reaction on THIS chart's own ticker+timeframe —
@@ -2449,7 +3009,7 @@ with main_col:
             # independently set to detect on — there's only one real
             # current price, not one per timeframe.
             current_price = float(df[c_col].iloc[-1])
-            # A direct lookup, independent of the Rules tab's own entry/
+            # A direct lookup, independent of the Backtest tab's own entry/
             # exit/stop rule below — a real live MA+FVG overlap should
             # show up here regardless of whatever rule happens to be
             # configured. The border highlight means "an EMA sits inside
@@ -2458,7 +3018,7 @@ with main_col:
             _ma_fvg_starts = ma_fvg_starts(df)
 
             # Resolved unconditionally — the drawing loop below always
-            # needs these now. (The Rules tab's own R:R
+            # needs these now. (The Backtest tab's own R:R
             # preview resolves its own copy of these locally, in the SAME
             # fragment as the rule widgets themselves — see
             # _render_layer_controls — rather than reading a value
@@ -2472,48 +3032,141 @@ with main_col:
             # NOW," nothing ranked or guessed. Any rule that can't resolve
             # (e.g. "3rd-nearest FVG" but only 2 exist) returns None rather
             # than falling back to a different, unrequested number.
-            _entry_price = resolve_rule(_entry_rule, df, current_price)
-            _exit_price = resolve_rule(_exit_rule, df, current_price)
-            _stop_price = resolve_rule(_stop_rule, df, current_price)
+            #
+            # _active_scan_pick (sidebar "Scan watchlist"/"Scan timeframes")
+            # takes priority over the Strategy tab's own rule when it
+            # matches THIS ticker — a fixed snapshot from scan time, not
+            # re-resolved live, since re-resolving "nearest FVG below
+            # price" could land on a different zone entirely once price
+            # has moved, silently showing something the scan never
+            # actually picked.
+            #
+            # Unlocked (default): only applies when the timeframe ALSO
+            # matches — switching timeframe falls through to the normal
+            # rule below with nothing to clear, it just stops applying on
+            # its own. Locked (the checkbox below, direct request: "cycle
+            # through timeframes without the trade going away"): applies
+            # regardless of the displayed timeframe — the pick's own real
+            # price/timestamps are timeframe-independent, so it keeps
+            # showing correctly no matter what tf_label is browsed to,
+            # until a new pick replaces it (which resets the lock off) or
+            # the ticker itself changes.
+            _scan_pick = st.session_state.get("_active_scan_pick")
+            _scan_pick_here = bool(_scan_pick) and _scan_pick["ticker"] == ticker
+            if _scan_pick_here:
+                st.checkbox(
+                    f"🔒 Lock: {_scan_pick['label']} — keep showing across timeframes",
+                    key="_scan_pick_locked",
+                    help="On: this trade's exact entry/stop/target and confluence zones stay "
+                         "pinned no matter which timeframe you switch to, replacing everything "
+                         "else on the chart. Off (default): only shows while you're on the exact "
+                         "timeframe it was found on.")
+            _scan_pick_locked = _scan_pick_here and st.session_state.get("_scan_pick_locked", False)
+            _scan_pick_active = _scan_pick_here and (_scan_pick_locked or _scan_pick["timeframe"] == tf_label)
+            # Rebalance chain: ticker-scoped like _active_scan_pick above,
+            # but NOT timeframe-scoped — it's a projection drawn in its
+            # own forward time-slices past whatever's currently live, so
+            # it renders the same regardless of which timeframe is
+            # charted (same "real price is timeframe-independent"
+            # reasoning as the lock checkbox).
+            _tf_scan_chain = st.session_state.get("_tf_scan_chain")
+            _chain_here = bool(_tf_scan_chain) and _tf_scan_chain[0]["setup"]["ticker"] == ticker
+            _show_chain = _chain_here and st.session_state.get("_show_rebalance_chain", False)
+            if _scan_pick_active:
+                _entry_price, _stop_price, _exit_price = _scan_pick["entry"], _scan_pick["stop"], _scan_pick["target"]
+            else:
+                _entry_price = resolve_rule(_entry_rule, df, current_price)
+                _exit_price = resolve_rule(_exit_rule, df, current_price)
+                _stop_price = resolve_rule(_stop_rule, df, current_price)
 
-            # Entry/SL/TP always come from the Rules tab's own rule now —
+            # Entry/SL/TP come from the Strategy tab's own rule by default —
             # the old Automatic mode (trusting best_trade_now's own
-            # validation/confluence ranking for these same three lines) and
-            # the Off toggle (hiding them) are both gone per direct request.
+            # validation/confluence ranking for these same three lines,
+            # unconditionally, on whatever timeframe happened to be
+            # charted) and the Off toggle (hiding them) are both gone per
+            # direct request. _active_scan_pick above is a narrower,
+            # deliberate exception: an explicit "show me THIS specific
+            # scan result" click, not best_trade_now silently driving the
+            # chart on its own again.
             _entry_x = _ny_fake_utc_seconds(df.index[-1])
+            # Direct request: "the current model for rendering active
+            # trade is something I don't want to see... During the
+            # backtest, the areas are rendered a specific way. I want
+            # exactly that for the active trade" — solid flat fill +
+            # visible border, the EXACT style the Backtest tab's own
+            # "Show these trades on the chart" already draws for a
+            # resolved trade (see this function's own backtest-trades
+            # block further down) — not the old fading gradient band.
+            # "the box should be printed from present to future a bit":
+            # bounded to _trade_box_seconds, not open-ended out to
+            # future_edge — _active_box_t1 is reused as the rebalance
+            # chain's own starting point below (see _show_chain), so the
+            # active trade's box and the chain's own boxes read as one
+            # continuous, chained sequence rather than two unrelated
+            # spans.
+            _trade_box_seconds = _TF_BAR_SECONDS[tf_label] * 50
+            _active_box_t1 = _entry_x + _trade_box_seconds
+            # Direct request: "the current trade render... with the glow
+            # entry/tp/sl, I want it to be gone... bring it closer to the
+            # last bar printed." dashed=True (was False): a non-dashed
+            # line ALWAYS stretches to the chart's own far right edge
+            # regardless of t1 (see HLineRenderer's own comment) — the
+            # glow/gradient treatment that came with it, AND the reason
+            # these labels rendered far from the box they belong to
+            # instead of right at its own edge next to the last real
+            # candle. Dashed respects t0/t1 for real, same fix already
+            # applied to the rebalance chain's own entry markers.
             for _price, _color, _title in [
                 (_entry_price, theme.NEON_AMBER, "Entry"),
                 (_stop_price, theme.NEON_MAGENTA, "SL"),
                 (_exit_price, theme.NEON_GREEN, "TP"),
             ]:
                 if _price is not None:
-                    price_lines.append({"t0": _entry_x, "t1": future_edge, "price": _price,
+                    price_lines.append({"t0": _entry_x, "t1": _active_box_t1, "price": _price,
                                          "color": _hex_to_rgba(_color, 1.0), "title": _title,
-                                         "line_width": 3, "dashed": False,
-                                         "above": _price >= (_entry_price if _entry_price is not None else _price)})
+                                         "line_width": 2, "dashed": True,
+                                         # bool(...) - resolve_rule can return a raw
+                                         # numpy float off a liquidity-anchored rule
+                                         # (a swing point's own price), and comparing
+                                         # that against another float yields
+                                         # numpy.bool_, not a native bool. Confirmed
+                                         # directly as a real bug: embedded straight
+                                         # into this dict, it broke the component's
+                                         # JSON serialization the moment a rule using
+                                         # such a price got applied to the chart
+                                         # ("Could not fetch <ticker>: ... Object of
+                                         # type bool is not JSON serializable").
+                                         "above": bool(_price >= (_entry_price if _entry_price is not None else _price))})
             if _entry_price is not None and _stop_price is not None:
-                # The risk itself, not just its two edges — a translucent
-                # band between Entry and SL, fading in from the entry
-                # candle to solid red at the live edge, same pairing and
-                # same "builds toward now" language as the lines
-                # themselves. See feedback_ui_obviousness.
-                rectangles.append({"t0": _entry_x, "t1": future_edge, "p0": _entry_price, "p1": _stop_price,
-                                    "fill": _hex_to_rgba(theme.NEON_MAGENTA, 0.02),
-                                    "fill_to": _hex_to_rgba(theme.NEON_MAGENTA, 0.16),
-                                    "extend_to_edge": True})
+                rectangles.append({"t0": _entry_x, "t1": _active_box_t1, "p0": _entry_price, "p1": _stop_price,
+                                    "fill": _hex_to_rgba(theme.NEON_MAGENTA, 0.10),
+                                    "border": _hex_to_rgba(theme.NEON_MAGENTA, 0.9)})
             if _entry_price is not None and _exit_price is not None:
-                # The reward's own zone, mirroring the risk zone above —
-                # without this TP's line alone reads as less
-                # highlighted than SL's, even though both get the
-                # identical glow/gradient treatment, since SL had a
-                # whole tinted area behind it and TP didn't. See
-                # feedback_ui_obviousness.
-                rectangles.append({"t0": _entry_x, "t1": future_edge, "p0": _entry_price, "p1": _exit_price,
-                                    "fill": _hex_to_rgba(theme.NEON_GREEN, 0.02),
-                                    "fill_to": _hex_to_rgba(theme.NEON_GREEN, 0.16),
-                                    "extend_to_edge": True})
+                rectangles.append({"t0": _entry_x, "t1": _active_box_t1, "p0": _entry_price, "p1": _exit_price,
+                                    "fill": _hex_to_rgba(theme.NEON_GREEN, 0.10),
+                                    "border": _hex_to_rgba(theme.NEON_GREEN, 0.9),
+                                    # Direct request: "for every trade, within the fill area,
+                                    # should contain text with all confluences" — only available
+                                    # when this box came from a scan pick (best_trade_now
+                                    # actually scored it); a plain Strategy-tab rule has no
+                                    # confluence data to show, so this is simply absent then.
+                                    "body_lines": _confluence_body_lines(_scan_pick) if _scan_pick_active else None})
 
-            # Every trade from the Rules tab's own "Run backtest" run, each
+            # Snapshot of JUST the Entry/SL/TP lines + their risk/reward
+            # bands, taken right here before any detection LAYER below
+            # (FVG/OB/Liquidity/Swing/Premium-Discount/Naked POC/...) gets
+            # a chance to append its own rectangles/price_lines onto the
+            # same two lists. The isolated "lock trade" view (see
+            # _scan_pick_overlays' own call site, near the ict_chart call
+            # below) rebuilds `rectangles`/`price_lines` from THIS
+            # snapshot instead of whatever those lists grow into by the
+            # end of the script — otherwise every other layer's own
+            # clutter would still leak into a view meant to show "those
+            # exact zones, nothing else."
+            _trade_only_rectangles = list(rectangles)
+            _trade_only_price_lines = list(price_lines)
+
+            # Every trade from the Backtest tab's own "Run backtest" run, each
             # as its own risk/reward box over its real entry-to-exit span —
             # opt-in via the "Show these trades on the chart" checkbox next
             # to that panel's results table, and only drawn when the stored
@@ -2639,10 +3292,10 @@ with main_col:
                     for _period in MA_FVG_PERIODS:
                         _chart_indicators[f"ma{_period}"] = _series_to_points(ema(_close_col, _period))
 
-            # RSI/MACD/Bollinger Bands — plain technical indicators, always
-            # read off the main chart's own df at its own timeframe (no
-            # separate TF picker; see the Settings checkboxes for why).
-            if (show_rsi or show_macd or show_bb) and not df.empty:
+            # RSI/MACD/Bollinger Bands/ATR — plain technical indicators,
+            # always read off the main chart's own df at its own timeframe
+            # (no separate TF picker; see the Settings checkboxes for why).
+            if (show_rsi or show_macd or show_bb or show_atr) and not df.empty:
                 _ti_close = df["Close"] if "Close" in df else df["close"]
                 if show_rsi:
                     _chart_indicators["rsi"] = _series_to_points(rsi(_ti_close))
@@ -2660,6 +3313,13 @@ with main_col:
                         "basis": _series_to_points(_bb_basis),
                         "lower": _series_to_points(_bb_lower),
                     }
+                if show_atr:
+                    # Needs the full OHLC, not just Close — unlike RSI/MACD/
+                    # BB above, True Range is a function of this bar's own
+                    # high-low AND the gap from the prior close (see atr's
+                    # own docstring), so it reads df directly rather than
+                    # the already-sliced _ti_close series the others share.
+                    _chart_indicators["atr"] = _series_to_points(atr(df))
 
             # Volume Profile — how much volume traded at each PRICE level
             # over this chart's own currently-loaded history (see
@@ -2681,6 +3341,10 @@ with main_col:
             # when it's an honest reflection of the full period.
             volume_profile_buckets = []
             _vp_df = df
+            # Set inside the block below when it actually runs — stays None
+            # otherwise (feature off, or no usable volume), so the detail
+            # expander further down can check it safely either way.
+            _vp = None
             if show_volume_profile and vp_anchor != "Full history" and not df.empty:
                 _vp_cutoff = None
                 if vp_anchor == "Custom date" and vp_anchor_date is not None:
@@ -2697,13 +3361,31 @@ with main_col:
             if show_volume_profile and not _vp_df.empty:
                 _vp = volume_profile(_vp_df)
                 if _vp is not None:
-                    for _b in _vp["buckets"]:
+                    _hvn_idx = set(_vp["hvn_indices"])
+                    _lvn_idx = set(_vp["lvn_indices"])
+                    for _bi, _b in enumerate(_vp["buckets"]):
                         _is_poc = _b["price_low"] <= _vp["poc_price"] <= _b["price_high"]
+                        # HVN = another real cluster besides POC (price likely
+                        # stalls/consolidates here if revisited) — green, the
+                        # same "stable/supportive" association this app's
+                        # palette already uses elsewhere. LVN = a genuine
+                        # thin spot (price likely moves FAST through if
+                        # revisited, little resting interest to absorb it) —
+                        # magenta, this app's existing "fast/volatile"
+                        # association, kept at low opacity since the bar
+                        # itself is already short by construction (a thin
+                        # bucket) and doesn't need to also shout.
+                        if _is_poc:
+                            _vp_color = _hex_to_rgba(theme.NEON_CYAN, 0.55)
+                        elif _bi in _hvn_idx:
+                            _vp_color = _hex_to_rgba(theme.NEON_GREEN, 0.45)
+                        elif _bi in _lvn_idx:
+                            _vp_color = _hex_to_rgba(theme.NEON_MAGENTA, 0.30)
+                        else:
+                            _vp_color = _hex_to_rgba("#8e8e93", 0.30)
                         volume_profile_buckets.append({
                             "price_low": _b["price_low"], "price_high": _b["price_high"],
-                            "volume_frac": _b["volume_frac"],
-                            "color": _hex_to_rgba(theme.NEON_CYAN, 0.55) if _is_poc
-                                     else _hex_to_rgba("#8e8e93", 0.30),
+                            "volume_frac": _b["volume_frac"], "color": _vp_color,
                         })
                     _vp_t0 = _ny_fake_utc_seconds(_vp_df.index[0]) if vp_anchor != "Full history" else axis_secs[0]
                     price_lines.append({"t0": _vp_t0, "t1": future_edge, "price": _vp["poc_price"],
@@ -2712,6 +3394,8 @@ with main_col:
                                          "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAH", "above": True})
                     price_lines.append({"t0": _vp_t0, "t1": future_edge, "price": _vp["value_area_low"],
                                          "color": _hex_to_rgba(theme.NEON_AMBER, 0.7), "title": "VAL", "above": False})
+                    legend_items.append((f"Volume Profile ({_vp['shape_label']})",
+                                          f"POC + {len(_hvn_idx)} HVN + {len(_lvn_idx)} LVN", theme.NEON_CYAN))
 
             # Every layer detects against whatever SINGLE timeframe its own
             # dropdown picked (see the Layers popover) — no more fixed 4h/
@@ -3028,16 +3712,31 @@ with main_col:
                 if rf is not None:
                     all_fvgs = detect_fvgs(rf["confirmed"])
                     fvgs = all_fvgs if show_mitigated else [g for g in all_fvgs if not g["filled"]]
-                    fvgs = _nearest_by_price(fvgs, current_price, max_items_per_layer)
+                    # Two deliberately different selections merged together
+                    # — direct request, for the whole detection system, not
+                    # just replay: "one that tracks previous candles, and
+                    # one that scans historical values." recent_zone_tracker
+                    # (Engine A) adds every zone from the last 50 bars,
+                    # uncapped; _nearest_by_price (Engine B, this layer's
+                    # own pre-existing selection, unchanged) still finds the
+                    # nearest max_items_per_layer above/below price from the
+                    # WHOLE history. Both feed the exact same downstream
+                    # win-rate/MA+FVG/indicator-confluence/render loop below
+                    # — a zone from either engine is drawn identically.
+                    fvgs = merge_zone_engines(
+                        recent_zone_tracker(fvgs, rf["confirmed"], lookback_bars=50),
+                        _nearest_by_price(fvgs, current_price, max_items_per_layer))
                     win_rates = _historical_win_rates(ticker, layer_tf["FVG"], "FVG", data_source,
-                                                       exit_types=_win_rate_exit_types)
+                                                       exit_types=_win_rate_exit_types,
+                                                       news_blackout=_news_blackout)
                     # A separate lookup, not per-zone — MA+FVG's own win
                     # rate (touch anchored to the EMA's level, not "touched
                     # anywhere in the gap") is a different, more specific
                     # stat than plain FVG's, shown INSTEAD of it for zones
                     # that are also MA+FVG matches.
                     ma_fvg_win_rates = _historical_win_rates(ticker, layer_tf["FVG"], "MA+FVG", data_source,
-                                                              exit_types=_win_rate_exit_types)
+                                                              exit_types=_win_rate_exit_types,
+                                                              news_blackout=_news_blackout)
                     # General indicator confluence (RSI/MACD/EMA, whichever
                     # the "Indicator confluence" control has selected) — a
                     # SEPARATE, additional check from the MA+FVG strategy
@@ -3100,7 +3799,8 @@ with main_col:
                             # gap price has already used up, at a glance.
                             rectangles.append({
                                 "t0": t0, "t1": t1, "p0": g["bottom"], "p1": g["top"],
-                                "fill": _hex_to_rgba(color, zone_opacity), "border": color,
+                                "fill": _hex_to_rgba(color, zone_opacity),
+                                "border": theme.CONFLUENCE_GOLD if is_highlighted else color,
                                 "label": label,
                                 "border_width": 3 if is_highlighted else 1,
                             })
@@ -3129,14 +3829,52 @@ with main_col:
                     open_n = sum(1 for g in fvgs if not g["filled"])
                     legend_items.append((f"FVG ({layer_tf['FVG']})", f"{len(fvgs)} shown · {open_n} open", theme.NEON_CYAN))
 
+            if "IFVG" in layers:
+                rf = tf_frames.get(layer_tf["IFVG"])
+                if rf is not None:
+                    ifvgs = detect_ifvgs(rf["confirmed"])
+                    # Same two-engine merge as every other zone layer — see
+                    # the FVG block's own comment above. No "still open"
+                    # eaten/encroachment shading here (see detect_ifvgs' own
+                    # docstring: unlike an FVG, an IFVG's own top/bottom are
+                    # fixed at the original gap's full formation size, not
+                    # something that shrinks as price re-tests it), and no
+                    # historical win-rate lookup yet — a new-enough concept
+                    # that this project doesn't have its own win-rate
+                    # methodology for it, unlike FVG/Order Block/Liquidity.
+                    ifvgs = merge_zone_engines(
+                        recent_zone_tracker(ifvgs, rf["confirmed"], lookback_bars=50),
+                        _nearest_by_price(ifvgs, current_price, max_items_per_layer))
+                    for z in ifvgs:
+                        color = theme.NEON_CYAN if z["type"] == "bullish" else theme.NEON_MAGENTA
+                        rectangles.append({
+                            "t0": _ny_fake_utc_seconds(z["start"]), "t1": future_edge,
+                            "p0": z["bottom"], "p1": z["top"],
+                            "fill": _hex_to_rgba(color, zone_opacity), "border": color,
+                            "label": "IFVG", "border_width": 2,
+                        })
+                        fvg_ob_rows.append({
+                            "layer": "IFVG", "tf": layer_tf["IFVG"], "type": z["type"],
+                            "top": z["top"], "bottom": z["bottom"],
+                            "start": z["start"], "end": z["start"],
+                            "status": "touched" if z["first_touch"] else "untouched",
+                            "first_touch": z["first_touch"], "hist_win_rate": "not tracked yet",
+                        })
+                    legend_items.append((f"IFVG ({layer_tf['IFVG']})", f"{len(ifvgs)} shown", theme.NEON_CYAN))
+
             if "Order Blocks" in layers:
                 rf = tf_frames.get(layer_tf["Order Blocks"])
                 if rf is not None:
                     all_obs = detect_order_blocks(rf["confirmed"])
                     obs = all_obs if show_mitigated else [o for o in all_obs if not o["mitigated"]]
-                    obs = _nearest_by_price(obs, current_price, max_items_per_layer)
+                    # Same two-engine merge as the FVG layer above — see
+                    # its own comment.
+                    obs = merge_zone_engines(
+                        recent_zone_tracker(obs, rf["confirmed"], lookback_bars=50),
+                        _nearest_by_price(obs, current_price, max_items_per_layer))
                     win_rates = _historical_win_rates(ticker, layer_tf["Order Blocks"], "Order Block", data_source,
-                                                       exit_types=_win_rate_exit_types)
+                                                       exit_types=_win_rate_exit_types,
+                                                       news_blackout=_news_blackout)
                     _rf_close = rf["confirmed"]["Close"] if "Close" in rf["confirmed"] else rf["confirmed"]["close"]
                     ob_confluence = zone_indicator_matches(obs, _rf_close, _confluence_keys) if _confluence_keys else {}
                     for ob in obs:
@@ -3148,10 +3886,11 @@ with main_col:
                         if matched_inds:
                             ind_tag = "+".join(INDICATOR_SPECS[k]["label"] for k in matched_inds)
                             label = f"{label} · {ind_tag}" if label else ind_tag
+                        ob_border = None if ob["mitigated"] else (theme.CONFLUENCE_GOLD if matched_inds else color)
                         rectangles.append({
                             "t0": _ny_fake_utc_seconds(ob["start"]), "t1": rf["t1_axis"](ob["end"]),
                             "p0": ob["bottom"], "p1": ob["top"],
-                            "fill": _hex_to_rgba(color, opacity), "border": None if ob["mitigated"] else color,
+                            "fill": _hex_to_rgba(color, opacity), "border": ob_border,
                             "label": label,
                             "border_width": 3 if matched_inds else 1,
                         })
@@ -3165,6 +3904,33 @@ with main_col:
                         })
                     unmit = sum(1 for o in obs if not o["mitigated"])
                     legend_items.append((f"Order Blocks ({layer_tf['Order Blocks']})", f"{len(obs)} shown · {unmit} unmit.", theme.NEON_GREEN))
+
+            if "Breaker Block" in layers:
+                rf = tf_frames.get(layer_tf["Breaker Block"])
+                if rf is not None:
+                    breakers = detect_breaker_blocks(rf["confirmed"])
+                    # Same reasoning as the IFVG block above, applied to
+                    # Order Blocks instead of FVGs — see detect_breaker_
+                    # blocks' own docstring.
+                    breakers = merge_zone_engines(
+                        recent_zone_tracker(breakers, rf["confirmed"], lookback_bars=50),
+                        _nearest_by_price(breakers, current_price, max_items_per_layer))
+                    for z in breakers:
+                        color = theme.NEON_GREEN if z["type"] == "bullish" else theme.NEON_AMBER
+                        rectangles.append({
+                            "t0": _ny_fake_utc_seconds(z["start"]), "t1": future_edge,
+                            "p0": z["bottom"], "p1": z["top"],
+                            "fill": _hex_to_rgba(color, zone_opacity), "border": color,
+                            "label": "Breaker", "border_width": 2,
+                        })
+                        fvg_ob_rows.append({
+                            "layer": "Breaker Block", "tf": layer_tf["Breaker Block"], "type": z["type"],
+                            "top": z["top"], "bottom": z["bottom"],
+                            "start": z["start"], "end": z["start"],
+                            "status": "touched" if z["first_touch"] else "untouched",
+                            "first_touch": z["first_touch"], "hist_win_rate": "not tracked yet",
+                        })
+                    legend_items.append((f"Breaker Block ({layer_tf['Breaker Block']})", f"{len(breakers)} shown", theme.NEON_GREEN))
 
             if "Swing Points" in layers:
                 rf = tf_frames.get(layer_tf["Swing Points"])
@@ -3364,7 +4130,8 @@ with main_col:
                     # uses (see liquidity_event_win_rate), so BSL reads the
                     # "bearish" side of this lookup and SSL the "bullish".
                     liq_win_rates = _historical_win_rates(ticker, layer_tf["Liquidity"], "Liquidity", data_source,
-                                                           exit_types=_win_rate_exit_types)
+                                                           exit_types=_win_rate_exit_types,
+                                                           news_blackout=_news_blackout)
                     bsl_label = _win_rate_label(liq_win_rates.get("bearish"))
                     ssl_label = _win_rate_label(liq_win_rates.get("bullish"))
                     _rf_close = rf["confirmed"]["Close"] if "Close" in rf["confirmed"] else rf["confirmed"]["close"]
@@ -3378,8 +4145,9 @@ with main_col:
                         matched_inds = above_confluence.get(lvl["time"], [])
                         if matched_inds:
                             title += " · " + "+".join(INDICATOR_SPECS[k]["label"] for k in matched_inds)
+                        bsl_color = theme.CONFLUENCE_GOLD if matched_inds else theme.NEON_MAGENTA
                         price_lines.append({"t0": _ny_fake_utc_seconds(lvl["time"]), "t1": rf["t1_axis"](t1),
-                                             "price": lvl["price"], "color": _hex_to_rgba(theme.NEON_MAGENTA, 1.0),
+                                             "price": lvl["price"], "color": _hex_to_rgba(bsl_color, 1.0),
                                              "title": title, "line_width": 2 if matched_inds else 1, "above": True})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "BSL (buy-side)", "price": lvl["price"], "formed": lvl["time"]})
                     for lvl in below:
@@ -3388,8 +4156,9 @@ with main_col:
                         matched_inds = below_confluence.get(lvl["time"], [])
                         if matched_inds:
                             title += " · " + "+".join(INDICATOR_SPECS[k]["label"] for k in matched_inds)
+                        ssl_color = theme.CONFLUENCE_GOLD if matched_inds else theme.NEON_AMBER
                         price_lines.append({"t0": _ny_fake_utc_seconds(lvl["time"]), "t1": rf["t1_axis"](t1),
-                                             "price": lvl["price"], "color": _hex_to_rgba(theme.NEON_AMBER, 1.0),
+                                             "price": lvl["price"], "color": _hex_to_rgba(ssl_color, 1.0),
                                              "title": title, "line_width": 2 if matched_inds else 1, "above": False})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "SSL (sell-side)", "price": lvl["price"], "formed": lvl["time"]})
 
@@ -3419,6 +4188,70 @@ with main_col:
                     legend_items.append((f"Liquidity ({layer_tf['Liquidity']})",
                                           f"{len(above)}BSL {len(below)}SSL · {len(reactions)} reaction(s)", theme.NEON_MAGENTA))
 
+            if "Naked POC" in layers:
+                rf = tf_frames.get(layer_tf["Naked POC"])
+                # Both this and Poor High/Low below need a real INTRADAY
+                # session to bucket — on a 1D+ layer timeframe, each bar
+                # already covers a whole day, so "group by NY calendar
+                # day" gives exactly one bar per group, which
+                # _daily_volume_profiles' own MIN_BARS_PER_DAY guard
+                # correctly refuses to treat as a real session profile.
+                # Skipped here too (not just left to come back empty)
+                # so the legend can say WHY plainly, instead of reading
+                # "0 untouched" — confirmed directly as a real point of
+                # confusion otherwise: this used to run anyway, silently
+                # producing a technically-computed but meaningless result
+                # instead of an honest "can't do this here."
+                if rf is not None and CANDLE_SECONDS.get(layer_tf["Naked POC"]) is not None:
+                    # Nearest to current price first, same "what's actually
+                    # in play right now" ordering every other layer's own
+                    # max_items_per_layer cap already uses — a naked POC
+                    # from months back, far from price, is much less
+                    # actionable than one price is sitting right next to.
+                    nakeds = sorted(detect_naked_pocs(rf["confirmed"]),
+                                     key=lambda r: abs(r["price"] - current_price))[:max_items_per_layer]
+                    for np_ in nakeds:
+                        price_lines.append({
+                            "t0": _ny_fake_utc_seconds(np_["time"]), "t1": future_edge, "price": np_["price"],
+                            "color": _hex_to_rgba(theme.NEON_GREEN, 0.85),
+                            "title": f"Naked POC ({np_['day']})", "dashed": True,
+                            "above": np_["price"] >= current_price,
+                        })
+                        naked_poc_rows.append({"tf": layer_tf["Naked POC"], "day": np_["day"], "price": np_["price"]})
+                    legend_items.append((f"Naked POC ({layer_tf['Naked POC']})",
+                                          f"{len(nakeds)} untouched", theme.NEON_GREEN))
+                    # Same underlying per-session data (see poc_migration's
+                    # own docstring) — is value migrating session to
+                    # session, or basically flat? Surfaced in the Naked POC
+                    # detail expander further down, not its own layer/
+                    # checkbox — a derived read on data this layer is
+                    # already fetching, not a new thing to opt into.
+                    _poc_mig = poc_migration(rf["confirmed"])
+                elif rf is not None:
+                    legend_items.append((f"Naked POC ({layer_tf['Naked POC']})",
+                                          "needs an intraday TF (≤4h)", theme.NEON_GREEN))
+
+            if "Poor High/Low" in layers:
+                rf = tf_frames.get(layer_tf["Poor High/Low"])
+                if rf is not None and CANDLE_SECONDS.get(layer_tf["Poor High/Low"]) is not None:
+                    # No "still live" concept here (see the detector's own
+                    # docstring) — most-recent-first, same as Swing Points/
+                    # Equal H-L/Structure above, not a nearest-to-price sort.
+                    poor_hl = detect_poor_highs_lows(rf["confirmed"])[:max_items_per_layer]
+                    for p in poor_hl:
+                        markers.append({
+                            "time": _ny_fake_utc_seconds(p["time"]),
+                            "position": "aboveBar" if p["kind"] == "high" else "belowBar",
+                            "color": _hex_to_rgba(theme.NEON_AMBER, 1.0),
+                            "shape": "square",
+                            "text": f"Poor {p['kind']} ({p['day']})",
+                        })
+                    legend_items.append((f"Poor High/Low ({layer_tf['Poor High/Low']})",
+                                          f"{len(poor_hl)} flagged", theme.NEON_AMBER))
+                elif rf is not None:
+                    legend_items.append((f"Poor High/Low ({layer_tf['Poor High/Low']})",
+                                          "needs an intraday TF (≤4h)", theme.NEON_AMBER))
+
             # Changes exactly when a full chart rebuild is warranted (new
             # ticker/timeframe/session/mitigated-visibility/log-scale, or the
             # loaded WINDOW itself shifted — the oldest bar actually being
@@ -3442,6 +4275,52 @@ with main_col:
             # backfill in Python but never actually trigger isFullReload on
             # the frontend, which would keep patching only the 2-bar
             # incremental tail and never receive the new array at all.
+            # Isolated "lock trade" view — direct request: "when I click
+            # one, I want to see the exact setup with those exact zones,
+            # nothing else." Overrides everything every layer above just
+            # built (FVG/OB/Liquidity/Swing/whatever's toggled on) with
+            # JUST this one trade's own trigger zone + its specific
+            # confluence-factor zones. Markers (Swing Points/Equal H-L
+            # dots) aren't part of any trade's own geometry, so those stay
+            # cleared too rather than left cluttering an otherwise-isolated
+            # view. Entry/SL/TP price_lines (already built above, from the
+            # same _scan_pick) are kept, not replaced — extended with the
+            # confluence levels alongside them.
+            # Rebalance chain view — direct request, sketched by hand:
+            # each step gets its own risk/reward box (see
+            # _rebalance_chain_overlays' own docstring) stacked forward
+            # from future_edge, isolated the same way the lock-trade view
+            # is (built from the SAME _trade_only_* snapshot, not
+            # whatever every other layer above grew rectangles/
+            # price_lines into) — composes with an active lock (both draw
+            # at once) rather than one silently overriding the other.
+            if _show_chain:
+                _base_rects, _base_lines = list(_trade_only_rectangles), list(_trade_only_price_lines)
+                if _scan_pick_active:
+                    _pick_rects, _pick_conf_lines = _scan_pick_overlays(_scan_pick, future_edge, _ny_fake_utc_seconds)
+                    _base_rects += _pick_rects
+                    _base_lines += _pick_conf_lines
+                # Chained from _active_box_t1 — exactly where the active
+                # trade's OWN box (built above) ends — not future_edge,
+                # so the whole sequence reads as one continuous path:
+                # [active trade box][chain step 1][chain step 2]..., each
+                # starting where the last one stopped. Same
+                # _trade_box_seconds width as that box, for a consistent
+                # rhythm across the whole chain. The chart's own default
+                # zoom now reserves room for this (see options.
+                # future_margin_frac on the ict_chart call below) instead
+                # of the slice width itself trying to solve that.
+                _chain_rects, _chain_lines = _rebalance_chain_overlays(
+                    _tf_scan_chain, _active_box_t1, _trade_box_seconds)
+                rectangles = _base_rects + _chain_rects
+                price_lines = _base_lines + _chain_lines
+                markers = []
+            elif _scan_pick_active:
+                _pick_rects, _pick_conf_lines = _scan_pick_overlays(_scan_pick, future_edge, _ny_fake_utc_seconds)
+                rectangles = _trade_only_rectangles + _pick_rects
+                price_lines = _trade_only_price_lines + _pick_conf_lines
+                markers = []
+
             fingerprint = (f"{ticker}|{tf_label}|{'+'.join(sorted(selected_kill_zones))}|{show_mitigated}|"
                             f"{bars[0]['time'] if bars else 0}")
 
@@ -3475,7 +4354,16 @@ with main_col:
                           # lightweight-charts derives candle width straight
                           # from barSpacing with no separate thickness knob,
                           # see candleWidthFactor in the frontend.
-                          "candle_width_factor": 0.85},
+                          "candle_width_factor": 0.85,
+                          # Direct request: "default the chart to about 60%
+                          # of the width to the right to make room for the
+                          # trades" — the active-trade box and rebalance-
+                          # chain boxes (see _trade_box_overlays) both start
+                          # at the present and extend rightward; leaving
+                          # this much of the fitted view empty on the right
+                          # is what actually makes room for them without
+                          # the user having to pan manually every time.
+                          "future_margin_frac": 0.6},
                 indicators=_chart_indicators,
                 # symbol/interval are separate from ticker/source above (which
                 # feed the on-chart readout text) — this pair is purely for
@@ -3492,6 +4380,7 @@ with main_col:
                       # identical from a reset frontend's own local state.
                       "is_full_reload": _is_full_reload},
                 height=1000,
+                display_tz=theme.get_display_tz(),
             )
             if clicked == _CHART_NEEDS_FULL_RELOAD:
                 # This frontend instance's own cache was empty when it got
@@ -3504,12 +4393,90 @@ with main_col:
                 # about the fingerprint itself was wrong. A fragment-scoped
                 # rerun (not _select_chart's full-app one) is enough: nothing
                 # outside this fragment reads _main_last_sent_fp.
-                st.session_state.pop("_main_last_sent_fp", None)
-                st.rerun(scope="fragment")
+                #
+                # Bounded per fingerprint: a genuine one-off desync (the
+                # case above) only ever needs ONE retry to resolve.
+                # Confirmed directly as a real, live bug otherwise: this
+                # fragment's own run_every tick racing a user-triggered
+                # rerun (e.g. clicking a scan result right as the fragment
+                # was mid-tick) can make the frontend report the same
+                # desync repeatedly, forever — st.rerun(scope="fragment")
+                # firing in a tight loop, re-sending the FULL ~2,700-row
+                # bars array every pass, which is exactly the multi-
+                # second "chart loads extremely slow" stall reported.
+                # Capping retries turns a recurring desync into "one
+                # stale-looking frame, then give up and move on" instead
+                # of an unbounded loop; a fresh fingerprint (a real
+                # ticker/timeframe change) always gets its own full budget.
+                _resync_state = st.session_state.get("_main_resync_tries")
+                _resync_tries = _resync_state[1] + 1 if _resync_state and _resync_state[0] == fingerprint else 1
+                st.session_state["_main_resync_tries"] = (fingerprint, _resync_tries)
+                if _resync_tries <= 2:
+                    st.session_state.pop("_main_last_sent_fp", None)
+                    st.rerun(scope="fragment")
             _select_chart("main", clicked)
 
+            # Direct request: "where is price more likely to head next" —
+            # every currently-open level (FVG/IFVG/Order Block/Breaker
+            # Block/resting liquidity) ranked by an actual historical
+            # touch-PROBABILITY, not raw proximity. See recommender.py's
+            # own module comment on rank_levels_by_visit_probability for
+            # the full reasoning (why this is a different question from
+            # any win-rate already on this page, and how the probability
+            # itself is computed). Computed early since the tab list below
+            # needs to know whether it has anything to show.
+            _level_current_price = float(df[c_col].iloc[-1])
+            _ranked_levels = rank_levels_by_visit_probability(df, _level_current_price, top_n=10)
+
+            # Independent of naked_poc_rows on purpose — whether value is
+            # migrating is a fact about the last few SESSIONS as a whole,
+            # not about which of their POCs still happen to be untouched
+            # right now (those are two different questions; a session's
+            # POC can get touched a day later and drop off the list below
+            # while the underlying migration trend it was part of is still
+            # real). Shown plainly, above the fold, not tucked inside the
+            # tabbed drawer below — this reads as a standalone "is a trend
+            # actually building" verdict, not a footnote to the level list.
+            if _poc_mig is not None:
+                _mig_first, _mig_last = _poc_mig["days"][0], _poc_mig["days"][-1]
+                if _poc_mig["direction"] == "flat":
+                    st.caption(
+                        f"POC migration ({_mig_first['day']} → {_mig_last['day']}, {len(_poc_mig['days'])} "
+                        f"sessions): {_mig_first['price']:.5g} → {_mig_last['price']:.5g} "
+                        f"({_poc_mig['pct_change']:+.1f}%) — flat/range-bound, no strong directional "
+                        f"conviction session to session."
+                    )
+                else:
+                    _mig_dir = "UP" if _poc_mig["direction"] == "up" else "DOWN"
+                    st.caption(
+                        f"POC migration ({_mig_first['day']} → {_mig_last['day']}, {len(_poc_mig['days'])} "
+                        f"sessions): {_mig_first['price']:.5g} → {_mig_last['price']:.5g} "
+                        f"({_poc_mig['pct_change']:+.1f}%) — value has been drifting **{_mig_dir}**, "
+                        f"consistent with a developing trend rather than balance."
+                    )
+
+            # Every detector "detail" panel used to be its own always-visible
+            # collapsed expander — up to 6 stacked header bars taking up
+            # screen space before opening a single one. They now share ONE
+            # expander with a tab per section inside it, so the collapsed
+            # cost is exactly one header row no matter how many detectors
+            # are active — a soft drawer instead of a wall of bars.
+            _detail_tabs = []
             if legend_items:
-                with st.expander("Legend"):
+                _detail_tabs.append(("Legend", "legend"))
+            if fvg_ob_rows:
+                _detail_tabs.append((f"🔍 FVG / OB ({len(fvg_ob_rows)})", "fvg_ob"))
+            if liquidity_rows:
+                _detail_tabs.append((f"🔍 Liquidity ({len(liquidity_rows)})", "liquidity"))
+            if _ranked_levels:
+                _detail_tabs.append((f"🎯 Where's price headed ({len(_ranked_levels)})", "levels"))
+            if naked_poc_rows:
+                _detail_tabs.append((f"🔍 Naked POC ({len(naked_poc_rows)})", "naked_poc"))
+            if _vp is not None:
+                _detail_tabs.append((f"🔍 Volume Profile — {_vp['shape_label']}", "volume_profile"))
+
+            def _render_detail_body(_key):
+                if _key == "legend":
                     fvg_legend(legend_items)
                     tiny("🟢/🔵 bullish · 🔴/🟠 bearish · scroll to zoom, drag to pan, "
                          "each layer detects on its own chosen timeframe (☰ to change) and shows only its most "
@@ -3518,36 +4485,44 @@ with main_col:
                          "this ticker's own historical win rate for that direction (hover the detail table "
                          "below for what that number does and doesn't mean)")
 
-            # The legend above is a tally; this is the actual data behind it
-            # — every FVG/Order Block zone currently drawn on the chart, not
-            # a re-detection, the exact same fvg_ob_rows list the rectangles
-            # were built from a few hundred lines up.
-            #
-            # Sorted open/unmitigated first, then by distance from the
-            # current close — a zone price has already fully traded through
-            # isn't "tradeable in the future" the way a still-live zone
-            # sitting just above/below current price is, and the ones
-            # dozens of percent away are academic compared to the ones
-            # price could reach this session. This is a relevance ranking
-            # for YOUR attention, not a claim any specific zone will hold.
-            #
-            # hist_win_rate closes part of that gap — a real number computed
-            # off this ticker's own history (_historical_win_rates above),
-            # not a guess — but it's still a plain raw-return win rate, NOT
-            # the permutation-test-plus-multiple-testing-correction rigor
-            # Research Lab and Edge Lab apply before calling anything an
-            # actual edge. Treat it as "how has this pattern's direction
-            # tended to resolve historically," not statistical proof.
-            if fvg_ob_rows:
-                current_price = float(df[c_col].iloc[-1])
-                with st.expander(f"🔍 FVG / Order Block detail ({len(fvg_ob_rows)} zones, sorted by relevance)"):
+                elif _key == "fvg_ob":
+                    # The legend above is a tally; this is the actual
+                    # data behind it — every FVG/Order Block zone
+                    # currently drawn on the chart, not a
+                    # re-detection, the exact same fvg_ob_rows list
+                    # the rectangles were built from a few hundred
+                    # lines up.
+                    #
+                    # Sorted open/unmitigated first, then by distance
+                    # from the current close — a zone price has
+                    # already fully traded through isn't "tradeable
+                    # in the future" the way a still-live zone
+                    # sitting just above/below current price is, and
+                    # the ones dozens of percent away are academic
+                    # compared to the ones price could reach this
+                    # session. This is a relevance ranking for YOUR
+                    # attention, not a claim any specific zone will
+                    # hold.
+                    #
+                    # hist_win_rate closes part of that gap — a real
+                    # number computed off this ticker's own history
+                    # (_historical_win_rates above), not a guess —
+                    # but it's still a plain raw-return win rate, NOT
+                    # the permutation-test-plus-multiple-testing-
+                    # correction rigor Research Lab and Edge Lab
+                    # apply before calling anything an actual edge.
+                    # Treat it as "how has this pattern's direction
+                    # tended to resolve historically," not
+                    # statistical proof.
+                    current_price = float(df[c_col].iloc[-1])
+                    _decimals = _price_decimals(current_price)
                     detail_df = pd.DataFrame(fvg_ob_rows)
                     detail_df["is_open"] = detail_df["status"].isin(["open", "unmitigated"])
                     detail_df["dist_pct"] = (((detail_df["top"] + detail_df["bottom"]) / 2 - current_price)
                                               / current_price * 100)
                     detail_df = detail_df.sort_values(["is_open", "dist_pct"], key=lambda s: s if s.name == "is_open" else s.abs(),
                                                         ascending=[False, True]).drop(columns="is_open").reset_index(drop=True)
-                    st.dataframe(detail_df, hide_index=True, use_container_width=True, column_config={
+                    st.dataframe(detail_df, hide_index=True, width="stretch", column_config={
                         "dist_pct": st.column_config.NumberColumn(
                             "dist_pct", format="%+.2f%%",
                             help=f"Distance from the current price ({current_price:.5g}) to this zone's midpoint — "
@@ -3559,11 +4534,15 @@ with main_col:
                                                             "(4h or 15m) — independent of the chart's own zoom."),
                         "type": st.column_config.Column(help="bullish = support read, drawn cyan/green. "
                                                                "bearish = resistance read, drawn magenta/amber."),
-                        "top": st.column_config.NumberColumn(help="Zone's upper price boundary, as currently "
-                                                                    "drawn — shrinks over time as price eats into "
-                                                                    "the zone (consequent encroachment)."),
-                        "bottom": st.column_config.NumberColumn(help="Zone's lower price boundary, same "
-                                                                       "shrinking-over-time caveat as top."),
+                        "top": st.column_config.NumberColumn(
+                            format=f"%.{_decimals}f",
+                            help="Zone's upper price boundary, as currently "
+                                 "drawn — shrinks over time as price eats into "
+                                 "the zone (consequent encroachment)."),
+                        "bottom": st.column_config.NumberColumn(
+                            format=f"%.{_decimals}f",
+                            help="Zone's lower price boundary, same "
+                                 "shrinking-over-time caveat as top."),
                         "start": st.column_config.Column(help="Bar where this zone formed."),
                         "end": st.column_config.Column(help="Bar where the zone fully filled/mitigated — or the "
                                                               "most recent bar, if it's still open."),
@@ -3586,43 +4565,143 @@ with main_col:
                                                    "proof — no independent statistical validation is run on it."),
                     })
 
-            # BSL/SSL only ever rendered as unlabeled dashed lines on the
-            # chart, with a hover title as the only way to see which is
-            # which — no exact price, no distance, no way to tell which
-            # ones are closest to actually mattering right now without
-            # reading raw chart data. Same fix as the FVG/OB table above,
-            # same "sort by what's actually relevant" logic.
-            if liquidity_rows:
-                current_price = float(df[c_col].iloc[-1])
-                with st.expander(f"🔍 Liquidity detail ({len(liquidity_rows)} levels, sorted by distance)"):
-                    # A BSL level can legitimately show a NEGATIVE distance
-                    # (sitting below the live price) — detection only ever
-                    # checks "unswept as of the last CLOSED bar," but this
-                    # table's distance is measured against the live,
-                    # currently-forming candle. Confirmed directly: not a
-                    # bug, just means price has already wicked through that
-                    # level intrabar, on a candle that hasn't closed yet —
-                    # once it does, that level will very likely flip to
-                    # swept on the next rerun.
+                elif _key == "liquidity":
+                    # BSL/SSL only ever rendered as unlabeled dashed
+                    # lines on the chart, with a hover title as the
+                    # only way to see which is which — no exact
+                    # price, no distance, no way to tell which ones
+                    # are closest to actually mattering right now
+                    # without reading raw chart data. Same fix as
+                    # the FVG/OB table above, same "sort by what's
+                    # actually relevant" logic.
+                    current_price = float(df[c_col].iloc[-1])
+                    _decimals = _price_decimals(current_price)
+                    # A BSL level can legitimately show a NEGATIVE
+                    # distance (sitting below the live price) —
+                    # detection only ever checks "unswept as of the
+                    # last CLOSED bar," but this table's distance is
+                    # measured against the live, currently-forming
+                    # candle. Confirmed directly: not a bug, just
+                    # means price has already wicked through that
+                    # level intrabar, on a candle that hasn't closed
+                    # yet — once it does, that level will very
+                    # likely flip to swept on the next rerun.
                     tiny("A BSL below price (or SSL above it) means the live candle has already wicked through "
                          "that level — detection only confirms 'swept' once the bar actually closes.")
                     liq_df = pd.DataFrame(liquidity_rows)
                     liq_df["dist_pct"] = (liq_df["price"] - current_price) / current_price * 100
                     liq_df = liq_df.sort_values("dist_pct", key=lambda s: s.abs()).reset_index(drop=True)
-                    st.dataframe(liq_df, hide_index=True, use_container_width=True, column_config={
+                    st.dataframe(liq_df, hide_index=True, width="stretch", column_config={
                         "tf": st.column_config.Column(help="Reference timeframe this level was detected on."),
                         "kind": st.column_config.Column(
                             help="BSL (buy-side liquidity) rests above a swing high — stops from shorts, a magnet "
                                  "for a bullish run. SSL (sell-side) rests below a swing low — stops from longs, "
                                  "a magnet for a bearish run. Both shown here are still LIVE — detect_liquidity_levels "
                                  "only ever returns levels no later candle has swept yet."),
-                        "price": st.column_config.NumberColumn(help="Exact price of the resting level."),
+                        "price": st.column_config.NumberColumn(
+                            format=f"%.{_decimals}f", help="Exact price of the resting level."),
                         "formed": st.column_config.Column(help="The swing bar that created this level."),
                         "dist_pct": st.column_config.NumberColumn(
                             "dist_pct", format="%+.2f%%",
                             help=f"Distance from the current price ({current_price:.5g}). Sorted closest first — "
                                  "the nearest levels are what price could realistically reach next."),
                     })
+
+                elif _key == "levels":
+                    _decimals = _price_decimals(_level_current_price)
+                    tiny("Each level's own historical touch rate, conditioned on how far it sat from price "
+                         "when it formed — NOT a prediction, a plain fact about this ticker's own past: 'of "
+                         "every level like this one, formed this far from price, what fraction eventually got "
+                         "touched.' A level with too few historical examples to trust still shows, ranked "
+                         "below every well-supported one, labeled 'not enough history' instead of a number.")
+                    _lvl_rows = []
+                    for r in _ranked_levels:
+                        _lvl_rows.append({
+                            "type": r["type"], "price": r["price"], "dist_pct": r["distance_pct"],
+                            "touch_probability": f"{r['probability']*100:.0f}% (n={r['n']})" if r["sufficient"]
+                                                  else (f"low data ({r['n']})" if r["n"] else "not enough history"),
+                        })
+                    st.dataframe(pd.DataFrame(_lvl_rows), hide_index=True, width="stretch", column_config={
+                        "type": st.column_config.Column(help="FVG/IFVG/Order Block/Breaker Block are ranges; "
+                                                              "Liquidity is a single resting swing high/low."),
+                        "price": st.column_config.NumberColumn(
+                            format=f"%.{_decimals}f",
+                            help="This level's own price (range midpoint for "
+                                 "FVG/IFVG/Order Block/Breaker Block)."),
+                        "dist_pct": st.column_config.NumberColumn(
+                            "dist_pct", format="%+.2f%%",
+                            help=f"Distance from the current price ({_level_current_price:.5g})."),
+                        "touch_probability": st.column_config.Column(
+                            help="Historical fraction of this level's own type, formed this far from price at "
+                                 "the time, that ever got touched at all — see the caption above."),
+                    })
+
+                elif _key == "naked_poc":
+                    # Same "exact price/distance, not just a hover
+                    # title" fix as Liquidity above, for the same
+                    # reason.
+                    current_price = float(df[c_col].iloc[-1])
+                    _decimals = _price_decimals(current_price)
+                    tiny("A daily session's own busiest traded price, still untouched by anything since that "
+                         "session closed — these act as magnets. Drops off this list (and the chart) the instant "
+                         "a later candle finally trades through it.")
+                    np_df = pd.DataFrame(naked_poc_rows)
+                    np_df["dist_pct"] = (np_df["price"] - current_price) / current_price * 100
+                    np_df = np_df.sort_values("dist_pct", key=lambda s: s.abs()).reset_index(drop=True)
+                    st.dataframe(np_df, hide_index=True, width="stretch", column_config={
+                        "tf": st.column_config.Column(help="Reference timeframe the daily sessions were built from."),
+                        "day": st.column_config.Column(help="The NY calendar day this POC formed on."),
+                        "price": st.column_config.NumberColumn(
+                            format=f"%.{_decimals}f", help="Exact price of the untouched POC."),
+                        "dist_pct": st.column_config.NumberColumn(
+                            "dist_pct", format="%+.2f%%",
+                            help=f"Distance from the current price ({current_price:.5g}). Sorted closest first — "
+                                 "the nearest ones are what price could realistically reach next."),
+                    })
+
+                elif _key == "volume_profile":
+                    # Shape/HVN/LVN are already ON the chart
+                    # (legend text, bucket coloring) — this tab is
+                    # for the exact price levels those bucket
+                    # colors don't otherwise show a number for,
+                    # same "make the number reachable" reasoning
+                    # as every table above.
+                    _decimals = _price_decimals(_vp["poc_price"])
+                    tiny(_vp["shape_description"])
+                    st.caption(f"POC {_vp['poc_price']:.5g} · VAH {_vp['value_area_high']:.5g} · "
+                               f"VAL {_vp['value_area_low']:.5g}")
+                    _vp_nodes = (
+                        [{"kind": "HVN", "price": (_vp["buckets"][i]["price_low"] + _vp["buckets"][i]["price_high"]) / 2,
+                          "volume_frac": _vp["buckets"][i]["volume_frac"]} for i in _vp["hvn_indices"]]
+                        + [{"kind": "LVN", "price": (_vp["buckets"][i]["price_low"] + _vp["buckets"][i]["price_high"]) / 2,
+                            "volume_frac": _vp["buckets"][i]["volume_frac"]} for i in _vp["lvn_indices"]]
+                    )
+                    if _vp_nodes:
+                        st.dataframe(pd.DataFrame(_vp_nodes), hide_index=True, width="stretch", column_config={
+                            "kind": st.column_config.Column(
+                                help="HVN = High Volume Node, a real second cluster besides POC — price likely "
+                                     "stalls/consolidates here if revisited. LVN = Low Volume Node, a genuinely "
+                                     "thin spot — price likely moves FAST through here if revisited, little "
+                                     "resting interest to absorb it."),
+                            "price": st.column_config.NumberColumn(
+                                format=f"%.{_decimals}f", help="Midpoint price of this bucket."),
+                            "volume_frac": st.column_config.ProgressColumn(
+                                "volume", format="percent", min_value=0, max_value=1,
+                                help="This bucket's own volume relative to the busiest bucket (POC)."),
+                        })
+                    else:
+                        st.caption("No distinct HVN/LVN cleared the prominence filter on this profile.")
+
+            if len(_detail_tabs) == 1:
+                _only_label, _only_key = _detail_tabs[0]
+                with st.expander(_only_label):
+                    _render_detail_body(_only_key)
+            elif _detail_tabs:
+                with st.expander("📋 Detail"):
+                    _tab_objs = st.tabs([label for label, _key in _detail_tabs])
+                    for _tab_obj, (_label, _key) in zip(_tab_objs, _detail_tabs):
+                        with _tab_obj:
+                            _render_detail_body(_key)
         except Exception as e:
             st.error(f"Could not fetch {ticker}: {e}")
 
@@ -3657,7 +4736,8 @@ with main_col:
     # cache hit, not a fresh fetch.
     for _wr_layer in ("FVG", "Order Blocks"):
         if _wr_layer in layers:
-            _prefetch_specs.append((_historical_win_rates, (ticker, layer_tf[_wr_layer], _wr_layer, data_source), {}))
+            _prefetch_specs.append((_historical_win_rates, (ticker, layer_tf[_wr_layer], _wr_layer, data_source),
+                                     {"news_blackout": _news_blackout}))
     for _chart_id in ("htf", "ltf"):
         _mini_tf_key = st.session_state.get(TF_KEY_BY_CHART[_chart_id], DEFAULT_TF_BY_CHART[_chart_id])
         _mini_conf = TIMEFRAMES[_mini_tf_key]
@@ -3719,4 +4799,362 @@ with main_col:
                             {"period": _bg_tf_conf["period"],
                              "interval": _bg_tf_conf["fetch_interval"], "provider": data_source})
 
-    _render_chart()
+    def _render_replay_chart(rdf, r_ticker, r_tf_label, r_data_source, r_n_total):
+        """The actual candles + zones + trade-pick for one replay step —
+        split out from _render_bar_replay only so that function's own
+        control-row logic isn't buried under this. rdf is a plain PREFIX
+        SLICE of the full history (bars[:idx+1]) — every detector/
+        best_trade_now call below sees ONLY that slice, so a zone or a
+        trade pick can never reflect anything that hasn't "happened" yet
+        at this point in the replay."""
+        # Every tick genuinely IS new data (the array grows one bar every
+        # step), so the fingerprint changes every tick by design — a full
+        # rebuild is the honest, correct thing here, not something to dodge
+        # via a stable fingerprint. What actually caused "adjusts to the
+        # right side" (direct feedback) wasn't the rebuild itself, it was
+        # the existing calendar-window RESTORE logic that runs after a
+        # rebuild — built for the live chart's own occasional ticker/TF
+        # switches, and fragile under a full reload firing every single
+        # tick during Play. See "preserve_logical_range" on this chart's
+        # own options below, and the frontend's own handling of it, for the
+        # actual fix — a direct, synchronous save/restore around THIS
+        # rebuild, with no debounce or calendar-time conversion involved.
+        _idx = len(rdf) - 1
+
+        o_col, h_col, l_col, c_col = (("Open", "High", "Low", "Close") if "Close" in rdf
+                                       else ("open", "high", "low", "close"))
+        v_col = "Volume" if "Volume" in rdf else ("volume" if "volume" in rdf else None)
+        axis_secs = _ny_fake_utc_seconds_vec(rdf.index)
+        _o, _h, _l, _c = (rdf[o_col].to_numpy(), rdf[h_col].to_numpy(),
+                          rdf[l_col].to_numpy(), rdf[c_col].to_numpy())
+        _v = rdf[v_col].to_numpy() if v_col is not None else None
+        bars = [
+            {"time": int(axis_secs[i]), "open": float(_o[i]), "high": float(_h[i]),
+             "low": float(_l[i]), "close": float(_c[i]), "volume": float(_v[i]) if _v is not None else 0.0}
+            for i in range(len(rdf))
+        ]
+
+        rectangles, price_lines = [], []
+        last_x = int(axis_secs[-1])
+        # Real (if invisible) trailing bars, extending the series' OWN
+        # data past the last revealed candle — not just a wider requested
+        # view. Confirmed directly: lightweight-charts silently clamps any
+        # setVisibleLogicalRange request past the series' own last real
+        # point, even by a single index, no matter how it got there — a
+        # wider view has nowhere to go unless the series itself has real
+        # points to occupy that space. Flat (repeats the last close) and
+        # fully transparent (color/borderColor/wickColor all rgba(0,0,0,0))
+        # — invisible, but real data the timeScale can position and scroll
+        # into, the same anchor-bar technique this project's own backfill
+        # code already uses for coarser-timeframe candles elsewhere. Direct
+        # feedback: "I still can't scroll to see future timeline."
+        #
+        # 40, not a bigger number: fitContentWhenReady's own margin formula
+        # (see its own comment) turns out self-referential once ANY padding
+        # exists — its computed `to` always ends up past data.length-1 by
+        # construction (it's lastIdx PLUS a positive margin), so the
+        # frontend's own safety clamp always lands `to` exactly on the
+        # padded array's own last index, regardless of future_margin_frac's
+        # actual value. That makes THIS number, not that fraction, the
+        # real lever on how much margin shows — and DEFAULT_VISIBLE_BARS
+        # (120, frontend-side) is the total window width, so a bigger pad
+        # count directly eats into how many REAL candles are visible by
+        # default (confirmed directly: 90 padding bars left only 30 real
+        # ones on screen, mostly blank space). 40 comfortably covers the
+        # 30-bar trade box with a little room to spare while keeping most
+        # of the default view real, meaningful price action.
+        _last_close = float(_c[-1])
+        for _p in range(1, 41):
+            bars.append({
+                "time": last_x + _p * _TF_BAR_SECONDS[r_tf_label],
+                "open": _last_close, "high": _last_close, "low": _last_close, "close": _last_close, "volume": 0.0,
+                "color": "rgba(0,0,0,0)", "borderColor": "rgba(0,0,0,0)", "wickColor": "rgba(0,0,0,0)",
+            })
+
+        # The "live areas" — currently-open FVG/order-block zones, using
+        # the exact same detectors and color convention (bullish FVG=cyan,
+        # bearish=magenta, bullish OB=green, bearish OB=amber) the live
+        # chart's own FVG/Order Blocks layers already use — trimmed to the
+        # essentials (no win-rate labels/indicator confluence) since this
+        # is a focused replay view, not the full layer system.
+        #
+        # Two deliberately different selections, direct request ("one that
+        # tracks previous candles, and one that scans historical values"):
+        # recent_zone_tracker (Engine A) surfaces EVERY zone formed in the
+        # last 50 bars, uncapped — "mark everything in recent past... with
+        # surgical precision" — while historical_zone_scanner (Engine B)
+        # finds the nearest zones above/below current price from the FULL
+        # history regardless of age — "shows me where price might go even
+        # if it exits the range." Distance-based selection ALONE (this
+        # replay's own previous approach, and still the live chart's own
+        # _nearest_by_price) was confirmed as a real bug for a fast-moving
+        # replay: re-ranking "nearest overall" on every tick as price
+        # wiggles made a genuinely still-open zone flicker in and out of
+        # view for no reason tied to the zone itself. Age-based selection
+        # (Engine A) doesn't have that failure mode; Engine B keeps the
+        # "show me the actual nearest levels" behavior without being the
+        # ONLY lens onto what's currently open.
+        #
+        # n_per_side used to be hardcoded to 2 here — confirmed directly
+        # (offline replay of this exact ticker at bars 533-536) that every
+        # single appearance/disappearance in a direct report of "areas
+        # appear and disappear" was a REAL event (a zone getting mitigated
+        # by actual price action, or a genuinely new one confirming on its
+        # own displacement bar) — detect_order_blocks/detect_fvgs never
+        # retroactively reclassify an already-confirmed candle as more
+        # history streams in, and mitigation is monotonic (never reverses).
+        # So there's no actual bug in what gets detected or when — but a
+        # hardcoded 2-per-side cap on the distance-ranked sleeve means a
+        # real zone getting bumped by a marginally closer newcomer reads as
+        # constant churn, with almost no headroom to absorb it. Reusing the
+        # user's own "Areas per side" setting (max_items_per_layer, same
+        # control the live chart's own layers already respect) instead of
+        # a hardcoded 2 gives real breathing room, still 100% accurate to
+        # actual market events — this only changes how many currently-
+        # active zones get shown at once, not which ones are real.
+        _replay_max_items = st.session_state.get("_chart_controls", {}).get("max_items_per_layer", 5)
+        current_price = float(_c[-1])
+        _open_fvgs = [g for g in detect_fvgs(rdf) if not g["filled"]]
+        _open_obs = [o for o in detect_order_blocks(rdf) if not o["mitigated"]]
+        _fvgs = merge_zone_engines(
+            recent_zone_tracker(_open_fvgs, rdf, lookback_bars=50),
+            historical_zone_scanner(_open_fvgs, current_price, n_per_side=_replay_max_items))
+        _obs = merge_zone_engines(
+            recent_zone_tracker(_open_obs, rdf, lookback_bars=50),
+            historical_zone_scanner(_open_obs, current_price, n_per_side=_replay_max_items))
+        for g in _fvgs:
+            color = theme.NEON_CYAN if g["type"] == "bullish" else theme.NEON_MAGENTA
+            rectangles.append({"t0": _ny_fake_utc_seconds(g["start"]), "t1": last_x,
+                                "p0": g["bottom"], "p1": g["top"],
+                                "fill": _hex_to_rgba(color, 0.2), "border": _hex_to_rgba(color, 0.7),
+                                "label": "FVG"})
+        for ob in _obs:
+            color = theme.NEON_GREEN if ob["type"] == "bullish" else theme.NEON_AMBER
+            rectangles.append({"t0": _ny_fake_utc_seconds(ob["start"]), "t1": last_x,
+                                "p0": ob["bottom"], "p1": ob["top"],
+                                "fill": _hex_to_rgba(color, 0.2), "border": _hex_to_rgba(color, 0.7),
+                                "label": "OB"})
+
+        # "scans for live areas and displays potential trades as time
+        # ticks" — the exact same engine behind the sidebar's Signals scan
+        # and the live chart's own active-trade box (best_trade_now),
+        # just handed this replay slice instead of the live df. Single-
+        # timeframe confluence only (no HTF context_df) — a deliberate v1
+        # scope cut, not an oversight: syncing a SECOND timeframe's own
+        # frame to this same replay cursor is real extra work, left for a
+        # follow-up if this turns out to matter in practice.
+        picks = best_trade_now(rdf, r_ticker, TIMEFRAMES[r_tf_label]["fetch_interval"], r_data_source, top_n=1,
+                                news_blackout=st.session_state.get("_chart_controls", {}).get("news_blackout"))
+        trade_box_seconds = _TF_BAR_SECONDS[r_tf_label] * 30
+        box_t1 = last_x + trade_box_seconds
+        if picks:
+            pick = picks[0]
+            entry_price, stop_price, exit_price = pick["entry_price"], pick["sl_price"], pick["tp_price"]
+            pattern = EVENT_TYPE_LABELS.get(pick["event_type"], pick["event_type"])
+            for price, color, title in [(entry_price, theme.NEON_AMBER, "Entry"),
+                                         (stop_price, theme.NEON_MAGENTA, "SL"),
+                                         (exit_price, theme.NEON_GREEN, "TP")]:
+                price_lines.append({"t0": last_x, "t1": box_t1, "price": price,
+                                     "color": _hex_to_rgba(color, 1.0), "title": title,
+                                     "line_width": 2, "dashed": True, "above": bool(price >= entry_price)})
+            rectangles.append({"t0": last_x, "t1": box_t1, "p0": entry_price, "p1": stop_price,
+                                "fill": _hex_to_rgba(theme.NEON_MAGENTA, 0.10),
+                                "border": _hex_to_rgba(theme.NEON_MAGENTA, 0.9)})
+            rectangles.append({"t0": last_x, "t1": box_t1, "p0": entry_price, "p1": exit_price,
+                                "fill": _hex_to_rgba(theme.NEON_GREEN, 0.10),
+                                "border": _hex_to_rgba(theme.NEON_GREEN, 0.9),
+                                "body_lines": _confluence_body_lines(pick),
+                                "label": f"{pattern} ({pick['direction']})"})
+            caption = f"Potential trade: {pattern} ({pick['direction']}) · confluence {pick['confluence_score']}"
+        else:
+            caption = "No active setup at this point in history."
+        st.caption(f"{caption} — {len(rdf)} of {r_n_total} bars revealed.")
+
+        fingerprint = f"replay|{r_ticker}|{r_tf_label}|{_idx}"
+        ict_chart(
+            bars, fingerprint,
+            overlays={"rectangles": rectangles, "price_lines": price_lines, "markers": [], "ghost_candles": []},
+            # No always_fit (unlike the mini reference panels) — that
+            # re-fits on every single reload, which for a chart whose
+            # fingerprint changes every tick means every tick, exactly the
+            # "rescales with every tick" behavior direct feedback pushed
+            # back on. preserve_logical_range is the real fix for that: a
+            # plain synchronous save-then-restore of the exact visible
+            # logical range around this reload (see this option's own
+            # frontend handling) — correct specifically because a replay
+            # dataset only ever grows at the END (bar 0 never moves), so
+            # the SAME logical indices still mean the same bars next tick,
+            # with no need for the live chart's own calendar-time
+            # conversion or debounced-settle machinery (built for an
+            # arbitrary ticker/TF switch, and fragile once a reload fires
+            # every tick during Play instead of on rare, deliberate
+            # switches). future_margin_frac still sets the INITIAL window
+            # (first render of a session, nothing to preserve yet) — needs
+            # the padding bars above to actually be visible, since
+            # lightweight-charts clamps any requested range past the
+            # series' own last real point.
+            options={"volume": False, "selected": False, "future_margin_frac": 0.4, "preserve_logical_range": True},
+            # No "symbol" key here on purpose — the frontend's connectLiveFeed
+            # guard (`if (!tickerSymbol...) return`) treats a missing symbol
+            # as "don't connect," which is exactly what a replay needs: this
+            # component instance must never receive genuine live ticks,
+            # crypto ticker or not.
+            ohlc={"ticker": r_ticker, "source": "Replay", "forming_bar_time": None},
+            height=650,
+            key="ict_chart_replay",
+            display_tz=theme.get_display_tz(),
+        )
+
+    def _render_bar_replay(r_ticker, r_tf_label, r_tf, r_data_source):
+        """TradingView-style Bar Replay: rewind to a point in this ticker's
+        own history, then step through it bar by bar (or auto-play) with
+        _render_replay_chart above recomputing candles/zones/best-trade
+        fresh from ONLY the bars revealed so far — the same read a live
+        trader would have had at that exact moment. A separate, self-
+        contained render path rather than a mode flag threaded through
+        _render_chart: that function is a ~1500-line fragment with its own
+        scattered fetch/splice/backfill/indicator machinery tuned for the
+        live case (see its own module-level comments) — truncating every
+        one of those call sites would risk that carefully-tuned live path
+        to build something that only ever needs candles + two zone types +
+        one trade pick. Reuses the same cached get_yf_ohlcv fetch and the
+        exact same detectors/best_trade_now the live chart and sidebar
+        scans already use, unmodified — they were always just "whatever df
+        you hand them," a full history or a replay slice makes no
+        difference to them.
+
+        Everything lives in ONE fragment, including Play/Pause — a
+        `run_every`-based design (redefining the decorator's own interval
+        from an OUTER, non-fragment Play button, mirroring the main TF
+        radio's own established split) was tried first and confirmed
+        broken here: a full rerun that redefines this fragment with a new
+        `run_every` does NOT reliably cancel whatever periodic tick the
+        PREVIOUS instance already had scheduled, so Pause stopped updating
+        the label without actually stopping the advance — the position
+        kept climbing underneath a control that visibly claimed it was
+        paused. Auto-play here instead self-drives via a plain
+        `time.sleep()` + `st.rerun(scope="fragment")` loop at the tail of
+        a single, always-`run_every=None` fragment: every click (Play,
+        Pause, step, drag) is a fresh execution of this SAME fragment that
+        checks "should I still be advancing" from scratch before ever
+        looping again, so there is never more than one advance path alive
+        at once. The tradeoff — a Pause click can take up to one sleep
+        interval (0.25-2s) to land — is a small, honest cost next to a
+        Pause button that silently doesn't pause."""
+        base_df = get_yf_ohlcv(r_ticker, period=r_tf["period"], interval=r_tf["fetch_interval"], provider=r_data_source)
+        if r_tf["resample"]:
+            base_df = resample_ohlc(base_df, r_tf["resample"])
+        if base_df.empty or len(base_df) < 25:
+            st.warning(f"Not enough history for {r_ticker} at {r_tf_label} to replay.")
+            return
+
+        n = len(base_df)
+        state_key = f"_replay_state_{r_ticker}_{r_tf_label}"
+        idx_key = f"{state_key}_idx"
+        if st.session_state.get(state_key, {}).get("n") != n:
+            # Fresh ticker/timeframe, or the underlying history's own
+            # length shifted under it (new data arrived) — reset to a sane
+            # starting point rather than carry an index that might now
+            # mean something else entirely.
+            st.session_state[state_key] = {"playing": False, "speed": "1x", "n": n}
+            st.session_state[idx_key] = min(n - 2, max(20, n // 3))
+
+        @st.fragment
+        def _replay_frame():
+            # idx_key (the slider's own bound key) is the ONE canonical
+            # store for the current position — every control that moves
+            # it writes st.session_state[idx_key] directly, BEFORE the
+            # slider widget below is instantiated, rather than handing it
+            # a fresh `value=` each render. Confirmed directly as a real
+            # bug otherwise: once a keyed widget has rendered once,
+            # Streamlit uses ITS OWN persisted value on every later rerun
+            # and silently ignores a new `value=` argument — a step/auto-
+            # play update looked right for one render, then the slider's
+            # own frozen state snapped it straight back on the next one.
+            s = st.session_state[state_key]
+            # A pending auto-play advance MUST land here, before the
+            # slider below (key=idx_key) is instantiated this run — same
+            # "can't modify a keyed widget's value after it's rendered"
+            # rule applies WITHIN a single fragment pass too, not just
+            # across full reruns. The tail of this function (see its own
+            # sleep+rerun block) never touches idx_key directly; it just
+            # flags the advance and reruns, so it's always applied here,
+            # one step ahead of the widget that owns that key.
+            if s.pop("_advance_pending", False):
+                st.session_state[idx_key] = min(n - 1, st.session_state[idx_key] + 1)
+
+            _play_col, _speed_col, _exit_col = st.columns([1.1, 1, 1.2])
+            with _play_col:
+                if st.button("⏸ Pause" if s["playing"] else "▶️ Play", key=f"{state_key}_play", width="stretch"):
+                    s["playing"] = not s["playing"]
+            with _speed_col:
+                _speed_options = ["0.5x", "1x", "2x", "4x"]
+                s["speed"] = st.selectbox("Speed", _speed_options, index=_speed_options.index(s["speed"]),
+                                           key=f"{state_key}_speed", label_visibility="collapsed")
+            with _exit_col:
+                if st.button("✕ Exit replay", key=f"{state_key}_exit", width="stretch"):
+                    # Can't write st.session_state["_replay_active"] directly
+                    # here — that checkbox widget already rendered earlier
+                    # in THIS run, and Streamlit raises on mutating a
+                    # widget's own bound key post-instantiation. Deferred
+                    # flag instead, applied at the very top of the next run
+                    # before that checkbox exists yet (see its read site
+                    # below).
+                    st.session_state["_replay_exit_requested"] = True
+                    st.session_state.pop(state_key, None)
+                    st.session_state.pop(idx_key, None)
+                    st.rerun()
+
+            _slider_col, _back_col, _fwd_col = st.columns([6, 1, 1])
+            with _back_col:
+                if st.button("◀", key=f"{state_key}_back", help="Step back one bar", width="stretch"):
+                    st.session_state[idx_key] = max(20, st.session_state[idx_key] - 1)
+                    s["playing"] = False
+            with _fwd_col:
+                if st.button("▶", key=f"{state_key}_fwd", help="Step forward one bar", width="stretch"):
+                    st.session_state[idx_key] = min(n - 1, st.session_state[idx_key] + 1)
+                    s["playing"] = False
+            with _slider_col:
+                picked = st.slider(
+                    "Replay position", 20, n - 1, key=idx_key, label_visibility="collapsed",
+                    help="Drag to rewind — the chart, its FVG/order-block zones, and the best-trade pick "
+                         "below all recompute using ONLY bars up to here, exactly as they'd have looked "
+                         "live at that moment.")
+
+            if picked >= n - 1:
+                s["playing"] = False
+            st.session_state[state_key] = s
+
+            _render_replay_chart(base_df.iloc[: picked + 1], r_ticker, r_tf_label, r_data_source, n)
+
+            if s["playing"] and picked < n - 1:
+                time.sleep({"0.5x": 2.0, "1x": 1.0, "2x": 0.5, "4x": 0.25}[s["speed"]])
+                # Re-check right before looping — a Pause/Exit click that
+                # landed during the sleep above must win, not get overrun
+                # by a stale decision made before it. Flags the advance
+                # rather than applying it here directly — idx_key's own
+                # widget (the slider above) already rendered THIS pass, so
+                # writing it now would hit the exact same "modified after
+                # instantiation" error; the next pass's own top handles it
+                # instead (see this function's own opening lines).
+                _latest = st.session_state.get(state_key)
+                if _latest and _latest.get("playing"):
+                    _latest["_advance_pending"] = True
+                    st.session_state[state_key] = _latest
+                    st.rerun(scope="fragment")
+
+        _replay_frame()
+
+    if st.session_state.pop("_replay_exit_requested", False):
+        st.session_state["_replay_active"] = False
+    st.session_state.setdefault("_replay_active", False)
+    _replay_on = st.checkbox(
+        "🎬 Bar Replay", key="_replay_active",
+        help="Rewind this chart to a point in its own history, then step through it bar by bar (or "
+             "auto-play) — candles, FVG/order-block zones, and the recommender's own \"best trade right "
+             "now\" pick all unfold fresh from ONLY the bars revealed so far, exactly what a live trader "
+             "would have seen at that moment. No lookahead into the future.")
+    if _replay_on:
+        _render_bar_replay(ticker, tf_label, tf, data_source)
+    else:
+        _render_chart()

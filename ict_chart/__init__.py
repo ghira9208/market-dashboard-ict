@@ -23,7 +23,7 @@ _component_func = components.declare_component(
 
 
 def ict_chart(bars, fingerprint, overlays=None, options=None, tick_labels=None, indicators=None,
-              ohlc=None, height=700, key="ict_chart"):
+              ohlc=None, height=700, key="ict_chart", display_tz="America/New_York"):
     """
     bars: list of {"time": <seconds, int>, "open", "high", "low", "close", "volume"} dicts, ascending,
           unique times. `time` should be pre-encoded as "fake UTC" — the wall-clock digits of whatever
@@ -55,9 +55,22 @@ def ict_chart(bars, fingerprint, overlays=None, options=None, tick_labels=None, 
             at any zoom level. Order doesn't matter; color is fully pre-computed in Python (e.g. the
             Point-of-Control bucket highlighted, the rest a uniform dim tone).
     }
-    options: {"log_scale": bool, "volume": bool, "selected": bool} — "selected" draws a thin
-        inset border around the chart, for a multi-chart page to show which one a shared
-        control (e.g. a timeframe picker) currently applies to.
+    options: {"log_scale": bool, "volume": bool, "selected": bool, "hide_ohlc": bool,
+        "candle_width_factor": float, "error_message": str, "always_fit": bool,
+        "right_offset": int} — every key optional. "selected" draws a thin inset border
+        around the chart, for a multi-chart page to show which one a shared control (e.g. a
+        timeframe picker) currently applies to. "hide_ohlc" drops the O/H/L/C/source corner
+        readout (the HTF/LTF mini panels use this — no room to compete with the main chart's
+        own). "candle_width_factor" scales barSpacing by this factor once a reload settles
+        (< 1 = thinner candles than the library's own auto-fit spacing). "error_message"
+        shows this text instead of candles, for an honest "no data" state without a JS error.
+        "always_fit" skips the calendar-window/bar-count preservation a ticker/timeframe
+        switch normally tries first, going straight to fitting the whole loaded window instead
+        — for a chart meant to always show everything it currently holds (again, the mini
+        panels) rather than carry a zoom state across switches the way the main chart
+        deliberately does. "right_offset" sets how many bar-widths of empty margin sit after
+        the last candle (createChart's own default, unset, is 8) — a smaller chart may want
+        more visual breathing room than that.
 
     Returns a value that changes (a fresh timestamp) each time the user clicks the chart
     (a plain click, not a pan-drag) — compare it against the last-seen value to detect a
@@ -71,8 +84,10 @@ def ict_chart(bars, fingerprint, overlays=None, options=None, tick_labels=None, 
         "rsi": [{"time", "value"}] | None — its own pane below, with 30/70 reference lines.
         "macd": {"macd": [...], "signal": [...], "histogram": [...]} | None — its own pane below;
                 histogram points may include "color" for pos/neg bars.
+        "atr": [{"time", "value"}] | None — its own pane below, no reference lines (unlike RSI,
+               ATR has no fixed 0-100 range — it's in the instrument's own raw price units).
       Each list entry's "time" uses the same units as bar time. Any key omitted/None/empty is
-      simply not drawn — indicator panes for RSI/MACD only exist when their data is present.
+      simply not drawn — indicator panes for RSI/MACD/ATR only exist when their data is present.
     }
     key: MUST stay a constant across reruns for the SAME logical chart (don't derive it from ticker/data) —
          Streamlit auto-keys unkeyed/content-varying component calls, and a key that changes when the
@@ -80,6 +95,15 @@ def ict_chart(bars, fingerprint, overlays=None, options=None, tick_labels=None, 
          Confirmed directly: an unstable key discarded the whole persistent-JS-state premise this
          component exists for. Pass a different literal key only when you actually want a second,
          independent chart instance on the same page.
+    display_tz: IANA zone name (e.g. "America/New_York", "Asia/Tokyo") — must match whatever timezone
+         `bars`/`overlays`/etc.'s own "fake UTC" timestamps were already encoded in on the Python side
+         (see app.py/crypto_app.py's own _ny_fake_utc_seconds), so the frontend's live-tick path (the
+         Binance WebSocket feed, which receives GENUINE UTC millis straight from the exchange, not
+         pre-converted) can apply the exact same conversion and land new ticks on the same axis as the
+         historical bars already sitting there. Everything else about the chart (axis labels, OHLC
+         corner) just displays whatever digits `bars` already carries — only the live-tick path needs
+         to be told which zone that was, since it's the one place the frontend does its own conversion
+         instead of reading pre-converted digits from Python.
     """
     return _component_func(
         bars=bars,
@@ -91,5 +115,6 @@ def ict_chart(bars, fingerprint, overlays=None, options=None, tick_labels=None, 
         ohlc=ohlc or {},
         height=height,
         key=key,
+        display_tz=display_tz,
         default=None,
     )
