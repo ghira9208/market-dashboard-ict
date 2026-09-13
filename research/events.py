@@ -1,8 +1,8 @@
 """
-Turns fvg.py's FVG detector into a labeled point-in-time event table for
+Turns detectors.py's FVG detector into a labeled point-in-time event table for
 backtesting — the "Feature Generation" stage of the research pipeline,
 reusing the exact same detection logic the live ICT chart draws on screen
-rather than re-implementing it (see fvg.py's own DISPLACEMENT_MIN_BODY_RATIO
+rather than re-implementing it (see detectors.py's own DISPLACEMENT_MIN_BODY_RATIO
 comment for why this specific definition of a gap was chosen).
 
 Hypothesis under test: does price retracing back into a still-open FVG
@@ -20,8 +20,8 @@ touched the gap" couldn't have traded the touch bar itself at its own close.
 import numpy as np
 import pandas as pd
 
-from fvg import (detect_fvgs, detect_order_blocks, detect_liquidity_reactions,
-                  detect_equal_highs_lows, detect_structure_breaks, detect_liquidity_sweeps)
+from detectors import (detect_fvgs, detect_order_blocks, detect_liquidity_reactions,
+                        detect_equal_highs_lows, detect_structure_breaks, detect_liquidity_sweeps)
 from research.sequences import detect_judas_swing_setups
 from research.sessions import KILL_ZONES
 
@@ -62,7 +62,7 @@ def extract_fvg_retracement_events(df, forward_bars=10, min_body_ratio=None):
     """df: OHLCV with a DatetimeIndex (as returned by research.data_loader).
     Returns a DataFrame, one row per FVG that was ever retraced into, with
     the forward return from the bar after that retracement. min_body_ratio
-    overrides fvg.py's own displacement-strictness default when given —
+    overrides detectors.py's own displacement-strictness default when given —
     a sweepable parameter for the research UI, not a live-chart concern."""
     o_col, h_col, l_col, c_col = ("Open", "High", "Low", "Close")
     close = df[c_col].reset_index(drop=True)
@@ -262,7 +262,7 @@ def _walk_stop_target(direction, entry_price, stop_price, target_price, be_trigg
     happens after that bar's stop/target check already came back clean.
     A single bar whose range spans both the current stop and the target
     is called against the trade — stop wins — the same conservative same-
-    bar tie-break research/signals.py's own compute_setup already uses
+    bar tie-break research/setups.py's own compute_setup already uses
     ("an OHLC bar alone can't say which of TP/SL came first... calling it
     against the trade is the conservative read"), reused here rather than
     picked fresh.
@@ -488,7 +488,7 @@ def extract_judas_stoptarget_events(df, choch_window_minutes=60, choch_window_ta
 
     Stop and target still aren't reinvented — same formula already
     implemented independently in research_app.py/edge_lab_app.py and
-    consolidated in research/signals.py's own compute_setup: stop sits at
+    consolidated in research/setups.py's own compute_setup: stop sits at
     the far edge of the entry zone itself (zone bottom for a bullish
     setup, zone top for a bearish one), target is a fixed reward:risk
     (risk_reward=2.0, the trader's stated 2:1). be_trigger_r=1.0 is the

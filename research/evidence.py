@@ -21,17 +21,42 @@ mistaking background drift itself for edge.
 """
 
 import numpy as np
+import pandas as pd
 
 
-def run_event_study(events_df, cost_bps=10.0, n_permutations=5000, seed=0, direction_col="fvg_type"):
-    """events_df: output of events.extract_fvg_retracement_events.
+def run_event_study(events_df, cost_bps=10.0, n_permutations=5000, seed=0, direction_col="fvg_type",
+                     ticker=None, news_blackout=None):
+    """events_df: output of events.extract_fvg_retracement_events (or any
+    of the other extract_*_events functions — this only reads
+    entry_time/raw_return/direction_col, the shape they all share).
     cost_bps: assumed round-trip cost (spread + slippage + fees) in basis
     points, subtracted from every trade before any stat is computed — a
     pessimistic-by-design assumption since free OHLCV has no real fill/
     order-book data to model this from directly (see this module's own
-    docstring on backtest realism)."""
+    docstring on backtest realism).
+
+    ticker/news_blackout: both None (default, unchanged behavior), or
+    ticker plus a (minutes_before, minutes_after) pair — drops any event
+    whose own entry_time falls inside a high-impact news window for
+    ticker's own relevant currencies (see news.blackout_mask), before any
+    stat is computed. Same "don't count a trade that would have opened
+    right into a release" reasoning as market-dashboard-ict's live
+    dashboards (recommender.py's pattern_win_rate/backtest_custom_rule) —
+    this is the same engine, just applied to this module's own events_df
+    shape instead of an OHLCV df's row index. Both must be given together;
+    ticker alone or news_blackout alone is a no-op (nothing to look up a
+    ticker's currencies against without the other)."""
     if events_df.empty:
         return {"n_events": 0, "verdict": "NO_DATA", "note": "No qualifying events found."}
+
+    if ticker and news_blackout:
+        import news
+        mask = news.blackout_mask(pd.DatetimeIndex(events_df["entry_time"]), ticker,
+                                   news_blackout[0], news_blackout[1])
+        events_df = events_df[~mask]
+        if events_df.empty:
+            return {"n_events": 0, "verdict": "NO_DATA",
+                    "note": "No qualifying events left after excluding high-impact news windows."}
 
     rng = np.random.default_rng(seed)
     cost = cost_bps / 10_000.0

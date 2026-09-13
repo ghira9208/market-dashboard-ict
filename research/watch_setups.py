@@ -10,7 +10,7 @@ nothing extra in API calls.
 
 "Notable" was scoped down from an earlier draft that also considered
 reward:risk — dropped once it became clear every setup carries an
-identical fixed 2R by construction (research/signals.compute_setup), so it
+identical fixed 2R by construction (research/setups.compute_setup), so it
 can never distinguish one setup from another. What's left is genuinely
 discriminating and fully deterministic, so this stays a plain script
 (matching live_scan.py's own judas_swing-only alert, which already covers
@@ -25,7 +25,7 @@ minutes for no reason:
      notifies once, at detection).
   3. A setup's pattern is edge_lab-validated for its market (rare today —
      edge_lab has only ever tested GBPUSD, and live_scan doesn't scan it —
-     see research/signals.validation_badge).
+     see research/setups.validation_badge).
 
 State (research/.cache/watch_state.json) remembers each setup's
 last-notified status, keyed the same way live_events.csv itself dedupes
@@ -37,7 +37,7 @@ import json
 import os
 import subprocess
 
-from research.signals import load_live_setups, validation_badge
+from research.setups import load_live_setups, validation_badge
 
 _STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "watch_state.json")
 

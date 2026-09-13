@@ -1,20 +1,30 @@
 """
-Fair Value Gap (FVG) detection — the classic 3-candle imbalance:
+This project's whole ICT detection library — every pattern/zone/level
+detector the live charts, the recommender, and the research pipeline share,
+not just Fair Value Gaps (this file was named fvg.py originally, when FVG
+detection was the only thing in it; the name stuck through everything else
+that got added alongside it, which stopped being accurate a long time ago —
+renamed to detectors.py to actually match what's here):
 
-  candle[i-1]        candle[i]        candle[i+1]
-  (leaves the gap)   (impulse move)   (confirms the gap)
-
-Bullish FVG: low of candle[i+1] > high of candle[i-1] — price left a void
-             between those two candles that candle[i] jumped straight over.
-Bearish FVG: high of candle[i+1] < low of candle[i-1] — same thing, downward.
-
-The gap "fills" (mitigates) the first time a later candle trades back into
-its price zone. Open gaps (never filled) are the ones price hasn't returned
-to yet — usually the more interesting ones to watch.
+  - detect_fvgs / detect_order_blocks: the two core imbalance/footprint
+    zone detectors (Fair Value Gaps, Order Blocks).
+  - detect_swings / detect_structure_breaks: swing-point and market-
+    structure-break (BOS/CHoCH) detection.
+  - detect_equal_levels / detect_equal_highs_lows / detect_liquidity_levels /
+    detect_liquidity_sweeps / detect_liquidity_reactions: resting-liquidity
+    and liquidity-sweep detection.
+  - detect_naked_pocs / poc_migration / detect_poor_highs_lows: volume-
+    profile-derived detectors (built on indicators.volume_profile).
+  - current_dealing_range: premium/discount range.
+  - recent_zone_tracker / historical_zone_scanner / merge_zone_engines: the
+    two-engine zone-selection layer (recency-based vs. distance-based) that
+    picks which of the above zones actually get drawn/considered at once.
 """
 
 import numpy as np
 import streamlit as st
+
+from indicators import volume_profile
 
 # Detection here is O(n) but with per-row pandas access, not free on a
 # multi-thousand-row df — and several of these are called more than once per
@@ -25,15 +35,21 @@ import streamlit as st
 # of a recompute. TTL matches get_yf_ohlcv's, so it tracks fresh data.
 _CACHE_TTL = 300
 
-# ICT's own definition of displacement is a real, fast, mostly-one-direction
-# candle — body dominating its high-low range, not a long-wicked candle that
-# merely closed past a level. Without this gate, both FVG and order-block
-# detection below treat ANY 3-candle gap or ANY close-beyond-the-prior-high
-# as valid, which in practice fires on plenty of choppy, low-conviction
-# candles that no one would actually call an imbalance or an institutional
-# footprint. 0.5 is deliberately looser than the ~0.75 "textbook strong
-# displacement" bar — strict enough to drop indecisive candles, loose enough
-# not to silently empty out every FVG/OB on calmer timeframes.
+# What this actually measures, no more: body size as a fraction of the
+# candle's own high-low range — nothing here observes conviction, intent,
+# or who was trading. ICT's own definition of displacement INTERPRETS a
+# candle clearing this bar as "real, fast, mostly-one-direction" — body
+# dominating its range, not a long-wicked candle that merely closed past a
+# level — but that reading lives in the ICT methodology, not in the number
+# itself. Without this gate, both FVG and order-block detection below treat
+# ANY 3-candle gap or ANY close-beyond-the-prior-high as valid, which in
+# practice fires on plenty of choppy candles a body-ratio filter would
+# reject. 0.5 is deliberately looser than the ~0.75 "textbook strong
+# displacement" bar ICT itself would use — strict enough to drop the
+# clearest noise, loose enough not to silently empty out every FVG/OB on
+# calmer timeframes. Chosen as a reasonable engineering threshold, not
+# something back-tested to correlate with any actual forward outcome — see
+# research/evidence.py for that separate, much harder question.
 DISPLACEMENT_MIN_BODY_RATIO = 0.5
 
 
@@ -46,6 +62,21 @@ def _is_displacement(o, h, l, c, min_ratio=DISPLACEMENT_MIN_BODY_RATIO):
 
 @st.cache_data(ttl=_CACHE_TTL)
 def detect_fvgs(df, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, max_scan_bars=None, record_history=False):
+    # Fair Value Gap — the classic 3-candle imbalance:
+    #
+    #   candle[i-1]        candle[i]        candle[i+1]
+    #   (leaves the gap)   (impulse move)   (confirms the gap)
+    #
+    # Bullish FVG: low of candle[i+1] > high of candle[i-1] — price left a
+    #              void between those two candles that candle[i] jumped
+    #              straight over.
+    # Bearish FVG: high of candle[i+1] < low of candle[i-1] — same thing,
+    #              downward.
+    #
+    # The gap "fills" (mitigates) the first time a later candle trades back
+    # into its price zone. Open gaps (never filled) are the ones price
+    # hasn't returned to yet — usually the more interesting ones to watch.
+    #
     # record_history=False (default, every existing call site) returns the
     # exact same dict shape as always — this parameter is purely additive.
     # =True (recommender.py's backtest engine only) additionally records
@@ -174,6 +205,75 @@ def detect_fvgs(df, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, max_scan_bars=No
         fvgs.append(fvg_dict)
 
     return fvgs
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def detect_ifvgs(df, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, max_scan_bars=None):
+    """Inversion Fair Value Gap — an FVG that gets fully mitigated WITH
+    real conviction (the candle that finishes eating it all the way through
+    also CLOSES beyond the gap's own original far edge, not just wicks
+    through it) flips role: a bullish FVG broken this way stops acting as
+    support and starts acting as resistance; a bearish FVG broken this way
+    starts acting as support. Same price range as the original gap (its
+    own formation-time raw_top/raw_bottom, not detect_fvgs' own final
+    "top"/"bottom", which is often eaten down to a near-zero sliver by the
+    time it fully fills — see detect_fvgs' own raw_top/raw_bottom
+    docstring note for why that distinction already exists), just a
+    flipped interpretation and a fresh forward scan for whether price
+    actually comes back to test it FROM THE NEW DIRECTION.
+
+    Deliberately a separate detector, not a flag bolted onto detect_fvgs'
+    own output — an IFVG's own lifecycle (does price respect the flip) is
+    a different question from the original FVG's (did it get filled at
+    all), with its own first_touch meaning relative to the INVERTED
+    direction, not the original one. Mirrors detect_breaker_blocks below,
+    same mechanism applied to detect_order_blocks instead.
+
+    "Closes beyond," checked on the single bar that completes the fill —
+    not "wicks beyond at any later point" — is an engineering choice, not
+    something back-tested to be the one true definition; see this file's
+    own DISPLACEMENT_MIN_BODY_RATIO comment on the same kind of choice for
+    displacement itself."""
+    base = detect_fvgs(df, min_body_ratio=min_body_ratio, max_scan_bars=max_scan_bars, record_history=True)
+    if not base:
+        return []
+    high_arr = (df["High"] if "High" in df else df["high"]).to_numpy()
+    low_arr = (df["Low"] if "Low" in df else df["low"]).to_numpy()
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    idx = df.index
+    n = len(df)
+    pos_by_time = {t: i for i, t in enumerate(idx)}
+
+    ifvgs = []
+    for g in base:
+        if not g["filled"]:
+            continue
+        end_i = pos_by_time[g["end"]]
+        if g["type"] == "bullish":
+            # Filled from above (bullish gap re-tested downward) — inverts
+            # only if the closing bar actually closes BELOW the gap's own
+            # original bottom, not just wicks into/through it.
+            if close_arr[end_i] >= g["raw_bottom"]:
+                continue
+            new_type = "bearish"
+        else:
+            if close_arr[end_i] <= g["raw_top"]:
+                continue
+            new_type = "bullish"
+
+        top, bottom = g["raw_top"], g["raw_bottom"]
+        first_touch_i = None
+        scan_end = n if max_scan_bars is None else min(n, end_i + 1 + max_scan_bars)
+        for j in range(end_i + 1, scan_end):
+            if low_arr[j] <= top and high_arr[j] >= bottom:
+                first_touch_i = j
+                break
+        ifvgs.append({
+            "type": new_type, "top": top, "bottom": bottom,
+            "start": g["end"], "origin_start": g["start"],
+            "first_touch": idx[first_touch_i] if first_touch_i is not None else None,
+        })
+    return ifvgs
 
 
 def _rolling_mean_min1(arr, period):
@@ -384,10 +484,20 @@ def detect_structure_breaks(df, mode="close"):
 
 @st.cache_data(ttl=_CACHE_TTL)
 def detect_order_blocks(df, max_scan_bars=None, record_history=False):
-    """The last opposing candle before a displacement move that breaks clean
-    through it — the classic ICT proxy for "where institutions likely built
-    a position before the move." Bullish OB = last down-candle before a
-    candle that closes above its high; bearish OB = mirror image.
+    """OBSERVED: the last opposing candle before a displacement move that
+    breaks clean through it. Bullish OB = last down-candle before a candle
+    that closes above its high; bearish OB = mirror image. That is the
+    complete computational definition — nothing here observes who traded
+    it or why.
+
+    INTERPRETED (ICT's own reading, not something this function can verify):
+    that opposing candle marks "where institutions likely built a position
+    before the move." Keep that reading in the methodology and in how a
+    human trader uses this zone — treating it as an observed fact rather
+    than an interpretation is exactly the gap a research pipeline needs to
+    not fall into (see research/evidence.py's own permutation test, which
+    checks whether "OB retracement" actually predicts anything, rather than
+    assuming the ICT story is true because the geometry matched).
 
     max_scan_bars: see detect_fvgs' identical parameter — None (the live
     chart's own call site) preserves the original unbounded fill-scan; the
@@ -411,9 +521,8 @@ def detect_order_blocks(df, max_scan_bars=None, record_history=False):
     for i in range(n - 1):
         # The breakout candle (i+1) is what's supposed to be the displacement
         # move — a candle that merely closes past the prior high/low on a
-        # long wick isn't the "institutional footprint" ICT means by order
-        # block, just noise that technically satisfies the raw price
-        # condition. See DISPLACEMENT_MIN_BODY_RATIO.
+        # long wick doesn't clear DISPLACEMENT_MIN_BODY_RATIO's own body-size
+        # bar, just noise that technically satisfies the raw price condition.
         if not _is_displacement(o[i + 1], h[i + 1], l[i + 1], c[i + 1]):
             continue
         bearish_i = c[i] < o[i]
@@ -481,6 +590,60 @@ def detect_order_blocks(df, max_scan_bars=None, record_history=False):
             ob["_formation_top"], ob["_formation_bottom"] = formation_top, formation_bottom
 
     return obs
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def detect_breaker_blocks(df, max_scan_bars=None):
+    """Breaker Block — the Order Block equivalent of detect_ifvgs above,
+    same mechanism applied to detect_order_blocks' own output instead of
+    detect_fvgs': an order block that gets fully mitigated WITH the
+    completing candle actually CLOSING beyond the block's own formation-
+    time boundary (not just wicking through it) flips role — a bullish OB
+    broken this way stops acting as support and starts acting as
+    resistance, a bearish OB broken this way starts acting as support.
+    Same price range as the block's own _formation_top/_formation_bottom
+    (the size as it originally formed, before any consequent-encroachment
+    eating), plus a fresh forward scan for whether price comes back to
+    test it from the new direction. See detect_ifvgs' own docstring for
+    the full reasoning (separate detector, not a flag; "closes beyond" on
+    the completing bar as the engineering choice for confirmation)."""
+    base = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=True)
+    if not base:
+        return []
+    high_arr = (df["High"] if "High" in df else df["high"]).to_numpy()
+    low_arr = (df["Low"] if "Low" in df else df["low"]).to_numpy()
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    idx = df.index
+    n = len(df)
+    pos_by_time = {t: i for i, t in enumerate(idx)}
+
+    breakers = []
+    for ob in base:
+        if not ob["mitigated"]:
+            continue
+        end_i = pos_by_time[ob["end"]]
+        if ob["type"] == "bullish":
+            if close_arr[end_i] >= ob["_formation_bottom"]:
+                continue
+            new_type = "bearish"
+        else:
+            if close_arr[end_i] <= ob["_formation_top"]:
+                continue
+            new_type = "bullish"
+
+        top, bottom = ob["_formation_top"], ob["_formation_bottom"]
+        first_touch_i = None
+        scan_end = n if max_scan_bars is None else min(n, end_i + 1 + max_scan_bars)
+        for j in range(end_i + 1, scan_end):
+            if low_arr[j] <= top and high_arr[j] >= bottom:
+                first_touch_i = j
+                break
+        breakers.append({
+            "type": new_type, "top": top, "bottom": bottom,
+            "start": ob["end"], "origin_start": ob["start"],
+            "first_touch": idx[first_touch_i] if first_touch_i is not None else None,
+        })
+    return breakers
 
 
 def detect_equal_levels(points, tolerance=0.0015):
@@ -587,6 +750,202 @@ def detect_liquidity_levels(df, n_above=2, n_below=2):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
+def _daily_volume_profiles(df, max_days=60):
+    """Shared groundwork for detect_naked_pocs and detect_poor_highs_lows
+    below — groups df into NY calendar sessions and computes each COMPLETE
+    past day's own volume profile once, so two detectors reading the exact
+    same (df, max_days) hit one cache entry instead of each re-walking
+    history and re-bucketing every day independently.
+
+    Sessions are NY calendar days — df.index must be tz-aware (every
+    caller in this project already fetches tz-aware OHLCV, so this is
+    never a fresh conversion) — the same wall-clock convention every
+    other session-scoped feature here already uses (Kill Zones, session-
+    restricted backtests). Only COMPLETE past days are considered; the
+    current, still-forming day is excluded since its own profile isn't
+    final yet. max_days bounds how far back to look — each day gets its
+    own volume_profile() call, so cost is O(max_days), not O(len(df)).
+
+    Returns a list of {"day" (the NY date), "end_pos" (that day's own last
+    integer position in df, for "everything after this point" checks),
+    "day_high"/"day_low" (that day's own session extremes), "high_time"/
+    "low_time" (the exact bar each of those printed on — NOT necessarily
+    end_pos; the high/low can land anywhere in the session), "vp"
+    (volume_profile's own return dict for that day)}, most recent day
+    first. Days volume_profile returned None for are skipped entirely,
+    never included here — same as days with fewer than MIN_BARS_PER_DAY
+    bars (below), which volume_profile was never even called for.
+
+    MIN_BARS_PER_DAY exists because "day" here means "however many bars
+    of df happen to share an NY calendar date" — on an intraday df that's
+    a real session with real intraday price PATH to bucket, but on a
+    1D+ df, each bar already covers one whole day, so every "day" group
+    ends up with exactly 1 bar: volume_profile() still technically runs
+    (bucketing that ONE candle's own high-low range) and returns SOME
+    poc_price, but it's not a real session profile — there's no actual
+    intraday path in a single OHLC bar, just its own four numbers
+    reshuffled into 24 buckets. Confirmed directly as the actual cause of
+    "Naked POC / Poor High-Low don't look right on 1D+" reports: the
+    detectors WERE running, just on degenerate one-bar-a-day input,
+    producing technically-computed but meaningless output instead of an
+    honest empty result. 4 is deliberately low — even a coarse 4h main
+    chart only has 6 bars/day, and that's still a genuinely useful
+    profile; this is only meant to catch the "one bar IS the whole day"
+    case, not to demand a lot of resolution.
+    """
+    MIN_BARS_PER_DAY = 4
+    high_col = "High" if "High" in df else "high"
+    low_col = "Low" if "Low" in df else "low"
+    if df.empty:
+        return []
+    ny_dates = df.index.tz_convert("America/New_York").date
+    unique_days = sorted(set(ny_dates))
+    if len(unique_days) < 2:
+        return []
+    # [:-1] drops the current/still-forming day; [-max_days:] keeps only
+    # the most recent max_days of what remains.
+    past_days = unique_days[:-1][-max_days:]
+    high_arr = df[high_col].to_numpy()
+    low_arr = df[low_col].to_numpy()
+    results = []
+    for day in past_days:
+        day_positions = np.flatnonzero(ny_dates == day)
+        if day_positions.size < MIN_BARS_PER_DAY:
+            continue
+        vp = volume_profile(df.iloc[day_positions])
+        if vp is None:
+            continue
+        day_highs, day_lows = high_arr[day_positions], low_arr[day_positions]
+        hi_pos = int(day_positions[int(np.argmax(day_highs))])
+        lo_pos = int(day_positions[int(np.argmin(day_lows))])
+        results.append({
+            "day": day, "end_pos": int(day_positions[-1]),
+            "day_high": float(day_highs.max()), "day_low": float(day_lows.min()),
+            "high_time": df.index[hi_pos], "low_time": df.index[lo_pos], "vp": vp,
+        })
+    return sorted(results, key=lambda r: r["day"], reverse=True)
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def detect_naked_pocs(df, max_days=60):
+    """Naked (a.k.a. virgin) Points of Control — a past DAILY session's own
+    busiest traded price (see indicators.volume_profile) that price hasn't
+    traded back through since that session closed. Same "resting until
+    touched" rule detect_liquidity_levels above already uses for swing
+    highs/lows, applied to a session's POC instead of a swing point: a
+    level the market auctioned heavily around once and never revisited
+    acts as a magnet, one of the most-watched levels on a professional
+    order-flow desk — unlike the CURRENT profile's own POC/VAH/VAL
+    (computed once, over whatever window is presently loaded), these
+    persist across every session until touched, and get dropped the
+    instant that happens.
+
+    Returns a list of {"price", "time" (the day's own last bar — when
+    this POC became final and eligible to go naked), "day" (ISO date
+    string, for a label)}, naked ones only, most recent first."""
+    high_col = "High" if "High" in df else "high"
+    low_col = "Low" if "Low" in df else "low"
+    high_arr = df[high_col].to_numpy()
+    low_arr = df[low_col].to_numpy()
+    results = []
+    for d in _daily_volume_profiles(df, max_days):
+        poc = d["vp"]["poc_price"]
+        end_pos = d["end_pos"]
+        after_high = high_arr[end_pos + 1:]
+        after_low = low_arr[end_pos + 1:]
+        # Two-sided range check (unlike untouched_high/untouched_low
+        # above, which only ever need to check one direction for a
+        # directional swing level) — a POC can get traded through from
+        # either side, so "touched" means any later bar's own [low, high]
+        # span includes this exact price, not just a one-sided breach.
+        touched = after_high.size > 0 and bool(((after_low <= poc) & (after_high >= poc)).any())
+        if not touched:
+            results.append({"price": poc, "time": df.index[end_pos], "day": d["day"].isoformat()})
+    return sorted(results, key=lambda r: r["time"], reverse=True)
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def poc_migration(df, lookback=5, flat_threshold_pct=1.5):
+    """Is the daily session POC drifting session to session, or staying
+    roughly in place? A POC that keeps printing higher (or lower) day
+    after day means value itself is migrating, not just price wicking
+    around — the standard professional read for "is a trend actually
+    building" versus "the market's still auctioning around the same
+    fair price." Same daily-session groundwork as detect_naked_pocs (see
+    _daily_volume_profiles' own docstring) — NY calendar sessions,
+    current day excluded, capped to the most recent `lookback` of them.
+
+    flat_threshold_pct: the minimum |% change| between the oldest and
+    newest POC in the window to call it a real drift rather than noise —
+    below this, direction reads "flat" regardless of which way the raw
+    number moved (a real market rarely prints the exact same POC twice
+    in a row, so SOME nonzero change is normal background noise, not a
+    trend).
+
+    Returns None when fewer than 2 sessions are available in the window
+    (nothing to compare), else {"days": [{"day", "price"}, ...] (oldest
+    first, at most `lookback` entries), "pct_change", "direction"
+    ("up"/"down"/"flat")} — pct_change and direction are both measured
+    oldest-to-newest across the whole window, not just the last step."""
+    daily = sorted(_daily_volume_profiles(df, max_days=lookback), key=lambda d: d["day"])
+    if len(daily) < 2:
+        return None
+    points = [{"day": d["day"].isoformat(), "price": d["vp"]["poc_price"]} for d in daily]
+    first_price, last_price = points[0]["price"], points[-1]["price"]
+    pct_change = (last_price - first_price) / first_price * 100 if first_price else 0.0
+    if abs(pct_change) < flat_threshold_pct:
+        direction = "flat"
+    else:
+        direction = "up" if pct_change > 0 else "down"
+    return {"days": points, "pct_change": pct_change, "direction": direction}
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def detect_poor_highs_lows(df, max_days=60, min_frac=0.25):
+    """A session's own high or low that printed on REAL volume, not a thin
+    single tap — the auction didn't cleanly reject there. Distinguishes
+    "price wicked up here once and reversed hard" (a clean extreme, real
+    rejection, likely to hold) from "price kept trading right at this
+    level" (a poor one — real unfinished business, more likely to get
+    revisited or run straight through than defended) — the standard
+    professional read on a session's own high/low beyond just where it
+    printed.
+
+    min_frac: how busy (relative to that day's own busiest bucket) the
+    bucket AT the extreme needs to be to count as "poor" — default 0.25
+    means it carried at least a quarter of the day's busiest bucket's own
+    volume, real trading, not a single spike-and-reverse print.
+
+    volume_profile()'s own bucket edges are built from exactly this day's
+    [min(low), max(high)] — the TOP bucket's own upper edge is always
+    day_high and the BOTTOM bucket's own lower edge is always day_low, by
+    construction, so no separate search for "which bucket contains the
+    extreme" is needed.
+
+    Same day/history conventions as detect_naked_pocs (see
+    _daily_volume_profiles' own docstring) — NY calendar sessions, current
+    day excluded, max_days bounds lookback. Returns a list of {"price",
+    "time", "day", "kind" ("high" or "low")}, most recent first. Unlike
+    naked POCs, there's no persistence/touch tracking here — a poor high/
+    low doesn't go away once price returns to it; it's a property of how
+    that session itself traded, not a level still being defended."""
+    results = []
+    for d in _daily_volume_profiles(df, max_days):
+        buckets = d["vp"]["buckets"]
+        if not buckets:
+            continue
+        # time = the bar the extreme itself actually printed on, not the
+        # day's own last bar — a session's high/low can land anywhere in
+        # it, and a marker belongs at the moment it happened, not at
+        # end-of-day.
+        if buckets[-1]["volume_frac"] >= min_frac:
+            results.append({"price": d["day_high"], "time": d["high_time"], "day": d["day"].isoformat(), "kind": "high"})
+        if buckets[0]["volume_frac"] >= min_frac:
+            results.append({"price": d["day_low"], "time": d["low_time"], "day": d["day"].isoformat(), "kind": "low"})
+    return sorted(results, key=lambda r: r["time"], reverse=True)
+
+
+@st.cache_data(ttl=_CACHE_TTL)
 def detect_liquidity_sweeps(df, tier=False):
     """Every swing high/low that later got wicked through, as a standalone
     point-in-time event — the raw "stop hunt" moment on its own, not paired
@@ -627,7 +986,7 @@ def detect_liquidity_sweeps(df, tier=False):
     major by actually leading to a confirmed sweep→MSS→displacement
     sequence, not just "nothing newer superseded it yet." This function
     can't check that on its own (it doesn't know about MSS/displacement —
-    that's research/sequences.py's layer, and fvg.py importing it back
+    that's research/sequences.py's layer, and detectors.py importing it back
     would be a circular import). Treat this tier as a decent structural
     approximation, not the final answer — research/sequences.py's
     classify_liquidity_tiers() cross-references actual confirmed Judas
@@ -710,7 +1069,7 @@ def detect_liquidity_sweeps(df, tier=False):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None):
+def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None, record_history=False):
     """Once external liquidity is swept, ICT expects a reaction from the order
     block that formed right at that sweep — the "external area" price reverses
     from. Finds the MOST RECENT high-sweep and MOST RECENT low-sweep, and for
@@ -726,13 +1085,18 @@ def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None):
     max_scan_bars value is a different st.cache_data key, so it can't reuse
     an already-capped result computed elsewhere) — confirmed directly, this
     was still hanging after detect_fvgs/detect_order_blocks' own scans were
-    already fixed, until this call site got the same treatment."""
+    already fixed, until this call site got the same treatment.
+
+    record_history: passed straight through to detect_order_blocks — see
+    its own docstring on _formation_top/_formation_bottom, the
+    pre-encroachment bounds pattern_win_rate needs and this function's
+    own {**ob, ...} spread below otherwise silently drops."""
     high_col = "High" if "High" in df else "high"
     low_col = "Low" if "Low" in df else "low"
     high_arr = df[high_col].to_numpy()
     low_arr = df[low_col].to_numpy()
     highs, lows = detect_swings(df)
-    obs = detect_order_blocks(df, max_scan_bars=max_scan_bars)
+    obs = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=record_history)
     reactions = []
 
     def sweep_idx(point, arr, above):
@@ -831,3 +1195,65 @@ def current_dealing_range(df):
         "eq": (pending_high["price"] + pending_low["price"]) / 2,
         "top_swept_at": top_swept_at, "bottom_swept_at": bottom_swept_at,
     }
+
+
+# Two deliberately different ways to answer "which of these already-
+# detected zones should I actually show" — direct request, for the whole
+# detection system, not any one caller: "one that tracks previous
+# candles, and one that scans historical values." Neither one re-runs
+# detection itself — both take whatever detect_fvgs/detect_order_blocks
+# already found (fill/mitigation status resolved against the FULL
+# history, never truncated) and just filter/rank that output two
+# different ways. A caller showing "areas and levels" on a chart
+# typically wants BOTH results, merged (a zone can legitimately appear in
+# both) — see this project's own app.py/crypto_app.py FVG/Order Blocks
+# layers and the Bar Replay chart for how they're combined in practice.
+def recent_zone_tracker(zones, df, lookback_bars=50):
+    """Engine A — "tracks previous candles": every zone that FORMED within
+    the last `lookback_bars` bars of `df`, uncapped. Direct request: "the
+    tracker should mark everything in recent past... tells me with
+    surgical precision what and why it happened" — a complete recent
+    record, not a filtered top-N. Age is the only filter; a zone's own
+    distance from current price doesn't matter here at all (that's
+    historical_zone_scanner's own job)."""
+    if not zones or df is None or len(df) == 0:
+        return []
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+    cutoff = max(0, len(df) - lookback_bars)
+    return [z for z in zones if (pos_by_time.get(z["start"]) or 0) >= cutoff]
+
+
+def historical_zone_scanner(zones, current_price, n_per_side=2, top_key="top", bottom_key="bottom"):
+    """Engine B — "scans historical values": the nearest `n_per_side`
+    zones ABOVE current_price and nearest `n_per_side` BELOW it, drawn
+    from the FULL zone list regardless of age — an old, still-unmitigated
+    zone from far back in history counts exactly the same as one formed
+    yesterday. Direct request: "the historical ones should track areas
+    above and below price only... shows me where price might go even if
+    it exits the range" — read as potential liquidity draws/targets, not
+    "what just happened" (that's recent_zone_tracker's own job). Same
+    above/below split this project's own _nearest_by_price already uses
+    for on-chart zone selection — reimplemented here (rather than
+    imported) since that helper lives duplicated in app.py/crypto_app.py,
+    not in this shared detection module."""
+    above, below = [], []
+    for z in zones:
+        top, bottom = z[top_key], z[bottom_key]
+        if bottom >= current_price:
+            above.append((bottom - current_price, z))
+        elif top <= current_price:
+            below.append((current_price - top, z))
+    above.sort(key=lambda pair: pair[0])
+    below.sort(key=lambda pair: pair[0])
+    return [z for _, z in above[:n_per_side]] + [z for _, z in below[:n_per_side]]
+
+
+def merge_zone_engines(recent, historical):
+    """Combines recent_zone_tracker's and historical_zone_scanner's own
+    output into one list, keeping recent-tracker's own ordering first (a
+    caller's most-recently-formed-last convention) and appending whichever
+    historical picks weren't already included — a zone easily qualifies
+    for both (freshly formed AND the nearest one above/below price), and
+    should only ever be drawn once."""
+    seen = {id(z) for z in recent}
+    return list(recent) + [z for z in historical if id(z) not in seen]

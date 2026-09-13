@@ -9,7 +9,7 @@ Two jobs each run:
 1. Refresh (accumulate) OHLCV caches for the watched pairs/intervals — the
    actual trigger the merge-on-refresh logic in data_loader.py needed and
    never had; nothing was calling refresh=True on any schedule before this.
-2. Re-run the ICT detectors (fvg.py — same ones the live chart draws, same
+2. Re-run the ICT detectors (detectors.py — same ones the live chart draws, same
    ones events.py already wraps for backtesting) on the freshest data, and
    append any FVG/order-block/liquidity-sweep NOT already in the running
    log. Deliberately just detection + logging, no signal, no trade, no
@@ -28,8 +28,8 @@ import pandas as pd
 from research.agent_config import load_config
 from research.data_loader import INTERVAL_MAX_PERIOD, load_history
 from research.sequences import detect_judas_swing_setups
-from fvg import (detect_fvgs, detect_order_blocks, detect_liquidity_reactions,
-                  detect_equal_highs_lows, detect_structure_breaks)
+from detectors import (detect_fvgs, detect_order_blocks, detect_liquidity_reactions,
+                        detect_equal_highs_lows, detect_structure_breaks)
 
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 LIVE_EVENTS_PATH = os.path.join(_CACHE_DIR, "live_events.csv")

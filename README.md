@@ -12,7 +12,7 @@ trade right now" Entry/Stop/Target read.
   Binance WebSocket tick feed on top of the usual polling.
 
 Both are independent Streamlit scripts that share the same underlying
-modules (`fvg.py`, `theme.py`, `data.py`, `recommender.py`, `ict_chart/`)
+modules (`detectors.py`, `theme.py`, `data.py`, `recommender.py`, `ict_chart/`)
 and differ only in which curated symbol list their own ticker picker
 shows.
 
@@ -37,10 +37,10 @@ chain for when Yahoo is unavailable.
 
 - `app.py` / `crypto_app.py` — the two pages: controls, ICT detection
   wiring, and the custom interactive chart component.
-- `fvg.py` — FVG/Order Block/Swing/Structure/Liquidity/Equilibrium
+- `detectors.py` — FVG/Order Block/Swing/Structure/Liquidity/Equilibrium
   detection, shared by both pages.
 - `recommender.py` — ranks currently-open zones into the on-chart "best
-  trade right now" Entry/Stop/Target lines, reusing `research/signals.py`'s
+  trade right now" Entry/Stop/Target lines, reusing `research/setups.py`'s
   setup math and Edge Lab's validation lookup where it exists.
 - `theme.py` — the neon dark-mode styling + nav.
 - `data.py` — OHLCV fetch/cache/provider chain.

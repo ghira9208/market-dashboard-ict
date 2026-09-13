@@ -1,7 +1,7 @@
 """
 Multi-step ICT setups — an alert fires only once every step in a defined
 sequence completes IN ORDER, not on any single detector by itself. Built on
-top of fvg.py's primitives (liquidity sweep, structure break, FVG/OB
+top of detectors.py's primitives (liquidity sweep, structure break, FVG/OB
 retracement); this is where they get chained into something an ICT trader
 would actually call a "setup," not just a list of independent events.
 
@@ -29,8 +29,8 @@ CHoCH and retracement zone getting reused by every stale prior sweep still
 sitting in range, not 710 independent playbook completions.
 """
 
-from fvg import (detect_fvgs, detect_liquidity_levels, detect_liquidity_sweeps, detect_order_blocks,
-                  detect_structure_breaks)
+from detectors import (detect_fvgs, detect_liquidity_levels, detect_liquidity_sweeps, detect_order_blocks,
+                        detect_structure_breaks)
 
 # Gap-count -> code, per the trader's own taxonomy: OSG (One Simple Gap),
 # TG/TCG (Two Gaps / Two Consecutive Gaps), 3G/3CG (Three / Three
@@ -132,9 +132,9 @@ def _first_touch_in_zone(zone, high_arr, low_arr, scan_start, scan_end):
 def _scan_start_for_zone(zone, leg_gaps):
     """Earliest bar position price could possibly trade into `zone` — the
     REFERENCE gap's own 3-candle pattern is confirmed formed at
-    start_pos + 3 (matching fvg.py's detect_fvgs, which scans for touches
+    start_pos + 3 (matching detectors.py's detect_fvgs, which scans for touches
     from i+2 where start_pos == i-1 — see its own comment). NOT the gap's
-    end_pos: fvg.py's "end" is when the gap finished getting fully eaten
+    end_pos: detectors.py's "end" is when the gap finished getting fully eaten
     (or the last bar of data if it never fills), which is only ever AT OR
     AFTER the first real touch — anchoring the scan there means scanning
     for a touch only after the gap was already touched by definition,
@@ -286,10 +286,10 @@ def detect_judas_swing_setups(df, choch_window_bars=20, retrace_window_bars=30, 
     high_arr = (df["High"] if "High" in df else df["high"]).to_numpy()
     low_arr = (df["Low"] if "Low" in df else df["low"]).to_numpy()
 
-    # raw_top/raw_bottom, NOT top/bottom — fvg.py's "top"/"bottom" is the
+    # raw_top/raw_bottom, NOT top/bottom — detectors.py's "top"/"bottom" is the
     # gap's FINAL, fully-processed remaining-unfilled height (often clamped
     # to near-zero by the time a gap that fills fast finishes its scan; see
-    # fvg.py's own comment on this). The trader's entry-by-gap rule means
+    # detectors.py's own comment on this). The trader's entry-by-gap rule means
     # the zone the gap actually occupied when it formed — raw_top/
     # raw_bottom — not however little of it happened to still be
     # unfilled once the whole dataset finished scanning. Confirmed
@@ -363,11 +363,11 @@ def detect_judas_swing_setups(df, choch_window_bars=20, retrace_window_bars=30, 
 
 def classify_liquidity_tiers(df, choch_window_bars=20, retrace_window_bars=30, max_scan_bars=None):
     """The trader's Major/Minor/Local split, read literally rather than
-    approximated. fvg.py's detect_liquidity_sweeps(tier=True) can only see
+    approximated. detectors.py's detect_liquidity_sweeps(tier=True) can only see
     market STRUCTURE (was this point still the active swing boundary when
     swept) — it has no way to check the trader's actual definition, which
     depends on MSS + Displacement actually happening, a layer only this
-    module (built on top of fvg.py) can see:
+    module (built on top of detectors.py) can see:
 
       Major — "the last liquidity point that forms an impulsive leg":
         a swept point that is the sweep_level of an ACTUALLY CONFIRMED
@@ -379,7 +379,7 @@ def classify_liquidity_tiers(df, choch_window_bars=20, retrace_window_bars=30, m
         ever completed the chain within retrace_window_bars) — the level
         got taken without producing the impulsive leg Major requires.
       Local — not swept at all (yet): still a live, untouched swing
-        point (the same set fvg.py's detect_liquidity_levels calls
+        point (the same set detectors.py's detect_liquidity_levels calls
         "external range liquidity") — genuinely too recent to say whether
         it resolves Major or Minor, exactly the trader's own definition
         ("recent, not yet categorized").

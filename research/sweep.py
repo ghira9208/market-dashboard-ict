@@ -25,7 +25,7 @@ import os
 
 import pandas as pd
 
-from research.backtest import run_event_study
+from research.evidence import run_event_study
 from research.data_loader import INTERVAL_MAX_PERIOD, load_history
 from research.events import extract_fvg_retracement_events
 from research.experiment_log import log_run
@@ -72,14 +72,17 @@ def run_availability_sweep(tickers=CRYPTO_TICKERS, intervals=None, sources=SOURC
 
 
 def run_backtest_sweep(tickers=CRYPTO_TICKERS, intervals=LONG_INTERVALS,
-                        forward_bars=50, min_body_ratio=0.5, cost_bps=10.0):
+                        forward_bars=50, min_body_ratio=0.5, cost_bps=10.0, news_blackout=None):
+    """news_blackout: None (default) or a (minutes_before, minutes_after)
+    pair — see run_event_study's own docstring. Applied per-ticker (each
+    ticker has its own relevant news currencies)."""
     rows = []
     for ticker in tickers:
         for interval in intervals:
             try:
                 df = load_history(ticker, INTERVAL_MAX_PERIOD[interval], interval, provider="auto")
                 events = extract_fvg_retracement_events(df, forward_bars=forward_bars, min_body_ratio=min_body_ratio)
-                result = run_event_study(events, cost_bps=cost_bps)
+                result = run_event_study(events, cost_bps=cost_bps, ticker=ticker, news_blackout=news_blackout)
                 log_run(ticker, interval, INTERVAL_MAX_PERIOD[interval], "auto",
                         "FVG retracement -> continuation", forward_bars, cost_bps,
                         {"min_body_ratio": min_body_ratio, "sweep": True}, result)

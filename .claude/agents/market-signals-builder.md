@@ -16,7 +16,7 @@ Read these before writing code — they contain the actual conventions and the
 one hard constraint below, not paraphrases:
 
 - `research/live_scan.py` (docstring + `_DETECTORS`) — the hourly agent that
-  already re-runs `fvg.py`'s detectors (`detect_fvgs`, `detect_order_blocks`,
+  already re-runs `detectors.py`'s detectors (`detect_fvgs`, `detect_order_blocks`,
   `detect_liquidity_reactions`, `detect_equal_highs_lows`,
   `detect_structure_breaks`) plus `research/sequences.detect_judas_swing_setups`
   on fresh data and logs new structures to `research/.cache/live_events.csv`.

@@ -53,7 +53,7 @@ from datetime import time as dtime
 
 import pandas as pd
 
-from research.backtest import run_event_study
+from research.evidence import run_event_study
 from research.data_loader import load_history
 from research.events import extract_judas_stoptarget_events
 from research.experiment_log import log_run
@@ -201,7 +201,14 @@ def main():
                          "win/loss/be reclassification itself still applies either way).")
     p.add_argument("--retrace-window-bars", type=int, default=30)
     p.add_argument("--refresh", action="store_true")
+    p.add_argument("--news-blackout-before", type=int, default=None,
+                    help="Exclude setups whose entry falls within this many minutes BEFORE a high-impact "
+                         "news release for this ticker's own currencies. Requires --news-blackout-after too.")
+    p.add_argument("--news-blackout-after", type=int, default=None,
+                    help="Same as --news-blackout-before, minutes AFTER the release.")
     args = p.parse_args()
+    news_blackout = ((args.news_blackout_before, args.news_blackout_after)
+                      if args.news_blackout_before is not None and args.news_blackout_after is not None else None)
 
     window_start = None if args.no_window else _parse_hhmm(args.window_start_et)
     window_end = None if args.no_window else _parse_hhmm(args.window_end_et)
@@ -274,7 +281,8 @@ def main():
     }
 
     print("\n--- Aggregate (all gap-tagged setups pooled) ---")
-    agg_result = run_event_study(events, cost_bps=args.cost_bps, direction_col="event_type")
+    agg_result = run_event_study(events, cost_bps=args.cost_bps, direction_col="event_type",
+                                  ticker=args.ticker, news_blackout=news_blackout)
     log_run(args.ticker, f"{args.interval}->{args.resample or args.interval}", args.period, args.provider,
             "Judas Swing (gap-tagged, stop/target/BE exit) — aggregate",
             args.max_hold_bars, args.cost_bps, extra_params, agg_result)
@@ -286,7 +294,8 @@ def main():
     else:
         for code in _ALL_CODES:
             sliced = events[events["gap_count_full_code"] == code]
-            result = run_event_study(sliced, cost_bps=args.cost_bps, direction_col="event_type")
+            result = run_event_study(sliced, cost_bps=args.cost_bps, direction_col="event_type",
+                                      ticker=args.ticker, news_blackout=news_blackout)
             log_run(args.ticker, f"{args.interval}->{args.resample or args.interval}", args.period, args.provider,
                     f"Judas Swing (gap-tagged, stop/target/BE exit) — {code}",
                     args.max_hold_bars, args.cost_bps, extra_params, result)
@@ -297,7 +306,8 @@ def main():
     if "slg" in events.columns and not events.empty:
         for slg_val, label in ((False, "non-SLG"), (True, "SLG")):
             sliced = events[events["slg"] == slg_val]
-            result = run_event_study(sliced, cost_bps=args.cost_bps, direction_col="event_type")
+            result = run_event_study(sliced, cost_bps=args.cost_bps, direction_col="event_type",
+                                      ticker=args.ticker, news_blackout=news_blackout)
             log_run(args.ticker, f"{args.interval}->{args.resample or args.interval}", args.period, args.provider,
                     f"Judas Swing (gap-tagged, stop/target/BE exit) — {label}",
                     args.max_hold_bars, args.cost_bps, extra_params, result)
@@ -311,7 +321,8 @@ def main():
     else:
         for block in sorted(events["entry_hour_block"].unique()):
             sliced = events[events["entry_hour_block"] == block]
-            result = run_event_study(sliced, cost_bps=args.cost_bps, direction_col="event_type")
+            result = run_event_study(sliced, cost_bps=args.cost_bps, direction_col="event_type",
+                                      ticker=args.ticker, news_blackout=news_blackout)
             log_run(args.ticker, f"{args.interval}->{args.resample or args.interval}", args.period, args.provider,
                     f"Judas Swing (gap-tagged, stop/target/BE exit) — entry {block}",
                     args.max_hold_bars, args.cost_bps, extra_params, result)
@@ -326,7 +337,8 @@ def main():
         print("  (no session-close trades this run — nothing to report)")
     else:
         sc_events = events[sc_mask]
-        result = run_event_study(sc_events, cost_bps=args.cost_bps, direction_col="event_type")
+        result = run_event_study(sc_events, cost_bps=args.cost_bps, direction_col="event_type",
+                                  ticker=args.ticker, news_blackout=news_blackout)
         log_run(args.ticker, f"{args.interval}->{args.resample or args.interval}", args.period, args.provider,
                 "Judas Swing (gap-tagged, stop/target/BE exit) — session-close forced trades",
                 args.max_hold_bars, args.cost_bps, extra_params, result)
