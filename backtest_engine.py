@@ -18,6 +18,7 @@ from datetime import time as dtime
 from pathlib import Path
 
 from data import get_yf_ohlcv, resample_ohlc
+from news import blackout_mask
 from recommender import backtest_custom_rule, rule_describe
 
 DB_PATH = Path(__file__).parent / "backtest_results.db"
@@ -54,6 +55,7 @@ _RESULTS_EXTRA_COLUMNS = {
     "min_stop_abs": "REAL", "max_trades_per_session": "INTEGER",
     "entry_zone_point": "REAL", "exit_zone_point": "REAL", "stop_zone_point": "REAL",
     "max_scan_bars": "INTEGER", "cost_pct": "REAL", "avg_net_r": "REAL", "rule_json": "TEXT",
+    "news_blackout_label": "TEXT",
 }
 
 
@@ -86,6 +88,11 @@ def _connect():
 def _session_label(req):
     s = req.get("session")
     return f"{s['start']}-{s['end']}" if s else "None"
+
+
+def _news_blackout_label(req):
+    nb = req.get("news_blackout")
+    return f"±{nb['minutes_before']}/{nb['minutes_after']}min" if nb else "None"
 
 
 def build_combos(req):
@@ -210,6 +217,13 @@ def start_sweep(req, script_ctx=None):
                     if conf["resample"] and not df.empty:
                         df = resample_ohlc(df, conf["resample"])
                     df = df.tail(req["bar_cap"])
+                    nb = req.get("news_blackout")
+                    # Computed per ticker/timeframe (not once for the whole
+                    # sweep like `session`) — unlike a time-of-day window,
+                    # which currency's news counts depends on the ticker
+                    # itself, and the event times have to be resolved
+                    # against THIS df's own actual bar range.
+                    nb_mask = blackout_mask(df.index, ticker, nb["minutes_before"], nb["minutes_after"]) if nb else None
                     for direction, entry_rule, exit_rule, stop_rule in combos:
                         if job["cancel"]:
                             break
@@ -220,6 +234,7 @@ def start_sweep(req, script_ctx=None):
                             max_trades_per_session=req.get("max_trades_per_session"),
                             max_scan_bars=req.get("max_scan_bars", 500),
                             cost_pct=req.get("cost_pct"),
+                            news_blackout_mask=nb_mask,
                         )
                         avg_rr = None
                         if r["trades"]:
@@ -241,15 +256,17 @@ def start_sweep(req, script_ctx=None):
                             "INSERT INTO results (run_id, requested_at, ticker, timeframe, direction, entry, "
                             "exit_rule, stop, n_trades, wins, win_rate, avg_rr, bars_used, session_label, "
                             "min_rr, min_stop_pct, min_stop_abs, max_trades_per_session, entry_zone_point, "
-                            "exit_zone_point, stop_zone_point, max_scan_bars, cost_pct, avg_net_r, rule_json) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "exit_zone_point, stop_zone_point, max_scan_bars, cost_pct, avg_net_r, rule_json, "
+                            "news_blackout_label) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (run_id, job["started"], ticker, tf_label, direction,
                              rule_describe(entry_rule), rule_describe(exit_rule), rule_describe(stop_rule),
                              r["n"], r["wins"], r["win_rate"], avg_rr, len(df), _session_label(req),
                              req.get("min_rr"), req.get("min_stop_pct"), req.get("min_stop_abs"),
                              req.get("max_trades_per_session"), entry_rule.get("zone_point"),
                              exit_rule.get("zone_point"), stop_rule.get("zone_point"),
-                             req.get("max_scan_bars", 500), req.get("cost_pct"), r.get("avg_net_r"), rule_json),
+                             req.get("max_scan_bars", 500), req.get("cost_pct"), r.get("avg_net_r"), rule_json,
+                             _news_blackout_label(req)),
                         )
                         job["done"] += 1
                         job["elapsed"] = time.time() - job["started"]
@@ -281,7 +298,7 @@ def cancel_sweep(run_id):
 
 
 def load_results(ticker=None, timeframe=None, direction=None, session_label=None,
-                  min_n_trades=1, limit=20000):
+                  news_blackout_label=None, min_n_trades=1, limit=20000):
     conn = _connect()
     conn.row_factory = sqlite3.Row
     q = "SELECT * FROM results WHERE n_trades >= ?"
@@ -294,6 +311,8 @@ def load_results(ticker=None, timeframe=None, direction=None, session_label=None
         q += " AND direction = ?"; params.append(direction)
     if session_label:
         q += " AND session_label = ?"; params.append(session_label)
+    if news_blackout_label:
+        q += " AND news_blackout_label = ?"; params.append(news_blackout_label)
     q += " ORDER BY requested_at DESC LIMIT ?"
     params.append(limit)
     rows = [dict(r) for r in conn.execute(q, params)]
