@@ -1283,7 +1283,15 @@ def _confluence_body_lines(entity):
     _confluence_breakdown_md — this is only the on-chart headline
     number). Works for either a best_trade_now/scan_timeframes setup
     dict or an _active_scan_pick dict — both carry the same two field
-    names."""
+    names. A "Validated edge" sidebar pick (see validated_stats) carries
+    real permutation-test evidence instead of a confluence tally — a
+    stronger claim than confluence, so it's shown in place of the count
+    rather than alongside "0 confluences" (which this kind of pick
+    always has, having nothing to do with best_trade_now's scoring)."""
+    validated = entity.get("validated_stats")
+    if validated:
+        return [f"Validated: p={validated['p_value_train']:.4f}, n={validated['n_events']}, "
+                f"holdout {validated['mean_return_holdout']:+.2%}"]
     entry_n = len(entity.get("confluence_entry_details") or [])
     context_details = entity.get("confluence_context_details")
     if context_details:
@@ -1418,6 +1426,82 @@ def _rebalance_chain_overlays(chain, chart_edge_x, slice_seconds):
 # a result jumps the main ticker straight to it), not a second surface to
 # split attention with.
 with st.sidebar:
+    # The strongest tier of signal this page can show: unlike "Scan
+    # watchlist" below (confluence — several ICT reads agreeing, no
+    # statistical proof behind it), a "Validated edge" hit is backed by
+    # an actual permutation test that already cleared Benjamini-Hochberg
+    # correction across the WHOLE accumulated Experiments trial log and
+    # held up on untouched holdout data (see experiments.py's own
+    # run_deep_backtest/load_experiment_trials) — the same bar Edge Lab
+    # used to hold before its own trial-running code went missing.
+    # list_validated_pairs reads that log directly rather than a
+    # hardcoded ticker/timeframe list, so this grows on its own as more
+    # Experiments tab backtests get run and survive correction, with
+    # nothing to maintain here.
+    st.subheader("🔬 Validated edge")
+    if st.button("🔬 Scan for validated setups", key="validated_scan_btn", width="stretch",
+                 help="Checks every ticker/timeframe on this watchlist that has ever cleared a real "
+                      "permutation test (Experiments tab \"Run deep backtest\", BH-corrected across "
+                      "everything ever tried) for a signal that's live right now — not just confluence, "
+                      "actual statistical evidence. Usually empty; that's honest, not broken."):
+        _val_pairs = experiments.list_validated_pairs(TICKER_UNIVERSE)
+        _val_specs = [(get_yf_ohlcv, (t, TIMEFRAMES[tf]["period"], TIMEFRAMES[tf]["fetch_interval"],
+                                       _prefetch_data_source), {}) for t, tf in _val_pairs]
+        _prefetch(_val_specs)
+        _val_hits = []
+        for _val_ticker, _val_tf in _val_pairs:
+            _val_conf = TIMEFRAMES[_val_tf]
+            try:
+                _val_df = get_yf_ohlcv(_val_ticker, period=_val_conf["period"], interval=_val_conf["fetch_interval"],
+                                        provider=_prefetch_data_source)
+                if _val_conf["resample"] and not _val_df.empty:
+                    _val_df = resample_ohlc(_val_df, _val_conf["resample"])
+                _val_hit = experiments.find_live_validated_signal(_val_df, _val_ticker, _val_tf)
+            except Exception:
+                _val_hit = None
+            if _val_hit:
+                _val_hits.append(_val_hit)
+        st.session_state["_validated_scan"] = _val_hits
+        st.session_state["_validated_scan_checked"] = len(_val_pairs)
+
+    _val_results = st.session_state.get("_validated_scan")
+    if _val_results is None:
+        st.caption("Not scanned yet this session.")
+    elif not _val_results:
+        _val_n_checked = st.session_state.get("_validated_scan_checked", 0)
+        if _val_n_checked == 0:
+            st.caption("Nothing on this watchlist has cleared a validated Experiments backtest yet — "
+                       "run \"Run deep backtest\" in a chart's own 🧪 Experiments tab to build one.")
+        else:
+            st.caption(f"Scanned {_val_n_checked} validated ticker/timeframe combo(s) — nothing live right now.")
+    else:
+        for _v in _val_results:
+            _v_label = f"{_v['ticker']} · {_v['tf_label']} · {_v['label']} ({_v['direction']})"
+            _v_help = (f"p={_v['p_value_train']:.4f} on train · train mean {_v['mean_return_train']:+.3%} · "
+                       f"holdout mean {_v['mean_return_holdout']:+.3%} (same direction, {_v['n_events']} events, "
+                       f"touched {_v['bars_since_touch']} bar(s) ago). Target line is a PROJECTION of the "
+                       f"historical holdout mean move, not a real take-profit — this edge actually exits after "
+                       f"{_v['forward_bars']} bars, not at a price level.")
+            if st.button(_v_label, key=f"val_jump_{_v['ticker']}_{_v['tf_label']}_{_v['entry_time']}",
+                         width="stretch", help=_v_help):
+                st.session_state["fvg_ticker"] = _v["ticker"]
+                st.session_state[TF_KEY_BY_CHART["main"]] = _v["tf_label"]
+                st.session_state["_active_scan_pick"] = {
+                    "ticker": _v["ticker"], "timeframe": _v["tf_label"], "direction": _v["direction"],
+                    "entry": _v["entry_price"], "stop": _v["stop_price"], "target": _v["target_price"],
+                    "label": f"Validated: {_v['label']}",
+                    "context_timeframe": None,
+                    "source_zone": {"start": _v["zone_start"], "end": None,
+                                     "top": _v["zone_top"], "bottom": _v["zone_bottom"]},
+                    "confluence_entry_details": [], "confluence_context_details": [],
+                    "validated_stats": {"p_value_train": _v["p_value_train"], "n_events": _v["n_events"],
+                                         "mean_return_holdout": _v["mean_return_holdout"]},
+                }
+                st.session_state["_scan_pick_locked"] = False
+                st.session_state.pop("_active_chart_rule", None)
+                st.rerun()
+
+    st.divider()
     st.subheader("🎯 Signals")
     # Explanations live in each button's own hover (help=), not as a
     # standing caption -- direct request: don't put explanatory text in my

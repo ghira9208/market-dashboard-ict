@@ -104,31 +104,31 @@ def _zone_reaction(df, zone, reaction_window, reaction_mult, atr, close_arr, pos
     return {"qualifies": bool(qualifies), "direction": direction, "touch_pos": touch_pos}
 
 
-@st.cache_data(ttl=_CACHE_TTL)
-def build_experiment_events(df, detector_name, min_volatility_pctile, reaction_window,
-                             reaction_mult, forward_bars, max_scan_bars=2000):
-    """events_df (entry_time, raw_return, direction) — the exact shape
-    research/evidence.run_event_study expects. Built by filtering EVERY
-    historical zone this detector found (over whatever history `df`
-    covers — switch the chart's own period/timeframe for more) down to
-    the ones that both got a sharp, fast reaction AND fired while the
-    volatility regime was at or above min_volatility_pctile at the
-    moment of that reaction. raw_return is the ACTUAL forward return
-    over forward_bars bars from the touch — never adjusted, never
-    assumed."""
+def _qualifying_touches(df, detector_name, min_volatility_pctile, reaction_window, reaction_mult,
+                         max_scan_bars=2000):
+    """Every historical zone touch (this detector, over whatever history
+    df covers) that got a sharp, fast reaction AND fired while the
+    volatility regime was at or above min_volatility_pctile — the shared
+    entry-criteria filter behind both build_experiment_events (which
+    additionally requires the trade's own forward_bars exit to already
+    exist in df, to compute a real backtested return) and
+    find_live_validated_signal (which doesn't — a signal that's live
+    right now by definition hasn't exited yet). Returns a list of dicts
+    (touch_pos, direction, zone_top, zone_bottom, zone_start), in
+    whatever order the detector found the zones — callers sort by
+    touch_pos themselves if order matters."""
     detect_fn = DETECTOR_FNS[detector_name]
     zones = detect_fn(df, max_scan_bars=max_scan_bars, record_history=True)
     if not zones:
-        return pd.DataFrame(columns=["entry_time", "raw_return", "direction"])
+        return []
 
     vol_pctile = volatility_percentile(df)
     atr = atr_series(df)
     close = (df["Close"] if "Close" in df else df["close"])
     close_arr = close.to_numpy()
-    n = len(df)
     pos_by_time = {t: i for i, t in enumerate(df.index)}
 
-    rows = []
+    touches = []
     for zone in zones:
         reaction = _zone_reaction(df, zone, reaction_window, reaction_mult, atr, close_arr, pos_by_time)
         if reaction is None or not reaction["qualifies"]:
@@ -137,13 +137,45 @@ def build_experiment_events(df, detector_name, min_volatility_pctile, reaction_w
         vp = vol_pctile.iloc[touch_pos]
         if pd.isna(vp) or vp < min_volatility_pctile:
             continue
+        touches.append({"touch_pos": touch_pos, "direction": reaction["direction"],
+                         "zone_top": zone["top"], "zone_bottom": zone["bottom"], "zone_start": zone["start"]})
+    return touches
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def build_experiment_events(df, detector_name, min_volatility_pctile, reaction_window,
+                             reaction_mult, forward_bars, max_scan_bars=2000):
+    """events_df (entry_time, raw_return, direction, plus the triggering
+    zone's own top/bottom/start — carried through for find_live_validated_
+    signal's own stop-price lookup, unused by research/evidence.run_event_study
+    which only reads entry_time/raw_return/direction). Built by filtering
+    EVERY historical zone this detector found (over whatever history `df`
+    covers — switch the chart's own period/timeframe for more) down to
+    the ones that both got a sharp, fast reaction AND fired while the
+    volatility regime was at or above min_volatility_pctile at the
+    moment of that reaction. raw_return is the ACTUAL forward return
+    over forward_bars bars from the touch — never adjusted, never
+    assumed."""
+    touches = _qualifying_touches(df, detector_name, min_volatility_pctile, reaction_window,
+                                   reaction_mult, max_scan_bars)
+    cols = ["entry_time", "raw_return", "direction", "zone_top", "zone_bottom", "zone_start"]
+    if not touches:
+        return pd.DataFrame(columns=cols)
+
+    close = (df["Close"] if "Close" in df else df["close"])
+    close_arr = close.to_numpy()
+    n = len(df)
+
+    rows = []
+    for t in touches:
+        touch_pos = t["touch_pos"]
         exit_pos = touch_pos + forward_bars
         if exit_pos >= n:
             continue
         fwd_return = float((close_arr[exit_pos] - close_arr[touch_pos]) / close_arr[touch_pos])
-        rows.append({"entry_time": df.index[touch_pos], "raw_return": fwd_return,
-                     "direction": reaction["direction"]})
-    return pd.DataFrame(rows)
+        rows.append({"entry_time": df.index[touch_pos], "raw_return": fwd_return, "direction": t["direction"],
+                     "zone_top": t["zone_top"], "zone_bottom": t["zone_bottom"], "zone_start": t["zone_start"]})
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
 def preview_stats(events_df, cost_bps=10.0):
@@ -253,3 +285,80 @@ def load_experiment_trials():
             & df.loc[scored.index, "same_sign"].fillna(False)
         )
     return df.sort_values("logged_at", ascending=False).reset_index(drop=True)
+
+
+def list_validated_pairs(tickers):
+    """Every (ticker, tf_label) combo among `tickers` that currently has
+    at least one BH-corrected, same-sign-confirmed validated trial in the
+    accumulated experiment log — drives the sidebar's "Validated edge"
+    scan so it only ever checks combos that have actually earned the
+    right to be checked live, instead of a hardcoded guess at which
+    ticker/timeframe pairs might matter. Grows on its own as more
+    Experiments tab backtests get run and survive correction — nothing
+    to maintain by hand. Empty list when nothing's survived yet for any
+    of these tickers, the honest default most of the time."""
+    trials = load_experiment_trials()
+    if trials.empty:
+        return []
+    survived = trials[(trials.get("survived", False) == True) & (trials["ticker"].isin(tickers))]
+    return sorted(set(zip(survived["ticker"], survived["tf_label"])))
+
+
+def find_live_validated_signal(df, ticker, tf_label):
+    """Checks whether any of this (ticker, tf_label)'s own BH-corrected,
+    same-sign-confirmed validated experiments (see load_experiment_trials)
+    has a signal that's LIVE right now on df — touched recently enough
+    that this trial's own forward_bars hold hasn't finished yet. Same
+    entry criteria as the Experiments tab's own "Run deep backtest"
+    button (_qualifying_touches), just checked against the most recent
+    bars instead of replayed across the full history — the live-scan
+    counterpart to that manual check, driving the sidebar instead.
+
+    Checks the STRONGEST validated trial for this ticker+timeframe first
+    (lowest train p-value) and returns the first one with a live touch.
+    None when nothing's validated yet for this exact ticker+timeframe, or
+    nothing's live right now — the normal case, most of the time, for
+    most tickers. An honest empty result, not an error.
+
+    The returned target_price is a PROJECTION of the historical holdout
+    mean return, not a real take-profit level — this kind of edge exits
+    by TIME (forward_bars), not by price reaching anywhere specific.
+    Callers must label it as such rather than presenting it as a hard
+    target the way a zone-edge stop genuinely is."""
+    trials = load_experiment_trials()
+    if trials.empty or df.empty:
+        return None
+    matches = trials[(trials["ticker"] == ticker) & (trials["tf_label"] == tf_label)
+                      & (trials.get("survived", False) == True)]
+    if matches.empty:
+        return None
+    matches = matches.sort_values("p_value_train")
+    n = len(df)
+    close = (df["Close"] if "Close" in df else df["close"])
+    close_arr = close.to_numpy()
+
+    for _, trial in matches.iterrows():
+        settings = trial["settings"]
+        touches = _qualifying_touches(df, settings["detector"], settings["min_volatility_pctile"],
+                                       settings["reaction_window"], settings["reaction_mult"])
+        if not touches:
+            continue
+        latest = max(touches, key=lambda t: t["touch_pos"])
+        bars_since = n - 1 - latest["touch_pos"]
+        if bars_since > settings["forward_bars"]:
+            continue  # already past this trial's own hold length -- no longer live
+        direction = latest["direction"]
+        entry_price = float(close_arr[latest["touch_pos"]])
+        stop_price = latest["zone_bottom"] if direction == "bullish" else latest["zone_top"]
+        sign = 1 if direction == "bullish" else -1
+        target_price = entry_price * (1 + sign * abs(trial["mean_return_holdout"]))
+        return {
+            "ticker": ticker, "tf_label": tf_label, "direction": direction,
+            "entry_price": entry_price, "stop_price": float(stop_price), "target_price": float(target_price),
+            "label": trial["label"], "p_value_train": trial["p_value_train"],
+            "mean_return_train": trial["mean_return_train"], "mean_return_holdout": trial["mean_return_holdout"],
+            "n_events": int(trial["n_events"]), "entry_time": df.index[latest["touch_pos"]],
+            "bars_since_touch": bars_since, "forward_bars": settings["forward_bars"],
+            "zone_start": latest["zone_start"], "zone_top": latest["zone_top"], "zone_bottom": latest["zone_bottom"],
+        }
+    return None
