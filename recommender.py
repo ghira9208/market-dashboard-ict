@@ -1743,6 +1743,64 @@ def resolve_rule(rule, df, current_price, max_scan_bars=None, origin_out=None, c
     return None
 
 
+def hold_resolved_trade(held, ctx_key, entry_rule, exit_rule, stop_rule, df, current_price):
+    """Resolves entry_rule/exit_rule/stop_rule against df/current_price
+    exactly like resolve_rule already does — but once resolved, HOLDS
+    that exact result fixed instead of re-resolving on every call, so a
+    trade drawn on a live-refreshing chart doesn't visibly reshuffle
+    every tick just because current_price nudged which zone counts as
+    "nearest" (resolve_rule's own side/n selection is current_price-
+    relative by design — that's correct for "what does this rule mean
+    right now," but wrong for "keep showing me the trade you already
+    found," which is what a chart re-rendering every 1-5s actually
+    needs).
+
+    held: whatever this function returned last time (None on first
+    call, or once the caller's own ctx_key changes). ctx_key: caller-
+    built identity for "is this still the same rule setup" (e.g.
+    ticker|timeframe|rule JSON) — a change here always forces a fresh
+    resolve; holding a stale price across an actual context switch
+    would be wrong, not stable.
+
+    A held trade is treated as a real position, not just a cached
+    number: once live, it stays exactly as first resolved until price
+    actually reaches its own stop or target — the same event that
+    would close a real trade (see research/signals.py's own active/
+    hit_tp/hit_sl status tracking) — only then does a new one resolve.
+    A combo where stop/target don't land on opposite, sane sides of
+    entry can't be tracked as a real trade at all, so it's re-resolved
+    on every call instead of held — matches backtest_custom_rule's own
+    "stop < entry < target for a long" sanity check.
+
+    Returns (new_held_or_None, entry_price, exit_price, stop_price) —
+    the caller is responsible for persisting new_held for next time."""
+    def _resolve_fresh():
+        entry = resolve_rule(entry_rule, df, current_price)
+        exit_ = resolve_rule(exit_rule, df, current_price)
+        stop = resolve_rule(stop_rule, df, current_price)
+        if entry is None or exit_ is None or stop is None:
+            return None, entry, exit_, stop
+        if stop < entry < exit_:
+            direction = "bullish"
+        elif exit_ < entry < stop:
+            direction = "bearish"
+        else:
+            return None, entry, exit_, stop
+        return ({"key": ctx_key, "entry": entry, "exit": exit_, "stop": stop, "direction": direction},
+                entry, exit_, stop)
+
+    if held is None or held.get("key") != ctx_key:
+        return _resolve_fresh()
+
+    if held["direction"] == "bullish":
+        invalidated = current_price <= held["stop"] or current_price >= held["exit"]
+    else:
+        invalidated = current_price >= held["stop"] or current_price <= held["exit"]
+    if invalidated:
+        return _resolve_fresh()
+    return held, held["entry"], held["exit"], held["stop"]
+
+
 def backtest_custom_rule(df, entry_rule, exit_rule, stop_rule, max_signals=100, max_scan_bars=500,
                           session=None, min_rr=None, min_stop_pct=None, min_stop_abs=None,
                           max_trades_per_session=None, cost_pct=None, news_blackout_mask=None):

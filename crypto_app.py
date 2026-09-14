@@ -14,11 +14,13 @@ import threading
 import time
 from datetime import time as dtime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 import backtest_ui
+import experiments
 import footprint
 import news
 import theme
@@ -55,6 +57,7 @@ from recommender import (
     best_trade_now,
     fvg_event_win_rate,
     fvg_run_up_stats,
+    hold_resolved_trade,
     liquidity_event_win_rate,
     ma_fvg_event_win_rate,
     ma_fvg_starts,
@@ -3016,9 +3019,25 @@ with main_col:
             if _scan_pick_active:
                 _entry_price, _stop_price, _exit_price = _scan_pick["entry"], _scan_pick["stop"], _scan_pick["target"]
             else:
-                _entry_price = resolve_rule(_entry_rule, df, current_price)
-                _exit_price = resolve_rule(_exit_rule, df, current_price)
-                _stop_price = resolve_rule(_stop_rule, df, current_price)
+                # Held, not re-resolved every tick: this fragment reruns
+                # every 1-5s, and resolve_rule's own "nth-nearest zone"
+                # selection is current_price-relative — as live price
+                # nudges a few ticks, "nearest FVG below price" can flip
+                # to a different zone entirely, making the rendered
+                # trade box visibly reshuffle for no reason tied to the
+                # setup itself. Direct request: hold the currently
+                # detected trade fixed on the chart instead of letting
+                # it move around as price updates. See
+                # recommender.hold_resolved_trade's own docstring — it
+                # only re-resolves once this exact trade is actually
+                # invalidated (price reaches its own stop or target) or
+                # the ticker/timeframe/rule itself changes.
+                _rule_ctx_key = (f"{ticker}|{tf_label}|{json.dumps(_entry_rule, sort_keys=True)}|"
+                                  f"{json.dumps(_exit_rule, sort_keys=True)}|{json.dumps(_stop_rule, sort_keys=True)}")
+                _held_trade, _entry_price, _exit_price, _stop_price = hold_resolved_trade(
+                    st.session_state.get("_held_chart_trade"), _rule_ctx_key,
+                    _entry_rule, _exit_rule, _stop_rule, df, current_price)
+                st.session_state["_held_chart_trade"] = _held_trade
 
             # Entry/SL/TP come from the Strategy tab's own rule by default —
             # the old Automatic mode (trusting best_trade_now's own
@@ -4420,6 +4439,7 @@ with main_col:
                 _detail_tabs.append((f"🔍 Naked POC ({len(naked_poc_rows)})", "naked_poc"))
             if _vp is not None:
                 _detail_tabs.append((f"🔍 Volume Profile — {_vp['shape_label']}", "volume_profile"))
+            _detail_tabs.append(("🧪 Experiments", "experiments"))
 
             def _render_detail_body(_key):
                 if _key == "legend":
@@ -4637,6 +4657,117 @@ with main_col:
                         })
                     else:
                         st.caption("No distinct HVN/LVN cleared the prominence filter on this profile.")
+
+                elif _key == "experiments":
+                    # The actual thesis, stated directly rather than
+                    # inferred: trade sharp, fast reactions off known
+                    # zones, but only when there's enough volatility to
+                    # deliver the move — a consolidating range gives a
+                    # reaction nothing to travel INTO. Settings below are
+                    # tuned live against this chart's own currently-
+                    # loaded history (switch timeframe/period for more);
+                    # "Run deep backtest" is the one number here that's
+                    # actually been permutation-tested — everything above
+                    # it is fast feedback for tuning, not proof.
+                    tiny("Trade sharp, fast reactions off known zones — but only when there's enough "
+                         "volatility to actually deliver the move. Settings below run live against "
+                         "this chart's own currently-loaded history. 'Run deep backtest' is the real "
+                         "test (permutation test + holdout split); the numbers above it are just fast "
+                         "feedback for tuning, not proof of anything on their own.")
+                    _exp_c1, _exp_c2 = st.columns(2)
+                    with _exp_c1:
+                        _exp_detector = st.selectbox("Detector", list(experiments.DETECTOR_FNS.keys()),
+                                                      key=f"exp_detector_{ticker}")
+                        _exp_min_vol = st.slider(
+                            "Min volatility percentile", 0.0, 1.0, 0.5, step=0.05,
+                            key=f"exp_minvol_{ticker}",
+                            help="0 = any regime, including consolidation. Higher means this only "
+                                 "fires when the instrument is more volatile than its own recent norm "
+                                 "right now — the whole point being to skip quiet, range-bound stretches.")
+                        _exp_forward = st.number_input(
+                            "Holding period (bars)", 1, 50, 5, key=f"exp_fwd_{ticker}",
+                            help="How many bars forward the outcome is measured over — kept short on "
+                                 "purpose ('in and out fast', not a multi-hour hold).")
+                    with _exp_c2:
+                        _exp_window = st.number_input(
+                            "Reaction window (bars)", 1, 10, 2, key=f"exp_window_{ticker}",
+                            help="How many bars after first touching the zone the reaction has to "
+                                 "happen within to count as fast.")
+                        _exp_mult = st.number_input(
+                            "Reaction strength (× ATR)", 0.1, 5.0, 1.0, step=0.1, key=f"exp_mult_{ticker}",
+                            help="How far price has to move away from the zone, in multiples of this "
+                                 "instrument's own ATR, to count as a real reaction rather than a slow "
+                                 "grind through it.")
+
+                    _exp_events = experiments.build_experiment_events(
+                        df, _exp_detector, _exp_min_vol, _exp_window, _exp_mult, _exp_forward)
+                    _exp_stats = experiments.preview_stats(_exp_events)
+
+                    if _exp_stats["n"] == 0:
+                        st.caption("No qualifying setups with these settings on this chart's own loaded "
+                                   "history — try loosening the volatility or reaction requirements, or "
+                                   "switch to a longer timeframe/period for more history to search.")
+                    else:
+                        _exp_m1, _exp_m2, _exp_m3 = st.columns(3)
+                        _exp_m1.metric("Qualifying setups", _exp_stats["n"])
+                        _exp_m2.metric("Win rate (quick check)", f"{_exp_stats['win_rate']:.0%}")
+                        _exp_m3.metric("Mean return (quick check)", f"{_exp_stats['mean_return']:+.3%}")
+
+                        _exp_price_by_time = dict(zip(df.index, df[c_col].to_numpy()))
+                        _exp_points = _exp_events.copy()
+                        _exp_points["price"] = _exp_points["entry_time"].map(_exp_price_by_time)
+                        _exp_chart_df = pd.DataFrame({"time": df.index, "close": df[c_col].to_numpy()})
+                        _exp_base = alt.Chart(_exp_chart_df).mark_line(
+                            color=theme.NEON_CYAN, opacity=0.6
+                        ).encode(x="time:T", y=alt.Y("close:Q", scale=alt.Scale(zero=False), title=None))
+                        _exp_marks = alt.Chart(_exp_points).mark_circle(size=90).encode(
+                            x="entry_time:T", y="price:Q",
+                            color=alt.Color("direction:N", scale=alt.Scale(
+                                domain=["bullish", "bearish"],
+                                range=[theme.NEON_GREEN, theme.NEON_MAGENTA]), legend=None),
+                            tooltip=["entry_time:T", "direction:N", "raw_return:Q"])
+                        st.altair_chart((_exp_base + _exp_marks).properties(height=280), width="stretch")
+
+                    if st.button("🔬 Run deep backtest", key=f"exp_run_{ticker}"):
+                        _exp_settings = {"detector": _exp_detector, "min_volatility_pctile": _exp_min_vol,
+                                          "reaction_window": _exp_window, "reaction_mult": _exp_mult,
+                                          "forward_bars": _exp_forward}
+                        with st.spinner("Running permutation test..."):
+                            _exp_trial = experiments.run_deep_backtest(ticker, tf_label, _exp_events, _exp_settings)
+                        if _exp_trial["verdict"] == "INSUFFICIENT_DATA":
+                            st.warning(f"Only {_exp_trial['n_events']} qualifying setups — need at least "
+                                       "30 to run a real test. Loosen the settings or load more history.")
+                        else:
+                            _exp_same = _exp_trial["same_sign"]
+                            _exp_passed = _exp_trial["holdout_verdict"] == "PASSED"
+                            if _exp_passed and _exp_same:
+                                st.success(
+                                    f"Train p={_exp_trial['p_value_train']:.4f}, mean="
+                                    f"{_exp_trial['mean_return_train']:+.3%} · Holdout mean="
+                                    f"{_exp_trial['mean_return_holdout']:+.3%} — passed, same direction "
+                                    "on both splits. Still just one trial; see the log below for the "
+                                    "corrected view across everything ever tried.")
+                            else:
+                                st.warning(
+                                    f"Train p={_exp_trial['p_value_train']:.4f}, mean="
+                                    f"{_exp_trial['mean_return_train']:+.3%} · Holdout mean="
+                                    f"{_exp_trial.get('mean_return_holdout', float('nan')):+.3%} "
+                                    f"({_exp_trial['holdout_verdict']}"
+                                    f"{', opposite sign from train' if not _exp_same else ''}) — "
+                                    "didn't hold up out of sample.")
+
+                    _exp_hist = experiments.load_experiment_trials()
+                    if not _exp_hist.empty:
+                        with st.expander(f"Every experiment ever run ({len(_exp_hist)}) — BH-corrected"):
+                            _exp_scored = _exp_hist[_exp_hist["verdict"] == "SCORED"]
+                            if _exp_scored.empty:
+                                st.caption("Nothing scored yet — every run so far had too little data.")
+                            else:
+                                st.dataframe(
+                                    _exp_scored[["logged_at", "ticker", "label", "n_events",
+                                                 "mean_return_train", "p_value_train", "q_value_train",
+                                                 "holdout_verdict", "survived"]],
+                                    hide_index=True, width="stretch")
 
             if len(_detail_tabs) == 1:
                 _only_label, _only_key = _detail_tabs[0]
