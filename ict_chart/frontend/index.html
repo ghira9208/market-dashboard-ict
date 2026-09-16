@@ -60,18 +60,6 @@
   }
   #measureBtn:hover { background: rgba(10,132,255,0.12); }
   #measureBtn.active { background: rgba(10,132,255,0.35); color: #1c1c1e; font-weight: 700; }
-  /* Sits at the bottom-left of the plot area — the actual time/price axis
-     intersection now that rightPriceScale is off and price labels only
-     ever render on the left. Pure client-side toggle, no round-trip to
-     Streamlit, matching how #fitBtn already behaves. */
-  #scaleBtn {
-    position: absolute; bottom: 26px; left: 8px; z-index: 10;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
-    font-variant-numeric: tabular-nums; font-size: 0.65rem;
-    color: #98989d; background: rgba(28,28,30,0.75); border: 1px solid rgba(10,132,255,0.25);
-    border-radius: 8px; padding: 2px 7px; cursor: pointer; user-select: none;
-  }
-  #scaleBtn:hover { color: #0A84FF; background: rgba(10,132,255,0.12); }
   /* TradingView-style readout pinned to the chart's own top-left corner,
      instead of a separate Streamlit-rendered line above the chart. */
   #ohlcOverlay {
@@ -121,7 +109,6 @@
 <div id="countdownOverlay"></div>
 <button id="fitBtn" title="Fit all loaded data">⤢ Fit</button>
 <button id="measureBtn" title="Click two points on a candle to measure price/%/bars between them. Right-click the chart to clear, or click Measure again to turn it off and clear.">📏 Measure</button>
-<button id="scaleBtn" title="Toggle log/arithmetic price scale">LOG</button>
 <script>
 window.__ictDebug = { errors: [] };
 window.addEventListener('error', (e) => {
@@ -622,21 +609,21 @@ document.getElementById('fitBtn').addEventListener('click', () => {
   }
 });
 
-// Pure client-side toggle, deliberately never re-driven from Python after
-// first mount — every Streamlit rerun (a TF click, a layer checkbox) would
-// otherwise stomp the user's choice back to the server-sent default on
-// every single interaction. isLogScale tracks the true current state;
-// handleRender only seeds it once, on a genuine full reload.
+// Authoritative from Python now (a real "Log scale" checkbox next to Show
+// volume, persisted in _chart_controls/session_state) — NOT a client-only
+// toggle anymore. That earlier design (a corner button, never re-driven
+// from Python after first mount) broke down for any chart whose fingerprint
+// changes on every rerun by construction — bar replay's own fingerprint
+// embeds the current step index, so every step was a "genuine full reload"
+// that silently reset the button's own local choice back to whatever
+// Python's hardcoded default was, with no way for the user to tell why.
+// Single source of truth now: Python always sends the CURRENT setting, so
+// resetting isLogScale from it on every full reload is simply correct,
+// not something to protect a local click from.
 let isLogScale = false;
-const scaleBtn = document.getElementById('scaleBtn');
 function applyScaleMode() {
   candleSeries.priceScale().applyOptions({ mode: isLogScale ? 1 : 0 });
-  scaleBtn.textContent = isLogScale ? 'LOG' : 'ARITH';
 }
-scaleBtn.addEventListener('click', () => {
-  isLogScale = !isLogScale;
-  applyScaleMode();
-});
 
 /* ---------------------------------------------------------------------
  * Rectangle primitive — FVG / Order Block / liquidity-reaction zones.
@@ -1992,14 +1979,13 @@ function handleRender(args) {
   // panels, the no-data path), matching their existing behavior exactly.
   const effectiveFullReload = pythonSaysFullReload !== undefined ? pythonSaysFullReload : isFullReload;
 
-  // Only seed from Python's default on an actual new dataset — otherwise
-  // this would stomp the user's own corner-button clicks back to
-  // arithmetic on every unrelated Streamlit rerun (a TF click, a layer
-  // checkbox), since args.options.log_scale never changes on the Python
-  // side once the sidebar checkbox was removed in favor of this toggle.
-  if (isFullReload) {
-    isLogScale = !!(options && options.log_scale);
-  }
+  // Synced on EVERY render now, not gated to full reloads — Python is the
+  // single source of truth (a real checkbox, see app.py's "Log scale"),
+  // and toggling that checkbox is itself just a normal rerun with the
+  // SAME fingerprint (no new data, so isFullReload is false for it) —
+  // gating this to full-reload-only would mean the checkbox visibly did
+  // nothing until the next unrelated full reload happened to come along.
+  isLogScale = !!(options && options.log_scale);
   applyScaleMode();
 
   // color/borderColor/wickColor are per-bar overrides (CandlestickSeries

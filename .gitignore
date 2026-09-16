@@ -18,3 +18,13 @@ research/.cache/
 .last_state*.json
 *.pre_fill_fix_backup_*.db
 *.pre_merge_stale_cleanup_*.db
+# Isolated venv for the cTrader Open API integration -- kept separate from
+# the main environment specifically because ctrader-open-api pulls in an
+# old protobuf (3.20.1) that conflicts with streamlit's own requirement
+# (>=5.26.1) -- confirmed directly, installing it system-wide downgraded
+# protobuf and would have broken every app on next restart.
+.venv_ctrader/
+# Live OAuth tokens, not a data log -- unlike the small accumulating
+# .cache/*.json history files this project deliberately tracks, this one
+# is a real, rotating credential (see ctrader_auth.py).
+.cache/ctrader_tokens.json

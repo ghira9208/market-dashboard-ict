@@ -44,7 +44,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from detectors import detect_breaker_blocks, detect_fvgs, detect_ifvgs, detect_order_blocks
+from detectors import (detect_breaker_blocks, detect_fvgs, detect_ifvgs, detect_liquidity_sweeps,
+                        detect_order_blocks, detect_swings)
 from edge_lab.multiple_testing import benjamini_hochberg
 from research.evidence import run_event_study
 
@@ -833,3 +834,1290 @@ def find_live_validated_signal(df, ticker, tf_label):
             "zone_start": latest["zone_start"], "zone_top": latest["zone_top"], "zone_bottom": latest["zone_bottom"],
         }
     return None
+
+
+# A genuinely different kind of bet from everything above: every prior
+# strategy in this module tests DIRECTION (did price go the way the rule
+# said). This one tests MAGNITUDE instead — does price move MORE around a
+# real catalyst (a high-impact news release) than a synthetic "straddle"
+# entered there would have cost to buy? A straddle (long a call + long a
+# put, same strike/expiry) pays off on a big move either way and loses
+# only if price sits still — so betting on magnitude sidesteps the
+# direction question every other strategy here already found no edge in.
+#
+# No real options data is used — this project has none. The premium a
+# straddle would have cost is approximated with the standard at-the-money
+# approximation, premium ≈ 0.8 × σ × √T (0.8 ≈ √(2/π)), using the
+# instrument's own TRAILING REALIZED volatility as σ. That's a
+# deliberately GENEROUS proxy for the buyer: real implied volatility
+# usually trades a bit richer than trailing realized vol (the well-
+# documented volatility risk premium — option sellers get paid for
+# bearing tail risk), so if this still comes up unprofitable against the
+# generous proxy, real options would likely have been worse, not better.
+def _rolling_realized_vol(close_arr, lookback_bars):
+    """Trailing per-bar return stdev at every bar, computed causally —
+    bar i's own value uses only returns up to and including bar i, never
+    later ones. Not annualized; run_vol_harvest_backtest scales it by
+    sqrt(forward_bars) itself, since both are already in the same
+    per-bar units."""
+    returns = np.diff(close_arr) / close_arr[:-1]
+    vol = pd.Series(returns).rolling(lookback_bars, min_periods=lookback_bars).std()
+    out = np.full(len(close_arr), np.nan)
+    out[1:] = vol.to_numpy()
+    return out
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def build_vol_harvest_events(df, ticker, forward_bars, vol_lookback_bars=100):
+    """One row per bar (not just at catalysts — the non-catalyst bars ARE
+    this test's own baseline population, see run_vol_harvest_backtest):
+    realized_move (the |return| over forward_bars from that bar — what a
+    straddle entered there would have needed to clear), premium_est (the
+    ATM straddle premium estimate at that bar, as a fraction of price),
+    and is_catalyst (True at the bar a High-impact news event for
+    ticker's own relevant currencies lands on or just after). ticker
+    having no curated currency mapping (news.ticker_currencies) leaves
+    is_catalyst all False — an honest no-op, not a full exclusion, same
+    convention news.py documents elsewhere."""
+    import news as _news
+
+    close = (df["Close"] if "Close" in df else df["close"])
+    close_arr = close.to_numpy()
+    n = len(df)
+    if n < vol_lookback_bars + forward_bars + 2:
+        return pd.DataFrame(columns=["entry_time", "realized_move", "premium_est", "is_catalyst"])
+
+    vol = _rolling_realized_vol(close_arr, vol_lookback_bars)
+    premium_est = 0.8 * vol * np.sqrt(forward_bars)
+
+    is_catalyst = np.zeros(n, dtype=bool)
+    currencies = _news.ticker_currencies(ticker)
+    if currencies:
+        idx_ny = df.index.tz_convert("America/New_York")
+        events = _news.high_impact_events_in_range(idx_ny.min(), idx_ny.max(), currencies=currencies)
+        if not events.empty:
+            pos_by_time = {t: i for i, t in enumerate(df.index)}
+            event_times = pd.DatetimeIndex(events["time"]).tz_convert(df.index.tz)
+            for et in event_times:
+                after = df.index[df.index >= et]
+                if len(after):
+                    is_catalyst[pos_by_time[after[0]]] = True
+
+    rows = []
+    for i in range(n):
+        exit_pos = i + forward_bars
+        if exit_pos >= n or np.isnan(premium_est[i]) or close_arr[i] <= 0:
+            continue
+        realized_move = abs(close_arr[exit_pos] - close_arr[i]) / close_arr[i]
+        rows.append({"entry_time": df.index[i], "realized_move": realized_move,
+                      "premium_est": float(premium_est[i]), "is_catalyst": bool(is_catalyst[i])})
+    return pd.DataFrame(rows)
+
+
+def run_vol_harvest_backtest(events_df, ticker, tf_label, forward_bars, n_permutations=2000,
+                              train_fraction=0.8, min_catalysts=15, label=None):
+    """events_df from build_vol_harvest_events (one ticker, or several
+    pooled together — every row's own premium_est already reflects that
+    row's own local vol, so pooling different instruments is fine, same
+    reasoning as the session-timing sweep's own pooling).
+
+    Hypothesis: mean(net_payoff) is HIGHER at catalyst bars than at
+    ordinary bars, where net_payoff = realized_move - premium_est —
+    i.e. news-driven moves are bigger than what the instrument's own
+    trailing volatility would have priced an ATM straddle at, not just
+    bigger in some absolute sense. Tested by permutation: repeatedly draw
+    a same-size random group of bars from the FULL pool (catalyst bars
+    included, matching how they'd be drawn from real data — this asks
+    "would a random group of bars this size ever score this high," not
+    "how do catalysts compare to non-catalysts specifically") and compare
+    the real catalyst group's own mean against that null.
+
+    Same discipline as every other builder here: 80/20 time split on the
+    catalyst events themselves, both train and holdout must independently
+    clear significance AND agree that net_payoff is positive (same_sign)
+    before this counts as anything. Logged through the same accumulating,
+    BH-corrected trial file (_append_trial/load_experiment_trials) as
+    every directional strategy — "how many things were tried" has to
+    include this test too, not a separate pool."""
+    if label is None:
+        label = f"VOL HARVEST fwd{forward_bars}b"
+    trial = {
+        "logged_at": pd.Timestamp.now("UTC").isoformat(), "ticker": ticker, "tf_label": tf_label,
+        "label": label, "settings": {"strategy": "vol_harvest", "forward_bars": forward_bars},
+    }
+    events_df = events_df.sort_values("entry_time").reset_index(drop=True)
+    catalysts = events_df[events_df["is_catalyst"]]
+    trial["n_events"] = int(len(catalysts))
+    if len(catalysts) < min_catalysts:
+        trial["verdict"] = "INSUFFICIENT_DATA"
+        _append_trial(trial)
+        return trial
+
+    cutoff_pos = int(len(catalysts) * train_fraction)
+    cutoff_time = catalysts["entry_time"].iloc[min(cutoff_pos, len(catalysts) - 1)]
+    train_catalysts = catalysts[catalysts["entry_time"] < cutoff_time]
+    holdout_catalysts = catalysts[catalysts["entry_time"] >= cutoff_time]
+    train_pool = events_df[events_df["entry_time"] < cutoff_time]["realized_move"] \
+        - events_df[events_df["entry_time"] < cutoff_time]["premium_est"]
+    holdout_pool = events_df[events_df["entry_time"] >= cutoff_time]["realized_move"] \
+        - events_df[events_df["entry_time"] >= cutoff_time]["premium_est"]
+
+    def _test_split(catalyst_sub, pool, tag):
+        n_cat = len(catalyst_sub)
+        if n_cat < min_catalysts // 2 or len(pool) <= n_cat:
+            return None
+        net = (catalyst_sub["realized_move"] - catalyst_sub["premium_est"]).to_numpy()
+        pool_arr = pool.to_numpy()
+        observed_mean = float(net.mean())
+        rng = np.random.default_rng(0)
+        null_means = np.empty(n_permutations)
+        for k in range(n_permutations):
+            sample = rng.choice(pool_arr, size=n_cat, replace=False)
+            null_means[k] = sample.mean()
+        p_value = float((null_means >= observed_mean).mean())
+        return {"n": n_cat, "mean_net_payoff": observed_mean, "p_value": p_value}
+
+    train_result = _test_split(train_catalysts, train_pool, "train")
+    holdout_result = _test_split(holdout_catalysts, holdout_pool, "holdout")
+    if train_result is None:
+        trial["verdict"] = "INSUFFICIENT_DATA"
+        _append_trial(trial)
+        return trial
+
+    trial.update({
+        "n_train": train_result["n"],
+        "n_holdout": holdout_result["n"] if holdout_result else 0,
+        "mean_return_train": train_result["mean_net_payoff"], "p_value_train": train_result["p_value"],
+        "mean_return_holdout": holdout_result["mean_net_payoff"] if holdout_result else None,
+        "holdout_verdict": ("PASSED" if holdout_result and holdout_result["p_value"] < 0.05
+                             and holdout_result["mean_net_payoff"] > 0 else "FAILED"),
+        "same_sign": bool(holdout_result and train_result["mean_net_payoff"] > 0
+                          and holdout_result["mean_net_payoff"] > 0),
+        "verdict": "SCORED",
+    })
+    _append_trial(trial)
+    return trial
+
+
+# A seventh strategy family, an explicit trading concept stated directly:
+# "a strong trend is the one which respects all future bullish/bearish
+# areas — the moment a gap is closed by a wick, even if trend goes up,
+# that's bearish signal. if candle breaks, that's true bearish."
+#
+# This maps onto fields detectors.py already tracks, not new detection
+# logic: a zone's own "filled"/"mitigated" is WICK-based (consequent
+# encroachment uses each bar's raw high/low, see detect_fvgs' own
+# comment) — a zone can go fully filled purely by wicks, with no candle
+# ever closing beyond it. detect_ifvgs/detect_breaker_blocks separately
+# require a CLOSE beyond the zone's own original bound to confirm an
+# inversion. So: filled but NOT inverted = "closed by a wick" (the
+# user's own bearish-even-in-an-uptrend warning); filled AND inverted =
+# "candle breaks" (already this project's own IFVG/Breaker Block
+# concept, tested on its own earlier — not duplicated here). Only
+# zones in the PREVAILING TREND'S OWN direction count (a bullish zone
+# during an uptrend, a bearish zone during a downtrend) — a violation
+# of a COUNTER-trend zone isn't the "strong trend weakening" signal
+# being described here at all.
+def _trend_at(fast_arr, slow_arr, pos):
+    if pos >= len(fast_arr) or np.isnan(fast_arr[pos]) or np.isnan(slow_arr[pos]):
+        return None
+    if fast_arr[pos] > slow_arr[pos]:
+        return "bullish"
+    if fast_arr[pos] < slow_arr[pos]:
+        return "bearish"
+    return None
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def build_trend_wick_violation_events(df, detector_name, forward_bars, ma_fast=20, ma_slow=50,
+                                       max_scan_bars=2000):
+    """events_df (entry_time, raw_return, direction) — same shape every
+    other builder here returns. direction is the SIGNAL's own direction
+    (opposite the prevailing trend — a wick violation of a bullish zone
+    during an uptrend is a BEARISH signal), not the trend's own.
+
+    Entry is the bar the zone actually goes fully filled (detectors.py's
+    own "end"/g["end"] — the bar the wick-based consequent-encroachment
+    scan already resolved as fully eaten) — the LAST bar whose data is
+    used to decide this qualifies (was it filled, did that same bar's own
+    close also break through). raw_return is measured forward from
+    THERE, never from the zone's own earlier start — same no-overlap
+    discipline as every builder above. One trade at a time (skip a
+    violation landing inside a still-open previous signal's own holding
+    window)."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close = (df["Close"] if "Close" in df else df["close"])
+    close_arr = close.to_numpy()
+    n = len(df)
+    if n < ma_slow + forward_bars + 2:
+        return pd.DataFrame(columns=cols)
+
+    from indicators import ema as _ema
+    fast_arr = _ema(close, ma_fast).to_numpy()
+    slow_arr = _ema(close, ma_slow).to_numpy()
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+
+    if detector_name == "FVG":
+        zones = detect_fvgs(df, max_scan_bars=max_scan_bars, record_history=True)
+        inversions = detect_ifvgs(df, max_scan_bars=max_scan_bars)
+        filled_key, zone_kind_key = "filled", "type"
+    else:
+        zones = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=True)
+        inversions = detect_breaker_blocks(df, max_scan_bars=max_scan_bars)
+        filled_key, zone_kind_key = "mitigated", "type"
+    inverted_origins = {inv["origin_start"] for inv in inversions}
+
+    violations = []
+    for zone in zones:
+        if not zone.get(filled_key):
+            continue
+        if zone["start"] in inverted_origins:
+            continue  # that same zone ALSO closed through -- its own IFVG/
+            # Breaker Block trial already covers it; this signal is
+            # specifically the wick-only case, not a duplicate of that one.
+        end_pos = pos_by_time.get(zone["end"])
+        if end_pos is None:
+            continue
+        trend = _trend_at(fast_arr, slow_arr, end_pos)
+        if trend is None or trend != zone[zone_kind_key]:
+            continue  # only a same-direction-as-trend zone counts
+        signal_direction = "bearish" if trend == "bullish" else "bullish"
+        violations.append((end_pos, signal_direction))
+
+    if not violations:
+        return pd.DataFrame(columns=cols)
+
+    violations = sorted(violations, key=lambda v: v[0])
+    rows = []
+    last_exit_pos = -1
+    for pos, direction in violations:
+        if pos <= last_exit_pos:
+            continue
+        exit_pos = pos + forward_bars
+        if exit_pos >= n:
+            continue
+        fwd_return = float((close_arr[exit_pos] - close_arr[pos]) / close_arr[pos])
+        rows.append({"entry_time": df.index[pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# An eighth strategy family, an explicit classic-ICT trade management
+# style, stated directly: "enter gap, stop below it, no target, just
+# stop moved below every new bullish/bearish area and never below the
+# slower moving average." Genuinely different in KIND from every
+# builder above — not a fixed forward_bars hold, a real path-dependent
+# trailing stop: enter on a same-direction-as-trend zone touch, initial
+# stop at that zone's own ORIGINAL far edge (before consequent
+# encroachment eats into it — raw_top/raw_bottom for FVG,
+# _formation_top/_formation_bottom for Order Blocks, detectors.py's own
+# two different names for the identical concept), then every bar:
+# ratchet the stop toward the newest same-direction zone's own far edge
+# once that's tighter than the current stop, and never let it sit
+# looser than the slow EMA (so the EFFECTIVE stop is
+# max(zone-trail, slow EMA) for a long, min(...) for a short) — a real
+# trend-follower's "cut losses short, let winners run," not a fixed R:R.
+#
+# A trade still open when df runs out is NOT counted — there's no
+# lookahead-safe way to know its real outcome, and fabricating a close
+# at some arbitrary bar cap would systematically UNDERSTATE exactly the
+# long, unbounded winners this style of stop exists to catch. That's
+# also why there's no max-hold parameter here at all, unlike every
+# fixed-horizon builder above.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_gap_trend_ride_events(df, detector_name, ma_fast=20, ma_slow=50, max_scan_bars=2000):
+    """events_df (entry_time, raw_return, direction) — same shape every
+    other builder here returns, raw_return now spanning a variable,
+    trade-specific holding period instead of a fixed bar count."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close = (df["Close"] if "Close" in df else df["close"])
+    close_arr = close.to_numpy()
+    n = len(df)
+    if n < ma_slow + 10:
+        return pd.DataFrame(columns=cols)
+
+    from indicators import ema as _ema
+    fast_arr = _ema(close, ma_fast).to_numpy()
+    slow_arr = _ema(close, ma_slow).to_numpy()
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+
+    if detector_name == "FVG":
+        zones = detect_fvgs(df, max_scan_bars=max_scan_bars, record_history=True)
+        top_key, bottom_key = "raw_top", "raw_bottom"
+    else:
+        zones = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=True)
+        top_key, bottom_key = "_formation_top", "_formation_bottom"
+
+    # Precompute, per bar, the tightest newly-CONFIRMED same-direction
+    # zone's own far edge — confirmed at zone["start"]'s own position
+    # (this project's existing "the instant its own displacement candle
+    # closes" convention for both FVG and Order Blocks). Several zones
+    # confirming on the same bar: keep only the tightest (highest floor /
+    # lowest ceiling), since that's the only one that could ever actually
+    # move the ratchet.
+    new_bull_floor, new_bear_ceiling = {}, {}
+    touches = []  # (touch_pos, direction, initial_far_edge)
+    for zone in zones:
+        start_pos = pos_by_time.get(zone["start"])
+        if start_pos is not None:
+            if zone["type"] == "bullish":
+                edge = zone.get(bottom_key, zone["bottom"])
+                new_bull_floor[start_pos] = max(new_bull_floor.get(start_pos, -float("inf")), edge)
+            else:
+                edge = zone.get(top_key, zone["top"])
+                new_bear_ceiling[start_pos] = min(new_bear_ceiling.get(start_pos, float("inf")), edge)
+        if zone.get("first_touch") is not None:
+            touch_pos = pos_by_time.get(zone["first_touch"])
+            if touch_pos is not None:
+                far_edge = zone.get(bottom_key, zone["bottom"]) if zone["type"] == "bullish" \
+                    else zone.get(top_key, zone["top"])
+                touches.append((touch_pos, zone["type"], far_edge))
+
+    touches.sort(key=lambda t: t[0])
+    rows = []
+    last_exit_pos = -1
+    for touch_pos, direction, far_edge in touches:
+        if touch_pos <= last_exit_pos or touch_pos >= n:
+            continue
+        if np.isnan(fast_arr[touch_pos]) or np.isnan(slow_arr[touch_pos]):
+            continue
+        trend = ("bullish" if fast_arr[touch_pos] > slow_arr[touch_pos]
+                  else "bearish" if fast_arr[touch_pos] < slow_arr[touch_pos] else None)
+        if trend is None or trend != direction:
+            continue  # only enter WITH the prevailing trend -- a counter-trend
+            # gap is a different trade entirely, out of scope here
+
+        entry_pos = touch_pos
+        entry_price = float(close_arr[entry_pos])
+        stop = max(far_edge, slow_arr[entry_pos]) if direction == "bullish" \
+            else min(far_edge, slow_arr[entry_pos])
+
+        exit_pos = None
+        for k in range(entry_pos + 1, n):
+            if direction == "bullish":
+                if not np.isnan(slow_arr[k]):
+                    stop = max(stop, slow_arr[k])
+                if k in new_bull_floor and new_bull_floor[k] > stop:
+                    stop = new_bull_floor[k]
+                if close_arr[k] < stop:
+                    exit_pos = k
+                    break
+            else:
+                if not np.isnan(slow_arr[k]):
+                    stop = min(stop, slow_arr[k])
+                if k in new_bear_ceiling and new_bear_ceiling[k] < stop:
+                    stop = new_bear_ceiling[k]
+                if close_arr[k] > stop:
+                    exit_pos = k
+                    break
+        if exit_pos is None:
+            continue  # never actually stopped out within available data
+
+        exit_price = float(close_arr[exit_pos])
+        fwd_return = (exit_price - entry_price) / entry_price
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A ninth strategy family, an explicit classic ICT setup: "test only 1m
+# candles on all tickers if during kill zones, you can predict swings
+# high and low and travel to the opposite liquidity once trend reversed
+# after a sweep." Reuses detect_liquidity_sweeps (already built — every
+# swing high/low that later got wicked through, tagged with the
+# REVERSAL direction it implies) and detect_swings' own confirmed_pos
+# (the exact field this project's own docstring warns must be used, not
+# pos, for "was this level already knowable at some earlier bar" — using
+# pos there is a documented lookahead bug elsewhere in this codebase,
+# avoided here on purpose).
+def _in_kill_zone(times_arr):
+    from datetime import time as _dtime
+    windows = [(_dtime(2, 0), _dtime(5, 0)), (_dtime(9, 30), _dtime(11, 30)), (_dtime(13, 30), _dtime(16, 0))]
+    return np.array([any(s <= t < e for s, e in windows) for t in times_arr])
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def build_liquidity_sweep_reversal_events(df, kill_zones_only=True):
+    """events_df (entry_time, raw_return, direction) — same shape every
+    other builder here returns. Rule, entirely causal:
+
+      1. SWEEP: a swing high/low gets wicked through (detect_liquidity_
+         sweeps) — `type` is already the reversal direction this implies
+         (sweeping a high -> bearish, sweeping a low -> bullish), the
+         same type convention every detector in this project shares.
+      2. CONFIRMATION: scanning forward from the sweep (up to
+         confirm_window bars — a real rejection candle rarely lands on
+         the exact same bar as the raw wick, it usually takes the
+         market a bar or two to actually close back inside), the FIRST
+         bar whose CLOSE gets back on the correct side of the swept
+         level — that bar, not the raw sweep bar itself, is the real
+         entry. A sweep that never gets a close-back within the window
+         isn't "trend reversed," it's still a live break in progress —
+         excluded, not force-confirmed.
+      3. KILL ZONE (if kill_zones_only): the CONFIRMATION bar must fall
+         in London Open, NY AM, or NY PM (NY time) — Asian excluded,
+         matching this session's own established session-testing
+         convention.
+      4. TARGET ("the opposite liquidity"): the nearest OPPOSITE-side
+         swing point already CONFIRMED as of the entry bar (confirmed_
+         pos <= entry bar, never pos — pos alone would let this react to
+         a swing the market hadn't actually shown enough reversal to
+         establish yet, exactly the lookahead bug detect_swings' own
+         docstring warns other callers about).
+      5. STOP: the swept level itself — a CLOSE back beyond it means the
+         reversal failed.
+
+    Walked forward bar by bar from entry, stop checked before target on
+    any bar that would trigger both (the conservative assumption
+    backtest_custom_rule already uses elsewhere in this project). A
+    trade that hits neither within available data is excluded — no
+    lookahead-safe way to know its real outcome, not fabricated.
+    One trade at a time."""
+    from datetime import time as _dtime
+    cols = ["entry_time", "raw_return", "direction"]
+    close = (df["Close"] if "Close" in df else df["close"])
+    high = (df["High"] if "High" in df else df["high"])
+    low = (df["Low"] if "Low" in df else df["low"])
+    close_arr = close.to_numpy()
+    high_arr = high.to_numpy()
+    low_arr = low.to_numpy()
+    n = len(df)
+    if n < 30:
+        return pd.DataFrame(columns=cols)
+
+    confirm_window = 10
+    sweeps = detect_liquidity_sweeps(df)
+    highs, lows = detect_swings(df)
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+
+    if kill_zones_only:
+        idx_ny = df.index.tz_convert("America/New_York")
+        in_session = _in_kill_zone(idx_ny.time)
+    else:
+        in_session = None
+
+    candidates = []
+    for sweep in sweeps:
+        sweep_pos = pos_by_time.get(sweep["end"])
+        if sweep_pos is None or sweep_pos >= n - 1:
+            continue
+        direction = sweep["type"]
+        level = sweep["level"]
+
+        entry_pos = None
+        for k in range(sweep_pos, min(n, sweep_pos + 1 + confirm_window)):
+            if direction == "bearish" and close_arr[k] < level:
+                entry_pos = k
+                break
+            if direction == "bullish" and close_arr[k] > level:
+                entry_pos = k
+                break
+        if entry_pos is None:
+            continue  # never actually closed back inside within the window
+        if in_session is not None and not in_session[entry_pos]:
+            continue
+        entry_price = float(close_arr[entry_pos])
+
+        # "Opposite" liquidity: a bearish reversal (swept a HIGH, buy-side
+        # liquidity) travels toward sell-side liquidity resting BELOW a
+        # swing LOW; a bullish reversal (swept a LOW) travels toward
+        # buy-side liquidity resting ABOVE a swing HIGH. Confirmed
+        # directly as a real bug before this fix: swapping these produced
+        # a target on the WRONG side of entry, which the exit loop below
+        # (high >= target for bullish, low <= target for bearish) would
+        # then satisfy almost immediately at a nonsensical price —
+        # exactly why every trade came back a loss regardless of
+        # direction (a perfect, suspicious 100% inverse pattern, not
+        # genuine noise).
+        if direction == "bearish":
+            opp = [l for l in lows if l["confirmed_pos"] <= entry_pos and l["price"] < entry_price]
+            if not opp:
+                continue
+            target = max(opp, key=lambda l: l["price"])["price"]
+        else:
+            opp = [h for h in highs if h["confirmed_pos"] <= entry_pos and h["price"] > entry_price]
+            if not opp:
+                continue
+            target = min(opp, key=lambda h: h["price"])["price"]
+
+        exit_pos, exit_price = None, None
+        for k in range(entry_pos + 1, n):
+            if direction == "bullish":
+                if close_arr[k] < level:
+                    exit_pos, exit_price = k, float(close_arr[k])
+                    break
+                if high_arr[k] >= target:
+                    exit_pos, exit_price = k, float(target)
+                    break
+            else:
+                if close_arr[k] > level:
+                    exit_pos, exit_price = k, float(close_arr[k])
+                    break
+                if low_arr[k] <= target:
+                    exit_pos, exit_price = k, float(target)
+                    break
+        if exit_pos is None:
+            continue
+
+        fwd_return = (exit_price - entry_price) / entry_price
+        candidates.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return,
+                            "direction": direction, "pos": entry_pos, "exit_pos": exit_pos})
+
+    if not candidates:
+        return pd.DataFrame(columns=cols)
+    candidates.sort(key=lambda c: c["pos"])
+    rows = []
+    last_exit_pos = -1
+    for c in candidates:
+        if c["pos"] <= last_exit_pos:
+            continue
+        rows.append({"entry_time": c["entry_time"], "raw_return": c["raw_return"], "direction": c["direction"]})
+        last_exit_pos = c["exit_pos"]
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A tenth strategy family, and a genuinely different KIND of bet from
+# every one of the nine above: cross-ASSET, not single-instrument. All
+# nine tested one instrument against its own history. This tests
+# whether an unusually large, ATR-relative move in a LEADER (BTC-USD —
+# crypto's most liquid, most-watched instrument) predicts a same-
+# direction follow-through in a FOLLOWER (an altcoin) over the next few
+# bars — "gradual information diffusion," a real, documented effect in
+# equity/crypto lead-lag literature (large-cap moves reaching smaller,
+# less-watched names with a lag), not an ICT concept at all.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_leader_follower_events(leader_df, follower_df, lead_window, atr_z_threshold, forward_bars,
+                                  atr_lookback=100):
+    """events_df (entry_time, raw_return, direction) — same shape every
+    other builder here returns, but raw_return is the FOLLOWER's own
+    forward return, conditioned on the LEADER's own recent move.
+
+    LEADER EVENT: over the last lead_window bars, the leader moved by at
+    least atr_z_threshold times its own trailing per-bar volatility
+    (scaled by sqrt(lead_window) — same volatility-scaling convention as
+    every ATR/vol-based builder above), causally (only the leader's own
+    past returns feed its own trailing-vol estimate). direction is the
+    leader's own move direction.
+
+    FOLLOWER OUTCOME: raw_return is the FOLLOWER's forward return over
+    forward_bars from that SAME bar — never the leader's own return,
+    and never using anything past that bar on either series.
+
+    Both dataframes must already share the same timestamps (same
+    provider/interval fetch) — aligned here via index intersection, not
+    resampled or interpolated, so a mismatched pair just yields fewer
+    (or zero) usable bars rather than fabricated alignment.
+
+    One trade at a time (skip a leader event whose own forward_bars
+    window would overlap a still-open previous one) — same discipline
+    as every builder above, applied here per (leader, follower) pair."""
+    cols = ["entry_time", "raw_return", "direction"]
+    common_idx = leader_df.index.intersection(follower_df.index)
+    if len(common_idx) < atr_lookback + lead_window + forward_bars + 10:
+        return pd.DataFrame(columns=cols)
+    leader = leader_df.loc[common_idx]
+    follower = follower_df.loc[common_idx]
+
+    l_close = (leader["Close"] if "Close" in leader else leader["close"]).to_numpy()
+    f_close = (follower["Close"] if "Close" in follower else follower["close"]).to_numpy()
+    n = len(common_idx)
+
+    l_returns = np.diff(l_close) / l_close[:-1]
+    l_vol = pd.Series(l_returns).rolling(atr_lookback, min_periods=atr_lookback).std().to_numpy()
+    l_vol_padded = np.concatenate([[np.nan], l_vol])
+
+    rows = []
+    last_exit_pos = -1
+    for t in range(lead_window + atr_lookback, n - forward_bars):
+        if t <= last_exit_pos:
+            continue
+        move = (l_close[t] - l_close[t - lead_window]) / l_close[t - lead_window]
+        sigma = l_vol_padded[t] * np.sqrt(lead_window)
+        if not np.isfinite(sigma) or sigma <= 0:
+            continue
+        z = move / sigma
+        if abs(z) < atr_z_threshold:
+            continue
+        direction = "bullish" if z > 0 else "bearish"
+        entry_price = float(f_close[t])
+        exit_price = float(f_close[t + forward_bars])
+        fwd_return = (exit_price - entry_price) / entry_price
+        rows.append({"entry_time": common_idx[t], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = t + forward_bars
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# An eleventh strategy family: volatility SQUEEZE then BREAKOUT — the
+# classic "Bollinger Band squeeze" / volatility-contraction pattern
+# (TTM Squeeze and similar retail indicators), genuinely different from
+# every one of the ten above: it's not zone-reaction, MA-retest, session
+# timing, or cross-asset — it's a pure volatility-CYCLE bet (quiet
+# periods precede loud ones, trade the transition), proposed early this
+# session and never actually built until now.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_vol_squeeze_breakout_events(df, squeeze_pctile_max, forward_bars, max_bars_after_squeeze=10,
+                                       bb_period=20, num_std=2.0, vol_lookback=100):
+    """events_df (entry_time, raw_return, direction) — same shape every
+    other builder here returns.
+
+    SQUEEZE: a bar whose own volatility_percentile (this module's own
+    causal, trailing-ATR-rank helper, already used by build_experiment_
+    events above) is at or below squeeze_pctile_max — among the quietest
+    it's recently been.
+
+    BREAKOUT: scanning forward from the squeeze bar (up to max_bars_
+    after_squeeze), the first bar whose CLOSE clears the Bollinger Band
+    computed AT THAT BAR (upper band -> bullish breakout, lower -> bearish)
+    — a real, convicted close beyond the band, not a wick, same "close,
+    not wick" confirmation discipline as every ICT-specific builder above
+    even though this one isn't ICT at all.
+
+    Entry is the breakout bar; raw_return measured forward from there,
+    never from the squeeze bar itself. One trade at a time."""
+    from indicators import bollinger_bands
+    cols = ["entry_time", "raw_return", "direction"]
+    close = (df["Close"] if "Close" in df else df["close"])
+    close_arr = close.to_numpy()
+    n = len(df)
+    if n < max(bb_period, vol_lookback) + max_bars_after_squeeze + forward_bars + 10:
+        return pd.DataFrame(columns=cols)
+
+    vol_pctile = volatility_percentile(df, lookback=vol_lookback).to_numpy()
+    upper, _, lower = bollinger_bands(close, bb_period, num_std)
+    upper_arr, lower_arr = upper.to_numpy(), lower.to_numpy()
+
+    candidates = []
+    i = 0
+    while i < n:
+        if np.isnan(vol_pctile[i]) or vol_pctile[i] > squeeze_pctile_max:
+            i += 1
+            continue
+        breakout_pos, direction = None, None
+        for j in range(i + 1, min(n, i + 1 + max_bars_after_squeeze)):
+            if np.isnan(upper_arr[j]) or np.isnan(lower_arr[j]):
+                continue
+            if close_arr[j] > upper_arr[j]:
+                breakout_pos, direction = j, "bullish"
+                break
+            if close_arr[j] < lower_arr[j]:
+                breakout_pos, direction = j, "bearish"
+                break
+        if breakout_pos is not None:
+            candidates.append((breakout_pos, direction))
+            i = breakout_pos + 1  # resume scanning for the NEXT squeeze after this breakout
+        else:
+            i += 1
+
+    if not candidates:
+        return pd.DataFrame(columns=cols)
+    candidates.sort(key=lambda c: c[0])
+    rows = []
+    last_exit_pos = -1
+    for pos, direction in candidates:
+        if pos <= last_exit_pos:
+            continue
+        exit_pos = pos + forward_bars
+        if exit_pos >= n:
+            continue
+        fwd_return = float((close_arr[exit_pos] - close_arr[pos]) / close_arr[pos])
+        rows.append({"entry_time": df.index[pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A twelfth strategy family, a direct refinement request: "cut the
+# losing trades by buying in retracements after crossings and limit
+# somehow as the trend exhausts." Same ENTRY as build_ma_cross_retest_
+# events (EMA cross, retest the fast MA, RSI-momentum-turn confirmation
+# at the touch) — but a genuinely different EXIT, aimed specifically at
+# cutting losers short rather than holding a fixed bar count or a
+# consecutive-adverse-close streak: hold only as long as price keeps
+# making new same-direction extremes that RSI ALSO confirms (a new high
+# with a new-high RSI too); exit the FIRST time price makes a new
+# extreme WITHOUT RSI confirming it — classic bearish/bullish
+# divergence, the standard definition of "the trend is running out of
+# steam." The slow EMA is a hard backstop underneath that (same "never
+# below the slow MA" floor build_gap_trend_ride_events already uses) —
+# whichever trips first ends the trade.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_ma_retest_exhaustion_events(df, ma_fast=20, ma_slow=50, rsi_dip_threshold=60,
+                                       max_bars_after_cross=20, rsi_period=14, max_hold_bars=150):
+    """events_df (entry_time, raw_return, direction) — same shape every
+    other builder here returns. Entry mechanics are identical to
+    build_ma_cross_retest_events (see its own docstring for the cross/
+    retest/RSI-turn rule); only what happens AFTER entry differs."""
+    from indicators import ema as _ema, rsi as _rsi
+    cols = ["entry_time", "raw_return", "direction"]
+    close = (df["Close"] if "Close" in df else df["close"])
+    high = (df["High"] if "High" in df else df["high"])
+    low = (df["Low"] if "Low" in df else df["low"])
+    close_arr = close.to_numpy()
+    high_arr = high.to_numpy()
+    low_arr = low.to_numpy()
+    n = len(df)
+    if n < ma_slow + 10:
+        return pd.DataFrame(columns=cols)
+
+    fast_ma = _ema(close, ma_fast).to_numpy()
+    slow_ma = _ema(close, ma_slow).to_numpy()
+    rsi_arr = _rsi(close, rsi_period).to_numpy()
+    diff = fast_ma - slow_ma
+
+    rows = []
+    last_exit_pos = -1
+    i = 0
+    while i < n - 1:
+        if np.isnan(diff[i]) or np.isnan(diff[i + 1]):
+            i += 1
+            continue
+        crossed_bullish = diff[i] <= 0 and diff[i + 1] > 0
+        crossed_bearish = diff[i] >= 0 and diff[i + 1] < 0
+        if not (crossed_bullish or crossed_bearish):
+            i += 1
+            continue
+        direction = "bullish" if crossed_bullish else "bearish"
+        cross_pos = i + 1
+
+        touch_pos = None
+        for j in range(cross_pos + 1, min(n, cross_pos + 1 + max_bars_after_cross)):
+            if np.isnan(fast_ma[j]) or np.isnan(slow_ma[j]):
+                continue
+            still_trending = (fast_ma[j] > slow_ma[j]) if direction == "bullish" else (fast_ma[j] < slow_ma[j])
+            if not still_trending:
+                break
+            if low_arr[j] <= fast_ma[j] <= high_arr[j]:
+                touch_pos = j
+                break
+        if touch_pos is None:
+            i = cross_pos
+            continue
+        if touch_pos <= last_exit_pos:
+            i = cross_pos
+            continue
+        if touch_pos < 1 or np.isnan(rsi_arr[touch_pos]) or np.isnan(rsi_arr[touch_pos - 1]):
+            i = cross_pos
+            continue
+        if direction == "bullish":
+            momentum_ok = (rsi_arr[touch_pos - 1] <= rsi_dip_threshold) and (rsi_arr[touch_pos] > rsi_arr[touch_pos - 1])
+        else:
+            momentum_ok = (rsi_arr[touch_pos - 1] >= (100 - rsi_dip_threshold)) and (rsi_arr[touch_pos] < rsi_arr[touch_pos - 1])
+        if not momentum_ok:
+            i = cross_pos
+            continue
+
+        entry_pos = touch_pos
+        entry_price = float(close_arr[entry_pos])
+        running_extreme_price = entry_price
+        running_extreme_rsi = float(rsi_arr[entry_pos])
+        exit_pos = None
+        for k in range(entry_pos + 1, min(n, entry_pos + 1 + max_hold_bars)):
+            if np.isnan(rsi_arr[k]):
+                continue
+            if direction == "bullish":
+                if not np.isnan(slow_ma[k]) and close_arr[k] < slow_ma[k]:
+                    exit_pos = k
+                    break
+                if high_arr[k] > running_extreme_price:
+                    if rsi_arr[k] < running_extreme_rsi:
+                        exit_pos = k  # new high, RSI didn't confirm -- exhausted
+                        break
+                    running_extreme_price = float(high_arr[k])
+                    running_extreme_rsi = float(rsi_arr[k])
+            else:
+                if not np.isnan(slow_ma[k]) and close_arr[k] > slow_ma[k]:
+                    exit_pos = k
+                    break
+                if low_arr[k] < running_extreme_price:
+                    if rsi_arr[k] > running_extreme_rsi:
+                        exit_pos = k
+                        break
+                    running_extreme_price = float(low_arr[k])
+                    running_extreme_rsi = float(rsi_arr[k])
+        if exit_pos is None:
+            exit_pos = min(n - 1, entry_pos + max_hold_bars)
+        if exit_pos <= entry_pos or exit_pos >= n:
+            i = cross_pos
+            continue
+
+        fwd_return = float((close_arr[exit_pos] - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+        i = cross_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A 13th strategy family, from a direct order-flow-flavored request:
+# "candles with exponentially increasingly positive volume delta over 3
+# candles" -- accelerating buy (or sell) pressure. yfinance OHLCV has no
+# real buyer/seller trade-side split (that needs tick data with a
+# classified side, which this project doesn't have yet), so "volume
+# delta" here is the standard Chaikin-style approximation: split each
+# bar's own total volume by where its close landed in its own [low,
+# high] range -- close near the high looks buyer-driven, close near the
+# low looks seller-driven. A real proxy, not real order flow; reported
+# as such.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_volume_delta_accel_events(df, forward_bars):
+    """events_df (entry_time, raw_return, direction). volume_delta[t] =
+    volume[t] * (2*close[t] - high[t] - low[t]) / (high[t] - low[t]) --
+    zero when high==low (a truly flat bar has no directional volume to
+    assign).
+
+    Signal (causal, uses only bars up to and including t): three
+    consecutive bars t-2, t-1, t each with delta > 0 AND strictly
+    increasing (delta[t-2] < delta[t-1] < delta[t]) -- accelerating
+    buying pressure, direction "bullish". The exact mirror -- three
+    consecutive bars each < 0 and strictly decreasing (more negative
+    each time) -- is direction "bearish", tested the same way for the
+    usual direction-balance check every builder here gets.
+
+    Entry/exit are lag-corrected FROM THE START this time (the mistake
+    caught and fixed after the fact in every earlier builder today): the
+    pattern is confirmed using only bar t's own just-revealed data, but
+    the real fill is bar t+1's OPEN, not bar t's own close -- a live
+    system only learns the pattern completed after bar t closes, so it
+    can't also transact at that same already-gone price. Exit is
+    forward_bars bars after that real entry, at that bar's close. One
+    trade at a time (skip a signal landing inside a still-open previous
+    trade's own holding window)."""
+    cols = ["entry_time", "raw_return", "direction"]
+    o = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    h = (df["High"] if "High" in df else df["high"]).to_numpy()
+    l = (df["Low"] if "Low" in df else df["low"]).to_numpy()
+    c = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    vol_col = "Volume" if "Volume" in df else "volume"
+    if vol_col not in df:
+        return pd.DataFrame(columns=cols)
+    v = df[vol_col].to_numpy().astype(float)
+    n = len(df)
+    if n < forward_bars + 5:
+        return pd.DataFrame(columns=cols)
+
+    rng_ = h - l
+    with np.errstate(divide="ignore", invalid="ignore"):
+        delta = np.where(rng_ > 0, v * (2 * c - h - l) / rng_, 0.0)
+
+    rows = []
+    last_exit_pos = -1
+    for t in range(2, n - 1 - forward_bars):
+        d0, d1, d2 = delta[t - 2], delta[t - 1], delta[t]
+        bullish = d0 > 0 and d1 > 0 and d2 > 0 and d0 < d1 < d2
+        bearish = d0 < 0 and d1 < 0 and d2 < 0 and d0 > d1 > d2
+        if not (bullish or bearish):
+            continue
+        entry_pos = t + 1
+        if entry_pos <= last_exit_pos:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = o[entry_pos]
+        exit_price = c[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        direction = "bullish" if bullish else "bearish"
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A 14th strategy: the "human instinct" request made literal -- not one
+# indicator, but several independent price-action tells voting together
+# at the exact moment price makes a fresh extreme, the way a discretionary
+# trader blends "this looks exhausted" cues by feel. Four cheap, already-
+# proven-relevant reads (each one alone was tried today in some other
+# builder and didn't survive): RSI failing to confirm the new extreme
+# (divergence -- build_bb_divergence_events/build_ma_retest_exhaustion_
+# events' own logic), a sweep-and-reject of the prior extreme (build_
+# liquidity_sweep_reversal_events' own mechanic), volume pressure
+# deserting the move (build_volume_delta_accel_events' own CLV-delta
+# proxy), and a real rejection wick. Deliberately a simple VOTE COUNT,
+# not a weighted score -- fewer knobs to curve-fit than a regression
+# would need, closer to "how many of my usual tells agree right now."
+@st.cache_data(ttl=_CACHE_TTL)
+def build_price_action_confluence_events(df, forward_bars, extreme_lookback=20, min_votes=3,
+                                          rejection_mult=1.5, rsi_period=14):
+    """events_df (entry_time, raw_return, direction). At any bar t where
+    price makes a fresh extreme_lookback-bar high or low, count up to 4
+    independent bearish (at a new high) or bullish (at a new low) votes:
+
+      1. RSI divergence: RSI[t] did NOT also make a new extreme_lookback
+         high (bearish case) / low (bullish case) alongside price --
+         momentum didn't confirm.
+      2. Sweep-and-reject: close[t] already back on the OTHER side of the
+         prior extreme_lookback-bar high/low (the level just swept),
+         i.e. the breakout failed intrabar.
+      3. Volume pressure flip: the CLV volume-delta proxy at t is on the
+         OPPOSITE side of zero from the move (negative/selling delta at
+         a fresh high, positive/buying delta at a fresh low).
+      4. Rejection wick: the wick beyond the body on the extreme's own
+         side is at least rejection_mult times the body itself.
+
+    A signal fires only when at least min_votes of these 4 agree, at the
+    bar the extreme was made (the LAST bar whose data decides this --
+    no lookahead). Entry is lag-corrected from the start (next bar's
+    open, not this bar's own close -- the same fix every earlier builder
+    needed applied retroactively). Exit is forward_bars bars later at
+    that bar's close. One trade at a time."""
+    cols = ["entry_time", "raw_return", "direction"]
+    o = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    h = (df["High"] if "High" in df else df["high"]).to_numpy()
+    l = (df["Low"] if "Low" in df else df["low"]).to_numpy()
+    c = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    vol_col = "Volume" if "Volume" in df else "volume"
+    n = len(df)
+    if n < extreme_lookback + forward_bars + 5:
+        return pd.DataFrame(columns=cols)
+
+    from indicators import rsi as _rsi
+    close_s = df["Close"] if "Close" in df else df["close"]
+    rsi_arr = _rsi(close_s, rsi_period).to_numpy()
+
+    if vol_col in df:
+        v = df[vol_col].to_numpy().astype(float)
+        rng_ = h - l
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vol_delta = np.where(rng_ > 0, v * (2 * c - h - l) / rng_, 0.0)
+    else:
+        vol_delta = np.zeros(n)
+
+    body = np.abs(c - o)
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
+
+    rows = []
+    last_exit_pos = -1
+    for t in range(extreme_lookback, n - 1 - forward_bars):
+        window_high = h[t - extreme_lookback:t]
+        window_low = l[t - extreme_lookback:t]
+        window_rsi = rsi_arr[t - extreme_lookback:t]
+        if np.isnan(rsi_arr[t]):
+            continue
+
+        is_new_high = h[t] > window_high.max()
+        is_new_low = l[t] < window_low.min()
+        if is_new_high and not is_new_low:
+            votes = 0
+            if not np.all(np.isnan(window_rsi)) and rsi_arr[t] < np.nanmax(window_rsi):
+                votes += 1
+            if c[t] < window_high.max():
+                votes += 1
+            if vol_delta[t] < 0:
+                votes += 1
+            if body[t] > 0 and upper_wick[t] >= rejection_mult * body[t]:
+                votes += 1
+            direction = "bearish"
+        elif is_new_low and not is_new_high:
+            votes = 0
+            if not np.all(np.isnan(window_rsi)) and rsi_arr[t] > np.nanmin(window_rsi):
+                votes += 1
+            if c[t] > window_low.min():
+                votes += 1
+            if vol_delta[t] > 0:
+                votes += 1
+            if body[t] > 0 and lower_wick[t] >= rejection_mult * body[t]:
+                votes += 1
+            direction = "bullish"
+        else:
+            continue
+
+        if votes < min_votes:
+            continue
+        entry_pos = t + 1
+        if entry_pos <= last_exit_pos:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = o[entry_pos]
+        exit_price = c[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A 15th strategy, addressing two things directly: (1) "self-adjusting,
+# not static" -- today's 14 builders all fire the same way regardless of
+# where price sits in the bigger picture; this one gates its entries on
+# HIGHER-TIMEFRAME context, so it's naturally selective rather than
+# uniform. (2) "HTF peaks should give off a good bearish trade" -- the
+# exact top-down ICT idea: an LTF reversal trigger (build_price_action_
+# confluence_events' own 4-vote logic, unmodified) only counts when it
+# ALSO lands near a genuine higher-timeframe extreme, not just a noisy
+# local one. Two separate dataframes, same pattern build_leader_follower_
+# events already uses for this file's only other multi-timeframe input.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_htf_peak_gated_reversal_events(ltf_df, htf_df, forward_bars, extreme_lookback=20, min_votes=3,
+                                          rejection_mult=1.5, htf_lookback=20, htf_proximity_pct=0.0015,
+                                          rsi_period=14):
+    """events_df (entry_time, raw_return, direction). Reuses build_price_
+    action_confluence_events' own 4-vote reversal logic on ltf_df bar for
+    bar (RSI divergence / sweep-and-reject / volume-pressure flip /
+    rejection wick), but ADDS a hard gate: the vote only counts if the
+    LTF extreme is also within htf_proximity_pct of the rolling
+    htf_lookback-bar high (bearish gate) or low (bullish gate) computed
+    from htf_df -- a genuinely higher-timeframe peak/trough, not just a
+    small extreme_lookback-bar wiggle on the LTF series itself.
+
+    HTF alignment is causal by construction: htf_df's own rolling
+    high/low is shifted forward one HTF bar before being matched to each
+    LTF timestamp (merge_asof, backward), so only an ALREADY-CLOSED HTF
+    bar's information gates any given LTF bar -- never the HTF bar still
+    forming at that moment.
+
+    Entry lag-corrected from the start (next LTF bar's open). Exit
+    forward_bars LTF bars later at that bar's close. One trade at a
+    time."""
+    cols = ["entry_time", "raw_return", "direction"]
+    o = (ltf_df["Open"] if "Open" in ltf_df else ltf_df["open"]).to_numpy()
+    h = (ltf_df["High"] if "High" in ltf_df else ltf_df["high"]).to_numpy()
+    l = (ltf_df["Low"] if "Low" in ltf_df else ltf_df["low"]).to_numpy()
+    c = (ltf_df["Close"] if "Close" in ltf_df else ltf_df["close"]).to_numpy()
+    vol_col = "Volume" if "Volume" in ltf_df else "volume"
+    n = len(ltf_df)
+    if n < extreme_lookback + forward_bars + 5 or htf_df is None or len(htf_df) < htf_lookback + 2:
+        return pd.DataFrame(columns=cols)
+
+    from indicators import rsi as _rsi
+    close_s = ltf_df["Close"] if "Close" in ltf_df else ltf_df["close"]
+    rsi_arr = _rsi(close_s, rsi_period).to_numpy()
+
+    if vol_col in ltf_df:
+        v = ltf_df[vol_col].to_numpy().astype(float)
+        rng_ = h - l
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vol_delta = np.where(rng_ > 0, v * (2 * c - h - l) / rng_, 0.0)
+    else:
+        vol_delta = np.zeros(n)
+
+    body = np.abs(c - o)
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
+
+    htf_high = (htf_df["High"] if "High" in htf_df else htf_df["high"])
+    htf_low = (htf_df["Low"] if "Low" in htf_df else htf_df["low"])
+    htf_roll_high = htf_high.rolling(htf_lookback, min_periods=htf_lookback).max().shift(1)
+    htf_roll_low = htf_low.rolling(htf_lookback, min_periods=htf_lookback).min().shift(1)
+    htf_ref = pd.DataFrame({"htf_high": htf_roll_high, "htf_low": htf_roll_low}, index=htf_df.index)
+    htf_ref = htf_ref.dropna()
+
+    ltf_times = pd.DataFrame({"t": ltf_df.index}, index=ltf_df.index)
+    merged = pd.merge_asof(ltf_times.sort_index(), htf_ref.sort_index(), left_index=True, right_index=True,
+                            direction="backward")
+    gate_high = merged["htf_high"].to_numpy()
+    gate_low = merged["htf_low"].to_numpy()
+
+    rows = []
+    last_exit_pos = -1
+    for t in range(extreme_lookback, n - 1 - forward_bars):
+        if np.isnan(rsi_arr[t]) or np.isnan(gate_high[t]) or np.isnan(gate_low[t]):
+            continue
+        window_high = h[t - extreme_lookback:t]
+        window_low = l[t - extreme_lookback:t]
+        window_rsi = rsi_arr[t - extreme_lookback:t]
+
+        is_new_high = h[t] > window_high.max()
+        is_new_low = l[t] < window_low.min()
+        if is_new_high and not is_new_low:
+            near_htf_peak = h[t] >= gate_high[t] * (1 - htf_proximity_pct)
+            if not near_htf_peak:
+                continue
+            votes = 0
+            if not np.all(np.isnan(window_rsi)) and rsi_arr[t] < np.nanmax(window_rsi):
+                votes += 1
+            if c[t] < window_high.max():
+                votes += 1
+            if vol_delta[t] < 0:
+                votes += 1
+            if body[t] > 0 and upper_wick[t] >= rejection_mult * body[t]:
+                votes += 1
+            direction = "bearish"
+        elif is_new_low and not is_new_high:
+            near_htf_trough = l[t] <= gate_low[t] * (1 + htf_proximity_pct)
+            if not near_htf_trough:
+                continue
+            votes = 0
+            if not np.all(np.isnan(window_rsi)) and rsi_arr[t] > np.nanmin(window_rsi):
+                votes += 1
+            if c[t] > window_low.min():
+                votes += 1
+            if vol_delta[t] > 0:
+                votes += 1
+            if body[t] > 0 and lower_wick[t] >= rejection_mult * body[t]:
+                votes += 1
+            direction = "bullish"
+        else:
+            continue
+
+        if votes < min_votes:
+            continue
+        entry_pos = t + 1
+        if entry_pos <= last_exit_pos:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = o[entry_pos]
+        exit_price = c[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": ltf_df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+# A 16th strategy, a direct request: does a MOMENTUM CROSSOVER that
+# happens counter to the recent trend (a bullish MACD/MA cross after a
+# recent bearish stretch, or the mirror) carry different information
+# depending on WHERE it crosses -- MACD's own zero line, or price's
+# side of a longer-term MA -- versus just "a cross happened." Two
+# separate builders (MACD zero-line position, MA 200-EMA position),
+# same trend-precondition logic, each filterable by position so the two
+# sides can be compared directly.
+@st.cache_data(ttl=_CACHE_TTL)
+def build_macd_cross_trend_events(df, forward_bars, trend_lookback=30, trend_majority=0.7,
+                                   zero_filter="both", macd_fast=12, macd_slow=26, macd_signal=9,
+                                   ema_fast=20, ema_slow=50):
+    """events_df (entry_time, raw_return, direction). Precondition: the
+    ema_fast/ema_slow relationship over the trend_lookback bars BEFORE
+    the cross bar was bearish (fast<slow) at least trend_majority of the
+    time, for a BULLISH MACD cross (counter-trend reversal setup) -- or
+    the mirror (majority bullish, then a bearish MACD cross) for
+    direction="bearish". A cross with no such prior counter-trend
+    stretch is skipped entirely -- this only tests the reversal-context
+    case, not plain trend-following continuation crosses.
+
+    zero_filter ("below", "above", "both"): at the cross bar itself, is
+    the MACD line still on the OLD trend's side of zero ("below" for a
+    bullish cross while MACD line < 0 -- hasn't caught up yet) or
+    already on the NEW direction's side ("above" -- momentum already
+    flipped sign, more confirmed/later signal)? "both" -- no filter,
+    every qualifying cross regardless of zero-line side.
+
+    Entry lag-corrected (next bar's open after the cross bar's own
+    close confirms it). Exit forward_bars bars later at that bar's
+    close. One trade at a time."""
+    cols = ["entry_time", "raw_return", "direction"]
+    o = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    c = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    n = len(df)
+    if n < trend_lookback + ema_slow + forward_bars + 5:
+        return pd.DataFrame(columns=cols)
+
+    from indicators import ema as _ema, macd as _macd
+    close_s = df["Close"] if "Close" in df else df["close"]
+    fast_ma = _ema(close_s, ema_fast).to_numpy()
+    slow_ma = _ema(close_s, ema_slow).to_numpy()
+    macd_line, signal_line, _ = _macd(close_s, macd_fast, macd_slow, macd_signal)
+    macd_arr = macd_line.to_numpy()
+    sig_arr = signal_line.to_numpy()
+
+    rows = []
+    last_exit_pos = -1
+    for t in range(trend_lookback + ema_slow, n - 1 - forward_bars):
+        if np.isnan(macd_arr[t]) or np.isnan(sig_arr[t]) or np.isnan(macd_arr[t - 1]) or np.isnan(sig_arr[t - 1]):
+            continue
+        crossed_bullish = macd_arr[t - 1] <= sig_arr[t - 1] and macd_arr[t] > sig_arr[t]
+        crossed_bearish = macd_arr[t - 1] >= sig_arr[t - 1] and macd_arr[t] < sig_arr[t]
+        if not (crossed_bullish or crossed_bearish):
+            continue
+
+        window_fast = fast_ma[t - trend_lookback:t]
+        window_slow = slow_ma[t - trend_lookback:t]
+        valid = ~(np.isnan(window_fast) | np.isnan(window_slow))
+        if valid.sum() < trend_lookback * 0.5:
+            continue
+        bearish_frac = (window_fast[valid] < window_slow[valid]).mean()
+        bullish_frac = (window_fast[valid] > window_slow[valid]).mean()
+
+        if crossed_bullish and bearish_frac >= trend_majority:
+            direction = "bullish"
+            zero_side = "below" if macd_arr[t] < 0 else "above"
+        elif crossed_bearish and bullish_frac >= trend_majority:
+            direction = "bearish"
+            zero_side = "above" if macd_arr[t] > 0 else "below"
+        else:
+            continue
+
+        if zero_filter != "both" and zero_side != zero_filter:
+            continue
+
+        entry_pos = t + 1
+        if entry_pos <= last_exit_pos:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = o[entry_pos]
+        exit_price = c[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def build_ma_cross_htf_filtered_events(df, forward_bars, trend_lookback=30, trend_majority=0.7,
+                                        fast=20, slow=50, htf_ma=200, position_filter="both"):
+    """Same trend-precondition + counter-trend-cross idea as
+    build_macd_cross_trend_events, but for a plain fast/slow EMA cross
+    instead of MACD, classified by price's side of a longer htf_ma EMA
+    at the cross bar instead of a zero line: position_filter "below_htf"
+    (price still under the bigger-picture average -- an early,
+    unconfirmed-by-the-bigger-trend cross) or "above_htf" (already back
+    over it -- later, more trend-aligned) or "both"."""
+    cols = ["entry_time", "raw_return", "direction"]
+    o = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    c = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    n = len(df)
+    if n < trend_lookback + htf_ma + forward_bars + 5:
+        return pd.DataFrame(columns=cols)
+
+    from indicators import ema as _ema
+    close_s = df["Close"] if "Close" in df else df["close"]
+    fast_ma = _ema(close_s, fast).to_numpy()
+    slow_ma = _ema(close_s, slow).to_numpy()
+    htf_arr = _ema(close_s, htf_ma).to_numpy()
+
+    rows = []
+    last_exit_pos = -1
+    for t in range(trend_lookback + htf_ma, n - 1 - forward_bars):
+        if np.isnan(fast_ma[t]) or np.isnan(slow_ma[t]) or np.isnan(fast_ma[t - 1]) or np.isnan(slow_ma[t - 1]) \
+                or np.isnan(htf_arr[t]):
+            continue
+        crossed_bullish = fast_ma[t - 1] <= slow_ma[t - 1] and fast_ma[t] > slow_ma[t]
+        crossed_bearish = fast_ma[t - 1] >= slow_ma[t - 1] and fast_ma[t] < slow_ma[t]
+        if not (crossed_bullish or crossed_bearish):
+            continue
+
+        window_fast = fast_ma[t - trend_lookback:t]
+        window_slow = slow_ma[t - trend_lookback:t]
+        valid = ~(np.isnan(window_fast) | np.isnan(window_slow))
+        if valid.sum() < trend_lookback * 0.5:
+            continue
+        bearish_frac = (window_fast[valid] < window_slow[valid]).mean()
+        bullish_frac = (window_fast[valid] > window_slow[valid]).mean()
+
+        if crossed_bullish and bearish_frac >= trend_majority:
+            direction = "bullish"
+            htf_side = "below_htf" if c[t] < htf_arr[t] else "above_htf"
+        elif crossed_bearish and bullish_frac >= trend_majority:
+            direction = "bearish"
+            htf_side = "above_htf" if c[t] > htf_arr[t] else "below_htf"
+        else:
+            continue
+
+        if position_filter != "both" and htf_side != position_filter:
+            continue
+
+        entry_pos = t + 1
+        if entry_pos <= last_exit_pos:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = o[entry_pos]
+        exit_price = c[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)

@@ -106,6 +106,57 @@ def _price_decimals(price):
     return max(2, min(10, decimals))
 
 
+PRICE_PROJECTION_BARS = 20
+
+
+def _compute_price_projection(df, c_col, n_bars=PRICE_PROJECTION_BARS, vol_lookback=100, ema_period=20, slope_lookback=5):
+    """A volatility cone (±1σ/±2σ, sqrt-time scaling off this instrument's
+    own trailing realized volatility — the exact same magnitude-only model
+    this session's own vol-harvest experiment used) plus a labeled trend-
+    extrapolation center line (the current EMA's own recent slope,
+    projected forward linearly). Direct request, with an explicit
+    constraint carried over from a full day of rigorous backtesting: none
+    of the six directional/magnitude strategies tried in the Experiments
+    tab this session survived correction (see experiments.py's own
+    docstring) — so this overlay is deliberately NOT presented as a
+    prediction anywhere it renders (see the render call site's own
+    "NOT a validated prediction" label on the center line), just an
+    honest "here's what current trend + volatility implies," nothing
+    more. Returns None when there isn't enough history yet to compute a
+    trailing volatility estimate (an honest empty state, not a fabricated
+    cone) — an early int/1h fetch right after a ticker/timeframe switch
+    can legitimately be this thin.
+
+    Returns {"center", "upper1", "lower1", "upper2", "lower2"}, each a
+    list of n_bars floats (one per future bar, nearest first)."""
+    close = df[c_col]
+    n = len(close)
+    if n < vol_lookback + slope_lookback + 2:
+        return None
+    returns = close.pct_change().dropna()
+    sigma = float(returns.tail(vol_lookback).std())
+    if not math.isfinite(sigma) or sigma <= 0:
+        return None
+
+    ema_series = ema(close, ema_period)
+    if len(ema_series) < slope_lookback + 1 or pd.isna(ema_series.iloc[-1]) or pd.isna(ema_series.iloc[-1 - slope_lookback]):
+        slope = 0.0
+    else:
+        slope = float(ema_series.iloc[-1] - ema_series.iloc[-1 - slope_lookback]) / slope_lookback
+
+    current_price = float(close.iloc[-1])
+    result = {"center": [], "upper1": [], "lower1": [], "upper2": [], "lower2": []}
+    for i in range(1, n_bars + 1):
+        center_i = current_price + slope * i
+        sigma_i = sigma * math.sqrt(i) * current_price
+        result["center"].append(center_i)
+        result["upper1"].append(center_i + sigma_i)
+        result["lower1"].append(center_i - sigma_i)
+        result["upper2"].append(center_i + 2 * sigma_i)
+        result["lower2"].append(center_i - 2 * sigma_i)
+    return result
+
+
 def _win_rate_label(wr, precision=0):
     """wr: a _historical_win_rates value, (rate, n, sufficient), or None.
     A thin sample shows as "low data (n=X)" rather than disappearing —
@@ -523,7 +574,8 @@ def _backfill_timeframe(tf_label):
 
 
 ICT_LAYERS = ["FVG", "IFVG", "Order Blocks", "Breaker Block", "Swing Points", "Equal Highs/Lows",
-              "Market Structure", "Premium/Discount", "Liquidity", "Naked POC", "Poor High/Low"]
+              "Market Structure", "Premium/Discount", "Liquidity", "Naked POC", "Poor High/Low",
+              "Price Projection"]
 # All off for a brand-new session — a first-time load shouldn't dump every
 # layer onto the chart at once. Returning users don't see this default at
 # all: their own on/off choice per layer is persisted (see .last_state.json
@@ -579,6 +631,14 @@ LAYER_LAG_HELP = {
                  "at the earliest, never today's still-forming one.",
     "Poor High/Low": "Same as Naked POC — only knowable once the full session that produced it has "
                       "closed, so today's own high/low can't be judged poor or clean until today ends.",
+    "Price Projection": "Not lagged — the opposite problem: this is a forward guess, not a confirmed "
+                         "read of what already happened. The shaded band is how far price COULD move "
+                         "(this instrument's own historical volatility, widening the further out you "
+                         "look) — the dashed line is just the current trend extended in a straight line, "
+                         "explicitly NOT a validated prediction. A full day of rigorous backtesting this "
+                         "session found no statistically confirmed directional edge in any single-"
+                         "indicator pattern tried (see the Experiments tab) — this overlay doesn't change "
+                         "that, it just visualizes what the current numbers imply.",
 }
 
 # Kill zones apply only below 1h — a 1h+ candle either barely fits inside a
@@ -1078,7 +1138,8 @@ def _render_mini_chart(ticker, chart_id):
             clicked = ict_chart(
                 bars_payload, fingerprint,
                 overlays=overlays,
-                options={"log_scale": False, "volume": st.session_state.get("fvg_show_volume", False),
+                options={"log_scale": st.session_state.get("fvg_log_scale", False),
+                          "volume": st.session_state.get("fvg_show_volume", False),
                           "selected": st.session_state.get("selected_chart") == chart_id,
                           # Plain candles at a glance — no O/H/L/C/source
                           # heading competing with the main chart's own
@@ -1952,6 +2013,11 @@ with main_col:
             # Lives here next to Volume Profile (what draws on the chart), not
             # in Settings (how it's configured) — moved per direct request.
             show_volume = st.checkbox("Show volume", value=False, key="fvg_show_volume")
+            show_log_scale = st.checkbox(
+                "Log scale", value=False, key="fvg_log_scale",
+                help="Equal on-screen distance means equal PERCENT move instead of equal dollar move — "
+                     "a real $50k Bitcoin range and a $2k one look proportionally the same, instead of "
+                     "the small move getting flattened to nothing next to the big one.")
             show_volume_profile = st.checkbox(
                 "Volume Profile", value=False, key="fvg_show_volume_profile",
                 help="How much volume traded at each PRICE level (not each candle) over this "
@@ -2333,7 +2399,8 @@ with main_col:
         _new_cc = {
             "layers": layers, "layer_tf": layer_tf, "max_items_per_layer": max_items_per_layer,
             "selected_kill_zones": selected_kill_zones, "show_mitigated": show_mitigated,
-            "show_volume": show_volume, "show_rsi": show_rsi, "show_macd": show_macd, "show_bb": show_bb,
+            "show_volume": show_volume, "log_scale": show_log_scale,
+            "show_rsi": show_rsi, "show_macd": show_macd, "show_bb": show_bb,
             "show_atr": show_atr,
             "show_ma": show_indicators, "ma_tf": indicator_tf, "show_volume_profile": show_volume_profile,
             "vp_anchor": vp_anchor, "vp_anchor_date": vp_anchor_date,
@@ -2730,6 +2797,7 @@ with main_col:
     selected_kill_zones = _cc.get("selected_kill_zones", [])
     show_mitigated = _cc.get("show_mitigated", False)
     show_volume = _cc.get("show_volume", False)
+    show_log_scale = _cc.get("log_scale", False)
     show_rsi = _cc.get("show_rsi", False)
     show_macd = _cc.get("show_macd", False)
     show_bb = _cc.get("show_bb", False)
@@ -2810,6 +2878,7 @@ with main_col:
             selected_kill_zones = _cc.get("selected_kill_zones", [])
             show_mitigated = _cc.get("show_mitigated", False)
             show_volume = _cc.get("show_volume", False)
+            show_log_scale = _cc.get("log_scale", False)
             show_rsi = _cc.get("show_rsi", False)
             show_macd = _cc.get("show_macd", False)
             show_bb = _cc.get("show_bb", False)
@@ -2954,7 +3023,12 @@ with main_col:
             # just "a little past now" on the main chart's OWN axis, which
             # stays correct regardless of which timeframe actually detected
             # the structure being extended.
-            FUTURE_EXTEND_CANDLES = 3
+            # Direct request: when Price Projection is on, still-open areas/
+            # levels should reach as far as the projection itself does,
+            # instead of stopping a token few candles past "now" — one
+            # shared boundary (PRICE_PROJECTION_BARS) for both, so they can
+            # never silently drift out of sync with each other.
+            FUTURE_EXTEND_CANDLES = PRICE_PROJECTION_BARS if "Price Projection" in layers else 3
             bar_step = (axis_secs[-1] - axis_secs[-2]) if len(axis_secs) > 1 else 1
             future_edge = axis_secs[-1] + FUTURE_EXTEND_CANDLES * bar_step
 
@@ -3756,6 +3830,43 @@ with main_col:
                                 "label": KILL_ZONE_LABELS[kz_name],
                             })
 
+            if "Price Projection" in layers:
+                _proj = _compute_price_projection(df, c_col)
+                if _proj is not None:
+                    _proj_bar_secs = _TF_BAR_SECONDS[tf_label]
+                    _proj_n = len(_proj["center"])
+                    for _pi in range(_proj_n):
+                        _pt0 = _entry_x + _pi * _proj_bar_secs
+                        _pt1 = _entry_x + (_pi + 1) * _proj_bar_secs
+                        # Outer 2-sigma band first (wider, fainter), inner
+                        # 1-sigma drawn right after so it layers visually
+                        # on top as a "core" region within the wider one —
+                        # same z-order-by-append-order every other layer
+                        # here already relies on.
+                        rectangles.append({"t0": _pt0, "t1": _pt1, "p0": _proj["lower2"][_pi],
+                                            "p1": _proj["upper2"][_pi],
+                                            "fill": _hex_to_rgba(theme.NEON_CYAN, 0.05), "border": None})
+                        rectangles.append({"t0": _pt0, "t1": _pt1, "p0": _proj["lower1"][_pi],
+                                            "p1": _proj["upper1"][_pi],
+                                            "fill": _hex_to_rgba(theme.NEON_CYAN, 0.10), "border": None})
+                    for _pi in range(_proj_n):
+                        _pt0 = _entry_x + _pi * _proj_bar_secs
+                        _pt1 = _entry_x + (_pi + 1) * _proj_bar_secs
+                        # price_lines has no native slope (a straight
+                        # horizontal segment per t0/t1, see ict_chart's own
+                        # docstring) — chaining one short segment per future
+                        # bar, each at that bar's own projected price,
+                        # approximates the sloped trend line as a fine
+                        # staircase. Label only on the LAST segment — one
+                        # honest disclaimer, not the same text repeated
+                        # n_bars times down the line.
+                        price_lines.append({
+                            "t0": _pt0, "t1": _pt1, "price": _proj["center"][_pi],
+                            "color": _hex_to_rgba(theme.NEON_AMBER, 0.9), "line_width": 1, "dashed": True,
+                            "title": "Trend extrapolation — NOT a validated prediction" if _pi == _proj_n - 1 else "",
+                            "above": True,
+                        })
+
             if "FVG" in layers:
                 rf = tf_frames.get(layer_tf["FVG"])
                 if rf is not None:
@@ -4397,7 +4508,7 @@ with main_col:
                           # some zoom levels.
                           "markers": sorted(markers, key=lambda m: m["time"]),
                           "ghost_candles": ghost_candles, "volume_profile": volume_profile_buckets},
-                options={"log_scale": False, "volume": show_volume,
+                options={"log_scale": show_log_scale, "volume": show_volume,
                           "selected": st.session_state.get("selected_chart") == "main",
                           # A touch narrower than the mini panels' candles —
                           # lightweight-charts derives candle width straight
@@ -5154,7 +5265,8 @@ with main_col:
             # the padding bars above to actually be visible, since
             # lightweight-charts clamps any requested range past the
             # series' own last real point.
-            options={"volume": False, "selected": False, "future_margin_frac": 0.4, "preserve_logical_range": True},
+            options={"volume": False, "selected": False, "future_margin_frac": 0.4, "preserve_logical_range": True,
+                     "log_scale": st.session_state.get("fvg_log_scale", False)},
             # No "symbol" key here on purpose — the frontend's connectLiveFeed
             # guard (`if (!tickerSymbol...) return`) treats a missing symbol
             # as "don't connect," which is exactly what a replay needs: this
