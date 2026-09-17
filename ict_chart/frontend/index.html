@@ -1706,7 +1706,15 @@ function _overlayArrayChanged(key, value) {
 // nowhere near what the attach/detach churn itself costs.
 function applyOverlays(overlays) {
   overlays = overlays || {};
-  if (_overlayArrayChanged('ghost_candles', overlays.ghost_candles)) {
+  // ghost_candles/volume_profile are OMITTED entirely (not sent as an
+  // empty array — a real, meaningful difference) on a plain incremental
+  // tick, since Python only recomputes either one on a genuine full
+  // reload. Checking key PRESENCE first, before ever touching
+  // _overlayArrayChanged's own JSON.stringify compare, means an
+  // incremental tick skips this pair completely instead of paying to
+  // serialize/compare a ~250KB array just to conclude nothing changed —
+  // whatever's already attached is already correct, so do nothing at all.
+  if ('ghost_candles' in overlays && _overlayArrayChanged('ghost_candles', overlays.ghost_candles)) {
     activeGhostCandles.forEach((g) => candleSeries.detachPrimitive(g));
     activeGhostCandles = [];
     // ONE batch primitive holding every tile, not one primitive PER tile —
@@ -1722,7 +1730,7 @@ function applyOverlays(overlays) {
       activeGhostCandles.push(batch);
     }
   }
-  if (_overlayArrayChanged('volume_profile', overlays.volume_profile)) {
+  if ('volume_profile' in overlays && _overlayArrayChanged('volume_profile', overlays.volume_profile)) {
     if (activeVolumeProfile) {
       candleSeries.detachPrimitive(activeVolumeProfile);
       activeVolumeProfile = null;
@@ -1768,41 +1776,90 @@ function applyOverlays(overlays) {
  * the main one before rebuilding, so toggling RSI/MACD off actually
  * reclaims the vertical space instead of leaving an empty pane behind.
  * ------------------------------------------------------------------- */
-let indicatorSeries = [];
+let indicatorSeriesMap = {};
+// Same "non-decreasing time or lightweight-charts throws" guard
+// candleSeries already needed (see safeSeriesUpdate/lastSeriesTime above)
+// — a fresh trailing-N-point tail is recomputed every incremental tick,
+// so consecutive ticks' tails overlap (the same bar can appear near the
+// END of one tick's tail and near the START of the next), and naively
+// replaying a whole tail in order calls .update() with an OLDER time
+// than what the series already has, which throws "Cannot update oldest
+// data" — confirmed directly, not hypothetical. One tracked time per
+// series, keyed the same as indicatorSeriesMap.
+let lastIndicatorTime = {};
 
 function clearIndicators() {
-  indicatorSeries.forEach((s) => {
+  Object.values(indicatorSeriesMap).forEach((s) => {
     try { chart.removeSeries(s); } catch (e) { /* already gone */ }
   });
-  indicatorSeries = [];
+  indicatorSeriesMap = {};
+  lastIndicatorTime = {};
   while (chart.panes().length > 1) {
     chart.removePane(chart.panes().length - 1);
   }
 }
 
-// Same "don't touch anything unless it actually changed" fix as
-// applyOverlays above, and for the same reason: this used to tear down
-// EVERY indicator series (removeSeries) AND every extra pane (RSI/MACD's
-// own, via removePane) and rebuild them from scratch on every render call
-// — including the main chart's own once-a-second auto-refresh tick, even
-// when none of MA/RSI/MACD/Bollinger had changed at all. With up to 8
-// series (rsi, macd x3, ma20, ma50, bb x3) each carrying up to ~17k
-// points on a real 5m chart, that's real, avoidable churn: pane removal/
-// creation triggers a full layout recalculation, and setData() on a
-// freshly-created series has to re-process every point even when the
-// data is byte-identical to what was already showing.
-let lastIndicatorsRaw = null;
+function safeIndicatorUpdate(key, point) {
+  const s = indicatorSeriesMap[key];
+  if (!s || !point) return;
+  const last = lastIndicatorTime[key];
+  if (last !== undefined && point.time < last) return; // stale, a faster/earlier source already advanced past this
+  s.update(point);
+  lastIndicatorTime[key] = point.time;
+}
 
+// Python now tells us directly whether this is a full reload
+// (ind._full_reload) instead of us guessing from a content hash — a
+// hash-based skip (what applyOverlays' ghost_candles/markers arrays still
+// correctly use) doesn't work for indicators specifically: unlike those,
+// indicator SERIES genuinely gain a new point almost every tick a bar
+// forms, so a JSON.stringify comparison almost never matched anyway,
+// meaning this used to do a full pane teardown + rebuild (up to 8 series,
+// each carrying the WHOLE loaded window's worth of points — confirmed
+// directly at over 1MB of JSON on a real 1m chart) on close to every
+// single auto-refresh tick, not just genuine full reloads. Same fix as
+// bars/ghost candles already got: full rebuild only when Python says the
+// indicator SETTINGS (or anything else forcing a full reload) actually
+// changed; otherwise `ind` carries just the last few points of each
+// active series, pushed onto the EXISTING series via .update() instead of
+// a full setData() teardown+rebuild.
 function applyIndicators(ind) {
   ind = ind || {};
-  const changed = JSON.stringify(ind) !== JSON.stringify(lastIndicatorsRaw);
-  lastIndicatorsRaw = ind;
-  if (!changed) return;
+  if (ind._full_reload === false) {
+    const pushTail = (key, arr) => {
+      if (!arr) return;
+      arr.forEach((point) => safeIndicatorUpdate(key, point));
+    };
+    pushTail('rsi', ind.rsi);
+    pushTail('atr', ind.atr);
+    if (ind.macd) {
+      pushTail('macd_line', ind.macd.macd);
+      pushTail('macd_signal', ind.macd.signal);
+      pushTail('macd_hist', ind.macd.histogram);
+    }
+    pushTail('ma_fast', ind.ma_fast);
+    pushTail('ma_slow', ind.ma_slow);
+    if (ind.bb) {
+      pushTail('bb_upper', ind.bb.upper);
+      pushTail('bb_basis', ind.bb.basis);
+      pushTail('bb_lower', ind.bb.lower);
+    }
+    return;
+  }
 
   clearIndicators();
-  if (!ind) return;
   let nextPane = 1;
   let numFixedPanes = 0; // RSI/MACD panes, each fixed at FIXED_PANE_PX
+
+  // Registers a fresh full-reload series AND seeds lastIndicatorTime from
+  // its own last point, so the very next INCREMENTAL tick's
+  // safeIndicatorUpdate has a real baseline to compare against instead of
+  // treating everything as "newer" (undefined) and silently accepting a
+  // stale point right after a reload.
+  const registerSeries = (key, series, dataArr) => {
+    indicatorSeriesMap[key] = series;
+    lastIndicatorTime[key] = (dataArr && dataArr.length) ? dataArr[dataArr.length - 1].time : undefined;
+  };
 
   if (ind.rsi && ind.rsi.length) {
     const s = chart.addSeries(LC.LineSeries, {
@@ -1811,7 +1868,7 @@ function applyIndicators(ind) {
     s.setData(ind.rsi);
     s.createPriceLine({ price: 70, color: 'rgba(255,255,255,0.25)', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: '70' });
     s.createPriceLine({ price: 30, color: 'rgba(255,255,255,0.25)', lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: '30' });
-    indicatorSeries.push(s);
+    registerSeries('rsi', s, ind.rsi);
     nextPane += 1;
     numFixedPanes += 1;
   }
@@ -1827,7 +1884,7 @@ function applyIndicators(ind) {
       color: '#5E5CE6', lineWidth: 1, priceLineVisible: false, lastValueVisible: true,
     }, nextPane);
     s.setData(ind.atr);
-    indicatorSeries.push(s);
+    registerSeries('atr', s, ind.atr);
     nextPane += 1;
     numFixedPanes += 1;
   }
@@ -1839,7 +1896,9 @@ function applyIndicators(ind) {
     signalLine.setData(ind.macd.signal || []);
     const hist = chart.addSeries(LC.HistogramSeries, { priceLineVisible: false, lastValueVisible: false }, nextPane);
     hist.setData(ind.macd.histogram || []);
-    indicatorSeries.push(macdLine, signalLine, hist);
+    registerSeries('macd_line', macdLine, ind.macd.macd);
+    registerSeries('macd_signal', signalLine, ind.macd.signal);
+    registerSeries('macd_hist', hist, ind.macd.histogram);
     nextPane += 1;
     numFixedPanes += 1;
   }
@@ -1866,7 +1925,7 @@ function applyIndicators(ind) {
       title: `EMA ${ind.ma_fast_period ?? ''}`,
     }, 0);
     s.setData(ind.ma_fast);
-    indicatorSeries.push(s);
+    registerSeries('ma_fast', s, ind.ma_fast);
   }
   if (ind.ma_slow && ind.ma_slow.length) {
     const s = chart.addSeries(LC.LineSeries, {
@@ -1874,16 +1933,17 @@ function applyIndicators(ind) {
       title: `EMA ${ind.ma_slow_period ?? ''}`,
     }, 0);
     s.setData(ind.ma_slow);
-    indicatorSeries.push(s);
+    registerSeries('ma_slow', s, ind.ma_slow);
   }
   if (ind.bb) {
-    ['upper', 'basis', 'lower'].forEach((k) => {
+    const bbKeys = { upper: 'bb_upper', basis: 'bb_basis', lower: 'bb_lower' };
+    Object.entries(bbKeys).forEach(([k, mapKey]) => {
       if (!ind.bb[k] || !ind.bb[k].length) return;
       const s = chart.addSeries(LC.LineSeries, {
         color: 'rgba(10,132,255,0.55)', lineWidth: 1, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false,
       }, 0);
       s.setData(ind.bb[k]);
-      indicatorSeries.push(s);
+      registerSeries(mapKey, s, ind.bb[k]);
     });
   }
 

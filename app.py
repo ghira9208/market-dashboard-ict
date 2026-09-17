@@ -4877,18 +4877,82 @@ with main_col:
             st.session_state["_main_last_sent_fp"] = fingerprint
             bars_payload = bars if _is_full_reload else bars[-2:]
 
+            # Indicators got NONE of the incremental treatment bars/ghost
+            # candles already have — _chart_indicators holds the WHOLE
+            # loaded window's worth of MA/RSI/MACD/BB/ATR points, rebuilt
+            # fresh from the current df every render, and it was being
+            # sent (and the frontend was doing a full pane teardown +
+            # rebuild for) IN FULL on every single tick, not just full
+            # reloads — confirmed directly: on a live 1m chart with just
+            # MA showing, this measured over 1MB of JSON, repeated on
+            # close to every auto-refresh tick, dwarfing the bars payload
+            # itself (which was already fixed to 2 rows). The reason a
+            # plain content-hash skip (what ghost_candles/markers already
+            # use) doesn't work here: unlike those, indicator SERIES
+            # genuinely change every tick a new bar forms, so the hash
+            # never matched and a full rebuild fired almost every time
+            # anyway. Same fix as bars: full resend only when the
+            # indicator SETTINGS themselves changed (or a genuine full
+            # reload happened for any other reason) — otherwise send just
+            # the last few points and let the frontend .update() them onto
+            # its already-existing series instead of tearing everything
+            # down.
+            _ind_settings_fp = (
+                show_indicators, ma_fast_period, ma_slow_period, indicator_tf,
+                show_rsi, rsi_period, show_macd, macd_fast, macd_slow, macd_signal,
+                show_bb, bb_period, bb_std, show_atr, atr_period_ind,
+            )
+            _indicators_full_reload = _is_full_reload or (
+                st.session_state.get("_main_last_indicator_fp") != _ind_settings_fp)
+            st.session_state["_main_last_indicator_fp"] = _ind_settings_fp
+            if _indicators_full_reload:
+                _chart_indicators["_full_reload"] = True
+            else:
+                _INDICATOR_TAIL = 3
+                _trimmed_indicators = {}
+                for _ik, _iv in _chart_indicators.items():
+                    if isinstance(_iv, list):
+                        _trimmed_indicators[_ik] = _iv[-_INDICATOR_TAIL:]
+                    elif isinstance(_iv, dict):
+                        _trimmed_indicators[_ik] = {
+                            _ik2: (_iv2[-_INDICATOR_TAIL:] if isinstance(_iv2, list) else _iv2)
+                            for _ik2, _iv2 in _iv.items()
+                        }
+                    else:
+                        _trimmed_indicators[_ik] = _iv  # scalars (periods) — cheap, always included
+                _trimmed_indicators["_full_reload"] = False
+                _chart_indicators = _trimmed_indicators
+
+            _main_overlays = {
+                "rectangles": rectangles, "price_lines": price_lines,
+                # lightweight-charts' series-markers plugin requires
+                # markers pre-sorted ascending by time — Swing
+                # Points appends bullish/bearish in two separate
+                # loops, so the raw list isn't globally sorted.
+                # Confirmed directly: passing it unsorted is why
+                # bearish (arrowDown) markers were disappearing at
+                # some zoom levels.
+                "markers": sorted(markers, key=lambda m: m["time"]),
+            }
+            # ghost_candles/volume_profile only ever change on a genuine
+            # full reload (ticker/timeframe/overlay-TF/backfill depth) —
+            # never on a plain incremental tick — but were being rebuilt
+            # and sent in full every single render regardless (measured at
+            # ~250KB on a real 1m chart). The frontend's own
+            # _overlayArrayChanged already skips the expensive
+            # detach/reattach when the content matches what's already
+            # showing, but it still has to receive and JSON-stringify the
+            # whole array to find that out. Omitting the keys entirely on
+            # an incremental tick (see applyOverlays' own matching change)
+            # skips that comparison altogether instead of just skipping
+            # the redraw — leaving whatever's already attached untouched,
+            # which is exactly correct since this data hasn't changed.
+            if _is_full_reload:
+                _main_overlays["ghost_candles"] = ghost_candles
+                _main_overlays["volume_profile"] = volume_profile_buckets
             clicked = ict_chart(
                 bars_payload, fingerprint,
-                overlays={"rectangles": rectangles, "price_lines": price_lines,
-                          # lightweight-charts' series-markers plugin requires
-                          # markers pre-sorted ascending by time — Swing
-                          # Points appends bullish/bearish in two separate
-                          # loops, so the raw list isn't globally sorted.
-                          # Confirmed directly: passing it unsorted is why
-                          # bearish (arrowDown) markers were disappearing at
-                          # some zoom levels.
-                          "markers": sorted(markers, key=lambda m: m["time"]),
-                          "ghost_candles": ghost_candles, "volume_profile": volume_profile_buckets},
+                overlays=_main_overlays,
                 options={"log_scale": show_log_scale, "volume": show_volume,
                           "selected": st.session_state.get("selected_chart") == "main",
                           # A touch narrower than the mini panels' candles —
