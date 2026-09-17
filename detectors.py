@@ -24,7 +24,7 @@ renamed to detectors.py to actually match what's here):
 import numpy as np
 import streamlit as st
 
-from indicators import volume_profile
+from indicators import atr, volume_profile
 
 # Detection here is O(n) but with per-row pandas access, not free on a
 # multi-thousand-row df — and several of these are called more than once per
@@ -1258,3 +1258,111 @@ def merge_zone_engines(recent, historical):
     should only ever be drawn once."""
     seen = {id(z) for z in recent}
     return list(recent) + [z for z in historical if id(z) not in seen]
+
+
+def find_clean_respect_streaks(df, zone_types=("FVG", "Order Block"), min_streak=3,
+                                min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """Runs of CONSECUTIVE zones (FVG and/or Order Block, merged into one
+    formation-time-ordered timeline) that every single one gets
+    genuinely RESPECTED — the exact "clean price action" read a
+    discretionary trader means by it: price never CLOSES through the
+    zone (a wick tapping it is fine, ICT's own "liquidity grab, still
+    respected" case) and the zone never gets 100% wicked/mitigated (its
+    own detect_fvgs/detect_order_blocks "filled"/"mitigated" flag — a
+    partial eat-into is fine, full consumption is not). A zone that
+    fails EITHER test ends the current streak; only runs of at least
+    min_streak zones are returned, so isolated one-off "got respected"
+    zones (common, not interesting) don't count.
+
+    Returns a list of {"start", "end", "n_zones", "zones", "bullish",
+    "bearish"} dicts, oldest streak first. Each zone in "zones" keeps its
+    own full detector shape (type/top/bottom/start/end/...) plus
+    "layer" ("FVG"/"Order Block") and "closed_through" (always False
+    here, kept for symmetry/debugging)."""
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    n = len(df)
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+
+    merged = []
+    if "FVG" in zone_types:
+        for z in detect_fvgs(df, min_body_ratio=min_body_ratio):
+            merged.append({**z, "layer": "FVG"})
+    if "Order Block" in zone_types:
+        for z in detect_order_blocks(df, min_body_ratio=min_body_ratio):
+            merged.append({**z, "layer": "Order Block"})
+    merged.sort(key=lambda z: z["start"])
+
+    def _respected(z):
+        mitigated_flag = z.get("filled") if z["layer"] == "FVG" else z.get("mitigated")
+        if mitigated_flag:
+            return False
+        start_pos = pos_by_time.get(z["start"])
+        if start_pos is None:
+            return True
+        # Closed-through check uses the zone's OWN raw formation bounds
+        # (raw_top/raw_bottom for FVG, top/bottom already IS the
+        # formation size for a fresh Order Block) — the boundary a
+        # genuine close-through breaches, not the already-eaten-into
+        # "active" edge consequent encroachment may have shrunk it to.
+        top = z.get("raw_top", z["top"])
+        bottom = z.get("raw_bottom", z["bottom"])
+        future_closes = close_arr[start_pos + 1:]
+        if z["type"] == "bullish":
+            return not bool((future_closes < bottom).any())
+        else:
+            return not bool((future_closes > top).any())
+
+    streaks = []
+    current = []
+    for z in merged:
+        if _respected(z):
+            current.append(z)
+        else:
+            if len(current) >= min_streak:
+                streaks.append(current)
+            current = []
+    if len(current) >= min_streak:
+        streaks.append(current)
+
+    out = []
+    for s in streaks:
+        out.append({
+            "start": s[0]["start"], "end": s[-1]["end"], "n_zones": len(s), "zones": s,
+            "bullish": sum(1 for z in s if z["type"] == "bullish"),
+            "bearish": sum(1 for z in s if z["type"] == "bearish"),
+        })
+    return out
+
+
+def describe_streak_conditions(df, streak, atr_period=14):
+    """Context around one find_clean_respect_streaks entry, for the
+    "what conditions produced this" read a human studying it actually
+    wants: volatility regime (this streak's own mean ATR vs. the whole
+    df's own median — >1 means it happened in an above-normal-vol
+    stretch), net trend (close-to-close % move across the streak, sign
+    only meaningful alongside the bullish/bearish zone tally), and
+    duration (bars and, for an intraday df, wall-clock span)."""
+    idx = df.index
+    close = df["Close"] if "Close" in df else df["close"]
+    pos_by_time = {t: i for i, t in enumerate(idx)}
+    start_pos = pos_by_time.get(streak["start"], 0)
+    end_pos = pos_by_time.get(streak["end"], len(df) - 1)
+    end_pos = max(end_pos, start_pos)
+
+    atr_series = atr(df, atr_period)
+    streak_atr = atr_series.iloc[start_pos:end_pos + 1].mean()
+    baseline_atr = atr_series.median()
+    vol_ratio = float(streak_atr / baseline_atr) if baseline_atr else float("nan")
+
+    start_close = float(close.iloc[start_pos])
+    end_close = float(close.iloc[end_pos])
+    net_move_pct = (end_close - start_close) / start_close * 100 if start_close else float("nan")
+
+    return {
+        "n_bars": end_pos - start_pos + 1,
+        "duration": idx[end_pos] - idx[start_pos],
+        "vol_ratio_vs_median": vol_ratio,
+        "net_move_pct": net_move_pct,
+        "dominant_direction": "bullish" if streak["bullish"] > streak["bearish"]
+                               else ("bearish" if streak["bearish"] > streak["bullish"] else "mixed"),
+    }

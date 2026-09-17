@@ -38,6 +38,8 @@ from detectors import (
     detect_poor_highs_lows,
     detect_structure_breaks,
     detect_swings,
+    describe_streak_conditions,
+    find_clean_respect_streaks,
     historical_zone_scanner,
     merge_zone_engines,
     poc_migration,
@@ -4862,6 +4864,28 @@ with main_col:
                 rectangles = rectangles + _click_rects
                 price_lines = price_lines + _click_lines
 
+            # Clean-pattern streak study view — same additive convention
+            # as the clicked-zone confluence factors just above: every
+            # zone in the currently-selected streak drawn as its own
+            # cyan-outlined box via _scan_pick_overlays, composed on top
+            # of whatever else is showing rather than replacing it.
+            _selected_streak = st.session_state.get("_selected_streak")
+            if _selected_streak:
+                _streak_shape = {
+                    "direction": _selected_streak["bullish"] >= _selected_streak["bearish"] and "bullish" or "bearish",
+                    "entry": None, "label": None, "source_zone": None,
+                    "confluence_entry_details": [
+                        {"label": f"{z['layer']} ({z['type']})",
+                         "zones": [{"kind": "rect", "top": z["top"], "bottom": z["bottom"],
+                                    "start": z["start"], "end": z["end"]}]}
+                        for z in _selected_streak["zones"]
+                    ],
+                    "confluence_context_details": [],
+                }
+                _streak_rects, _streak_lines = _scan_pick_overlays(_streak_shape, future_edge, _ny_fake_utc_seconds)
+                rectangles = rectangles + _streak_rects
+                price_lines = price_lines + _streak_lines
+
             fingerprint = (f"{ticker}|{tf_label}|{'+'.join(sorted(selected_kill_zones))}|{show_mitigated}|"
                             f"{bars[0]['time'] if bars else 0}")
 
@@ -5129,6 +5153,12 @@ with main_col:
             # needs to be discoverable BEFORE a first click, not appear
             # out of nowhere only after one happens.
             _detail_tabs.append(("🎯 Clicked zone", "clicked_zone"))
+            # Also unconditionally appended — the streak SEARCH itself is
+            # cheap (reuses the already-cached detect_fvgs/detect_order_
+            # blocks this chart's own FVG/OB layers already call), so
+            # there's no reason to gate the tab's existence on a layer
+            # being toggled on first.
+            _detail_tabs.append(("🧹 Clean patterns", "clean_patterns"))
 
             def _render_detail_body(_key):
                 if _key == "legend":
@@ -5504,6 +5534,45 @@ with main_col:
                         else:
                             st.caption("No other currently-active ICT reads agree with this direction "
                                        "right now.")
+
+                elif _key == "clean_patterns":
+                    st.caption("Runs of consecutive FVG/Order Block zones that ALL got genuinely "
+                               "respected — a wick tapping one is fine (ICT's own 'liquidity grab, "
+                               "still respected'), but a close through it or a full 100% wick "
+                               "mitigation ends the run. Every streak below is still unbroken as of "
+                               "the last loaded bar — 'end' means 'still holding', not 'finished'.")
+                    _cp_col1, _cp_col2 = st.columns(2)
+                    with _cp_col1:
+                        _cp_min_streak = st.number_input("Minimum run length", min_value=2, max_value=20,
+                                                          value=3, step=1, key="cp_min_streak")
+                    with _cp_col2:
+                        _cp_zone_types = st.multiselect("Zone types", ["FVG", "Order Block"],
+                                                          default=["FVG", "Order Block"], key="cp_zone_types")
+                    if not _cp_zone_types:
+                        st.caption("Pick at least one zone type.")
+                    else:
+                        _cp_streaks = find_clean_respect_streaks(
+                            df, zone_types=tuple(_cp_zone_types), min_streak=_cp_min_streak)
+                        if not _cp_streaks:
+                            st.caption(f"No runs of {_cp_min_streak}+ consecutive respected zones found "
+                                       f"on this chart's own currently-loaded history.")
+                        else:
+                            st.caption(f"{len(_cp_streaks)} found, most recent first.")
+                            for _cp_i, _cp_s in enumerate(reversed(_cp_streaks)):
+                                _cp_cond = describe_streak_conditions(df, _cp_s)
+                                _cp_dir = _cp_cond["dominant_direction"]
+                                _cp_label = (f"#{len(_cp_streaks) - _cp_i} — {_cp_s['n_zones']} zones "
+                                             f"({_cp_s['bullish']}▲ {_cp_s['bearish']}▼), {_cp_dir}, "
+                                             f"{_cp_cond['n_bars']} bars, vol {_cp_cond['vol_ratio_vs_median']:.2f}x "
+                                             f"median, net {_cp_cond['net_move_pct']:+.2f}%")
+                                _cp_row1, _cp_row2 = st.columns([5, 1])
+                                with _cp_row1:
+                                    st.markdown(f"**{_cp_label}**")
+                                    st.caption(f"{_cp_s['start']} → {_cp_s['end']} ({_cp_cond['duration']})")
+                                with _cp_row2:
+                                    if st.button("View", key=f"cp_view_{ticker}_{tf_label}_{_cp_i}"):
+                                        st.session_state["_selected_streak"] = _cp_s
+                                        st.rerun()
 
             if len(_detail_tabs) == 1:
                 _only_label, _only_key = _detail_tabs[0]
