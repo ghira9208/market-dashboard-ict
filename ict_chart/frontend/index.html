@@ -1597,35 +1597,43 @@ chart.subscribeCrosshairMove((param) => {
 });
 
 // A plain click (not a pan-drag) reports "this chart got picked" up to
-// Streamlit as the component's return value. Sending Date.now() rather
-// than a fixed value guarantees Python sees a genuinely new value on every
-// click, including clicking the SAME already-selected chart again — a
-// value that never changes would never re-fire the widget-changed check on
-// the Python side.
+// Streamlit as the component's return value — plus, now, WHERE it was
+// clicked (time/price), so Python can hit-test it against known zones
+// (Feature C: "click an area, scan for what's meaningful about it").
+// clickId is Date.now() rather than a fixed value so Python sees a
+// genuinely new value on every click, including clicking the SAME
+// already-selected chart again at a different spot — a value that never
+// changes would never re-fire the widget-changed check on the Python
+// side. No "which panel" field needed: each ict_chart(...) call (main,
+// mini HTF, mini LTF) is already its own component instance with its own
+// key, so Python already knows which panel a return value came from at
+// its own call site.
 chart.subscribeClick((param) => {
   if (!param) return;
-  if (measureMode && param.time !== undefined && param.point) {
-    const price = candleSeries.coordinateToPrice(param.point.y);
-    if (price !== null) {
-      const point = { time: param.time, price };
-      if (!measureA) {
-        // First click of a pair — drop a dot marker so there's immediate
-        // feedback, then wait for the second click to complete the line.
-        measureA = point;
-        const dot = new MeasurePrimitive(point, null, '#0A84FF', null);
-        candleSeries.attachPrimitive(dot);
-        measurePrimitives.push(dot);
-      } else {
-        const pending = measurePrimitives[measurePrimitives.length - 1];
-        pending.setPoint2(point, measureLabel(measureA, point));
-        measureA = null;
-      }
+  const hasPoint = param.time !== undefined && !!param.point;
+  const clickPrice = hasPoint ? candleSeries.coordinateToPrice(param.point.y) : null;
+  if (measureMode && hasPoint && clickPrice !== null) {
+    const point = { time: param.time, price: clickPrice };
+    if (!measureA) {
+      // First click of a pair — drop a dot marker so there's immediate
+      // feedback, then wait for the second click to complete the line.
+      measureA = point;
+      const dot = new MeasurePrimitive(point, null, '#0A84FF', null);
+      candleSeries.attachPrimitive(dot);
+      measurePrimitives.push(dot);
+    } else {
+      const pending = measurePrimitives[measurePrimitives.length - 1];
+      pending.setPoint2(point, measureLabel(measureA, point));
+      measureA = null;
     }
   }
   // Still reported even while measuring — "this panel got clicked" and
   // "a measurement point got placed" aren't mutually exclusive, and the
   // panel-select behavior is harmless to keep regardless of tool mode.
-  sendToStreamlit('streamlit:setComponentValue', { value: Date.now(), dataType: 'json' });
+  sendToStreamlit('streamlit:setComponentValue', {
+    value: { clickId: Date.now(), time: hasPoint ? param.time : null, price: clickPrice },
+    dataType: 'json',
+  });
 });
 
 // Shared by both clear paths below: turning the tool off, and right-click.
@@ -1848,18 +1856,24 @@ function applyIndicators(ind) {
   // see should be obvious, not inferred from a sidebar label alone).
   // Two distinct, high-contrast colors so which line is which reads at a
   // glance without a legend.
-  if (ind.ma20 && ind.ma20.length) {
+  // Generic ma_fast/ma_slow keys, not ma20/ma50 literals — the periods
+  // are user-adjustable now, so the title reads whatever period Python
+  // actually computed (ma_fast_period/ma_slow_period) instead of a
+  // hardcoded number that could silently go stale.
+  if (ind.ma_fast && ind.ma_fast.length) {
     const s = chart.addSeries(LC.LineSeries, {
-      color: '#FFD60A', lineWidth: 2, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false, title: 'EMA 20',
+      color: '#FFD60A', lineWidth: 2, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false,
+      title: `EMA ${ind.ma_fast_period ?? ''}`,
     }, 0);
-    s.setData(ind.ma20);
+    s.setData(ind.ma_fast);
     indicatorSeries.push(s);
   }
-  if (ind.ma50 && ind.ma50.length) {
+  if (ind.ma_slow && ind.ma_slow.length) {
     const s = chart.addSeries(LC.LineSeries, {
-      color: '#64D2FF', lineWidth: 2, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false, title: 'EMA 50',
+      color: '#64D2FF', lineWidth: 2, priceScaleId: 'left', priceLineVisible: false, lastValueVisible: false,
+      title: `EMA ${ind.ma_slow_period ?? ''}`,
     }, 0);
-    s.setData(ind.ma50);
+    s.setData(ind.ma_slow);
     indicatorSeries.push(s);
   }
   if (ind.bb) {

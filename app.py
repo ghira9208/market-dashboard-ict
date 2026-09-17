@@ -53,6 +53,7 @@ from recommender import (
     MA_FVG_PERIODS,
     RULE_DETECTOR_LABELS,
     TF_PAIRS,
+    _confluence_score,
     backtest_custom_rule,
     best_trade_now,
     fvg_event_win_rate,
@@ -72,6 +73,7 @@ from recommender import (
     zone_indicator_matches,
 )
 from research.data_loader import INTERVAL_MAX_PERIOD, load_history
+from research.setups import EVENT_TYPE_TO_HYPOTHESIS, validation_badge
 
 
 st.set_page_config(page_title="Markets", layout="wide", initial_sidebar_state="collapsed")
@@ -812,6 +814,53 @@ def fvg_legend(items):
 # every ~10s tick would be a real bandwidth/rerun-cost regression), so it
 # needs the frontend to flag the mismatch instead of Python guessing it away.
 _CHART_NEEDS_FULL_RELOAD = "__ICT_CHART_NEEDS_FULL_RELOAD__"
+
+
+def _reverse_ny_fake_utc_seconds(secs):
+    """Inverse of _ny_fake_utc_seconds — given the fake-UTC epoch seconds
+    a chart click reports, recovers the real, tz-aware timestamp it
+    corresponds to. _ny_fake_utc_seconds took a real ts, converted to the
+    display tz, stripped the tz label, and encoded those wall-clock digits
+    as if they were UTC; this just runs that exact chain backwards:
+    rebuild the naive wall-clock digits, then genuinely localize them to
+    the display tz (not UTC) to get back a real instant. Comparisons
+    against a df index in any other tz still work correctly afterward —
+    pandas Timestamp comparisons normalize by real instant, not by label."""
+    naive = _EPOCH + pd.Timedelta(seconds=secs)
+    return naive.tz_localize(theme.get_display_tz())
+
+
+def _hit_test_zone(clicked, clickable_zones):
+    """clicked: {"time": <fake-utc seconds>, "price": <float>} from the
+    chart's click handler. Returns the first clickable_zones entry (see
+    its own construction comment, next to `clickable_zones = []` in
+    _render_chart) whose box/level/point contains the click, searching in
+    REVERSE append order so a zone drawn later (visually on top, same
+    z-order every layer already draws in) wins on overlap. None on a
+    miss — an honest "didn't land on anything," not a guess."""
+    if not clickable_zones or clicked.get("price") is None or clicked.get("time") is None:
+        return None
+    click_price = clicked["price"]
+    click_time = _reverse_ny_fake_utc_seconds(clicked["time"])
+    for zone in reversed(clickable_zones):
+        df_ref = zone.get("df_ref")
+        bar_step = pd.Timedelta(seconds=60)
+        if df_ref is not None and len(df_ref) > 1:
+            bar_step = df_ref.index[-1] - df_ref.index[-2]
+        if zone["kind"] == "rect":
+            if zone["bottom"] <= click_price <= zone["top"] and zone["start"] <= click_time <= zone["end"]:
+                return zone
+        elif zone["kind"] == "level":
+            tolerance = abs(zone["price"]) * 0.0015
+            if abs(click_price - zone["price"]) <= tolerance and \
+                    zone["start"] - bar_step * 10 <= click_time <= zone["end"] + bar_step * 10:
+                return zone
+        else:  # "point"
+            tolerance = abs(zone["price"]) * 0.0015
+            if abs(click_price - zone["price"]) <= tolerance and \
+                    abs((click_time - zone["time"]).total_seconds()) <= bar_step.total_seconds() * 10:
+                return zone
+    return None
 
 
 def _select_chart(chart_id, click_value):
@@ -1977,6 +2026,41 @@ with main_col:
             # while an indicator is a plain, well-known technical formula —
             # different kinds of things, kept visually distinct.
             st.markdown("**Detectors**")
+            # Sensitivity knobs, tucked into a collapsed expander rather than
+            # inline with the per-layer checkboxes below — these are "how
+            # strict is a real signal" tuning, not day-to-day on/off choices,
+            # and most of the 12 layers share just THREE underlying knobs
+            # (detect_swings' own ATR sensitivity alone drives five of them),
+            # so one shared block beats one duplicate slider per layer.
+            with st.expander(":material/tune: Detector sensitivity (advanced)", expanded=False):
+                displacement_ratio = st.slider(
+                    "Displacement strictness", min_value=0.1, max_value=0.9, value=0.5, step=0.05,
+                    key="fvg_displacement_ratio",
+                    help="How much of a candle's own range has to be real body (not wick) before "
+                         "it counts as a genuine breakout/displacement move. Higher = stricter, fewer "
+                         "zones. Drives FVG, IFVG, Order Blocks, and Breaker Block — all four key off "
+                         "this same 'was that a real move' test.")
+                _swing_col1, _swing_col2 = st.columns(2)
+                with _swing_col1:
+                    swing_atr_period = st.number_input(
+                        "Swing ATR period", min_value=2, max_value=100, value=14, step=1,
+                        key="fvg_swing_atr_period",
+                        help="How many candles of typical range to average when deciding what counts "
+                             "as a big enough reversal to confirm a swing high/low.")
+                with _swing_col2:
+                    swing_atr_mult = st.number_input(
+                        "Swing reversal size (x ATR)", min_value=0.5, max_value=5.0, value=1.5, step=0.1,
+                        key="fvg_swing_atr_mult",
+                        help="How many ATRs price has to reverse before a swing point is confirmed. "
+                             "Higher = fewer, more significant swings; lower = more, smaller ones. "
+                             "This one pair of numbers drives Swing Points, Equal Highs/Lows, Market "
+                             "Structure, Premium/Discount, and Liquidity — all five ultimately read "
+                             "the same underlying swing detector.")
+                session_lookback_days = st.number_input(
+                    "Session lookback (days)", min_value=5, max_value=365, value=60, step=5,
+                    key="fvg_session_lookback_days",
+                    help="How many days back Naked POC and Poor High/Low look when bucketing "
+                         "session volume.")
             # One timeframe dropdown per layer, not a fixed 4h/15m pair — each
             # layer detects against exactly the timeframe its own dropdown
             # says, independent of every other layer and of the main chart's
@@ -1986,10 +2070,22 @@ with main_col:
             # here is a deliberate per-layer override, not a mistake to warn
             # about — there's no more "both toggles off" dead state to fall
             # into, a dropdown always has exactly one value.
+            # A few layers carry ONE extra knob beyond the shared sensitivity
+            # block above — not shared with any other layer, so it lives
+            # right on that layer's own row instead of the expander.
+            _PER_LAYER_EXTRA = {"Equal Highs/Lows", "Market Structure", "Liquidity", "Price Projection"}
             layers = []
             layer_tf = {}
+            eq_tolerance = 0.0015
+            ms_mode = "close"
+            liquidity_reaction_window = 5
+            price_projection_bars = PRICE_PROJECTION_BARS
             for name in ICT_LAYERS:
-                name_col, tf_col = st.columns([3, 2])
+                if name in _PER_LAYER_EXTRA:
+                    name_col, tf_col, extra_col = st.columns([3, 2, 2])
+                else:
+                    name_col, tf_col = st.columns([3, 2])
+                    extra_col = None
                 with name_col:
                     # No value= here — session_state is already seeded (see
                     # setdefault block above), from the persisted last-used
@@ -2002,6 +2098,34 @@ with main_col:
                                                    "main chart itself is showing. Pick a specific one to "
                                                    "detect this layer on its own fixed timeframe instead, "
                                                    "independent of the main chart selector.")
+                if extra_col is not None:
+                    with extra_col:
+                        if name == "Equal Highs/Lows":
+                            eq_tolerance = st.number_input(
+                                "Tolerance", min_value=0.0002, max_value=0.02, value=0.0015, step=0.0001,
+                                format="%.4f", key="fvg_eq_tolerance", label_visibility="collapsed",
+                                help="How close two swing prices must be, as a fraction of price, to "
+                                     "count as 'equal' highs/lows.")
+                        elif name == "Market Structure":
+                            ms_mode = st.selectbox(
+                                "Confirmation", ["Close", "Wick"], key="fvg_ms_mode",
+                                label_visibility="collapsed",
+                                help="'Close' (default): a break only counts once a candle CLOSES "
+                                     "beyond the level — decisive, fewer false breaks. 'Wick': counts "
+                                     "the moment a wick trades beyond it, without waiting for the "
+                                     "close — earlier, more of them.").lower()
+                        elif name == "Liquidity":
+                            liquidity_reaction_window = st.number_input(
+                                "Reaction window", min_value=1, max_value=30, value=5, step=1,
+                                key="fvg_liquidity_reaction_window", label_visibility="collapsed",
+                                help="How many candles after a liquidity sweep an order block can "
+                                     "still count as 'the reaction' to it.")
+                        elif name == "Price Projection":
+                            price_projection_bars = st.number_input(
+                                "Bars ahead", min_value=5, max_value=100, value=PRICE_PROJECTION_BARS,
+                                step=5, key="fvg_price_projection_bars", label_visibility="collapsed",
+                                help="How many bars into the future the projection cone/trend line "
+                                     "extends.")
                 if on:
                     layers.append(name)
                     layer_tf[name] = chosen_tf
@@ -2030,38 +2154,82 @@ with main_col:
             # defaults ON; RSI/MACD/Bollinger are just optional reading aids
             # with no strategy behind them here, so they default OFF.
             show_indicators = st.checkbox("MA", value=True, key="fvg_show_indicators",
-                                           help="Show/hide the EMA 20 / EMA 50 lines on the main chart. "
-                                                "Updates the instant a candle closes — no separate "
-                                                "confirmation delay the way Swing Points has above — but "
-                                                "as a moving average it's a DIFFERENT kind of lag: it's "
-                                                "always reacting to price that already happened, smoothed "
-                                                "over its own 20/50-candle window, not confirming a "
-                                                "specific past pivot the way the ICT layers do.")
+                                           help="Show/hide two EMA lines on the main chart. Updates the "
+                                                "instant a candle closes — no separate confirmation "
+                                                "delay the way Swing Points has above — but as a moving "
+                                                "average it's a DIFFERENT kind of lag: it's always "
+                                                "reacting to price that already happened, smoothed over "
+                                                "its own period, not confirming a specific past pivot "
+                                                "the way the ICT layers do.")
             _ind_tf_options = ["Chart TF"] + list(TIMEFRAMES.keys())
             indicator_tf = st.selectbox(
                 "MA timeframe", _ind_tf_options, index=0, key="fvg_indicator_tf",
                 label_visibility="collapsed", disabled=not show_indicators,
-                help="Which timeframe the EMA 20/50 lines are computed on. 'Chart TF' (default) "
+                help="Which timeframe the EMA lines are computed on. 'Chart TF' (default) "
                      "matches whatever timeframe the main chart itself is showing. Pick a higher "
                      "one (e.g. viewing 15m candles but computing the average on 1h closes) to "
                      "see a steadier, less noisy line laid over a more detailed chart.",
             )
+            _ma_col1, _ma_col2 = st.columns(2)
+            with _ma_col1:
+                ma_fast_period = st.number_input(
+                    "Fast EMA", min_value=2, max_value=200, value=20, step=1,
+                    key="fvg_ma_fast_period", disabled=not show_indicators,
+                    help="Chart-only — this line is for reading the chart. The MA+FVG strategy's "
+                         "own confluence scoring and win-rate stats still use the fixed 20/50 pair "
+                         "regardless of what's set here.")
+            with _ma_col2:
+                ma_slow_period = st.number_input(
+                    "Slow EMA", min_value=2, max_value=400, value=50, step=1,
+                    key="fvg_ma_slow_period", disabled=not show_indicators,
+                    help="Chart-only, same as Fast EMA — doesn't affect the MA+FVG strategy's own "
+                         "fixed 20/50 pair.")
             show_rsi = st.checkbox("Show RSI", value=False, key="fvg_show_rsi",
-                                    help="Adds an RSI (14) pane below the main chart. No confirmation "
+                                    help="Adds an RSI pane below the main chart. No confirmation "
                                          "delay — updates on every closed candle — but as a smoothed "
                                          "oscillator it's a lagging read of momentum that already "
                                          "happened, not a leading signal.")
+            rsi_period = st.number_input(
+                "RSI period", min_value=2, max_value=100, value=14, step=1,
+                key="fvg_rsi_period", disabled=not show_rsi, label_visibility="collapsed",
+                help="How many candles RSI averages over. Lower = twitchier, higher = smoother.")
             show_macd = st.checkbox("Show MACD", value=False, key="fvg_show_macd",
-                                     help="Adds a MACD (12/26/9) pane below the main chart. Same "
+                                     help="Adds a MACD pane below the main chart. Same "
                                           "'updates instantly, but reads what already happened' "
                                           "character as RSI above — built from two EMAs, so its own "
                                           "lag is the smoothing kind, not a confirmation delay.")
+            _macd_col1, _macd_col2, _macd_col3 = st.columns(3)
+            with _macd_col1:
+                macd_fast = st.number_input("MACD fast", min_value=2, max_value=100, value=12, step=1,
+                                             key="fvg_macd_fast", disabled=not show_macd,
+                                             label_visibility="collapsed", help="Fast EMA period.")
+            with _macd_col2:
+                macd_slow = st.number_input("MACD slow", min_value=2, max_value=200, value=26, step=1,
+                                             key="fvg_macd_slow", disabled=not show_macd,
+                                             label_visibility="collapsed", help="Slow EMA period.")
+            with _macd_col3:
+                macd_signal = st.number_input("MACD signal", min_value=2, max_value=100, value=9, step=1,
+                                               key="fvg_macd_signal", disabled=not show_macd,
+                                               label_visibility="collapsed",
+                                               help="Signal-line smoothing period.")
             show_bb = st.checkbox("Show Bollinger Bands", value=False, key="fvg_show_bb",
-                                   help="Adds Bollinger Bands (20-period, 2 std) over the candles "
-                                        "on the main chart. Same smoothing-lag character as RSI/MACD "
-                                        "above — the basis line is a 20-candle moving average.")
+                                   help="Adds Bollinger Bands over the candles on the main chart. "
+                                        "Same smoothing-lag character as RSI/MACD above — the basis "
+                                        "line is a moving average.")
+            _bb_col1, _bb_col2 = st.columns(2)
+            with _bb_col1:
+                bb_period = st.number_input("BB period", min_value=2, max_value=200, value=20, step=1,
+                                             key="fvg_bb_period", disabled=not show_bb,
+                                             label_visibility="collapsed",
+                                             help="How many candles the basis (middle) line averages.")
+            with _bb_col2:
+                bb_std = st.number_input("BB std dev", min_value=0.5, max_value=5.0, value=2.0, step=0.1,
+                                          key="fvg_bb_std", disabled=not show_bb,
+                                          label_visibility="collapsed",
+                                          help="How many standard deviations the upper/lower bands sit "
+                                               "from the basis line. Higher = wider bands.")
             show_atr = st.checkbox("Show ATR", value=False, key="fvg_show_atr",
-                                    help="Adds an ATR (14) pane below the main chart — how many "
+                                    help="Adds an ATR pane below the main chart — how many "
                                          "price units (not a percentage) this ticker has typically "
                                          "moved per candle lately. Rising = volatility expanding, "
                                          "falling = contracting. Useful for sizing a stop to the "
@@ -2071,6 +2239,10 @@ with main_col:
                                          "Same smoothing-lag character as RSI/MACD/BB above, not a "
                                          "confirmation delay — it's reacting to recent moves, not "
                                          "waiting to confirm a specific one.")
+            atr_period_ind = st.number_input(
+                "ATR period", min_value=2, max_value=100, value=14, step=1,
+                key="fvg_atr_period_ind", disabled=not show_atr, label_visibility="collapsed",
+                help="How many candles ATR averages over.")
             # Volume used to be permanently-on base chart furniture (no toggle) —
             # back to user-controlled, and defaulting off this time, on all three
             # panels (main + both mini charts) sharing this one setting rather
@@ -2467,6 +2639,21 @@ with main_col:
             "news_blackout": _news_blackout,
             "confluence_keys": _confluence_keys,
             "entry_rule": _entry_rule, "exit_rule": _exit_rule, "stop_rule": _stop_rule,
+            # Feature A — adjustable indicator periods (all chart-only, see
+            # each control's own help text on why they don't touch MA_FVG's
+            # own fixed 20/50 strategy pair).
+            "ma_fast_period": ma_fast_period, "ma_slow_period": ma_slow_period,
+            "rsi_period": rsi_period, "macd_fast": macd_fast, "macd_slow": macd_slow,
+            "macd_signal": macd_signal, "bb_period": bb_period, "bb_std": bb_std,
+            "atr_period_ind": atr_period_ind,
+            # Feature B — detector sensitivity (shared blocks + the few
+            # per-layer knobs), read back the same way as every other
+            # chart-affecting control here.
+            "displacement_ratio": displacement_ratio, "swing_atr_period": swing_atr_period,
+            "swing_atr_mult": swing_atr_mult, "session_lookback_days": session_lookback_days,
+            "eq_tolerance": eq_tolerance, "ms_mode": ms_mode,
+            "liquidity_reaction_window": liquidity_reaction_window,
+            "price_projection_bars": price_projection_bars,
             # Not a chart-drawing input itself, but its own toggle needs to
             # reach _render_chart the same forced way a rule change does on
             # 1D/1W/1M/1Y (see the comment just below) — omitting it here
@@ -2862,6 +3049,23 @@ with main_col:
     show_atr = _cc.get("show_atr", False)
     show_indicators = _cc.get("show_ma", True)
     indicator_tf = _cc.get("ma_tf", "Chart TF")
+    ma_fast_period = _cc.get("ma_fast_period", 20)
+    ma_slow_period = _cc.get("ma_slow_period", 50)
+    rsi_period = _cc.get("rsi_period", 14)
+    macd_fast = _cc.get("macd_fast", 12)
+    macd_slow = _cc.get("macd_slow", 26)
+    macd_signal = _cc.get("macd_signal", 9)
+    bb_period = _cc.get("bb_period", 20)
+    bb_std = _cc.get("bb_std", 2.0)
+    atr_period_ind = _cc.get("atr_period_ind", 14)
+    displacement_ratio = _cc.get("displacement_ratio", 0.5)
+    swing_atr_period = _cc.get("swing_atr_period", 14)
+    swing_atr_mult = _cc.get("swing_atr_mult", 1.5)
+    session_lookback_days = _cc.get("session_lookback_days", 60)
+    eq_tolerance = _cc.get("eq_tolerance", 0.0015)
+    ms_mode = _cc.get("ms_mode", "close")
+    liquidity_reaction_window = _cc.get("liquidity_reaction_window", 5)
+    price_projection_bars = _cc.get("price_projection_bars", PRICE_PROJECTION_BARS)
     show_volume_profile = _cc.get("show_volume_profile", False)
     vp_anchor = _cc.get("vp_anchor", "Full history")
     vp_anchor_date = _cc.get("vp_anchor_date")
@@ -2943,6 +3147,23 @@ with main_col:
             show_atr = _cc.get("show_atr", False)
             show_indicators = _cc.get("show_ma", True)
             indicator_tf = _cc.get("ma_tf", "Chart TF")
+            ma_fast_period = _cc.get("ma_fast_period", 20)
+            ma_slow_period = _cc.get("ma_slow_period", 50)
+            rsi_period = _cc.get("rsi_period", 14)
+            macd_fast = _cc.get("macd_fast", 12)
+            macd_slow = _cc.get("macd_slow", 26)
+            macd_signal = _cc.get("macd_signal", 9)
+            bb_period = _cc.get("bb_period", 20)
+            bb_std = _cc.get("bb_std", 2.0)
+            atr_period_ind = _cc.get("atr_period_ind", 14)
+            displacement_ratio = _cc.get("displacement_ratio", 0.5)
+            swing_atr_period = _cc.get("swing_atr_period", 14)
+            swing_atr_mult = _cc.get("swing_atr_mult", 1.5)
+            session_lookback_days = _cc.get("session_lookback_days", 60)
+            eq_tolerance = _cc.get("eq_tolerance", 0.0015)
+            ms_mode = _cc.get("ms_mode", "close")
+            liquidity_reaction_window = _cc.get("liquidity_reaction_window", 5)
+            price_projection_bars = _cc.get("price_projection_bars", PRICE_PROJECTION_BARS)
             show_volume_profile = _cc.get("show_volume_profile", False)
             vp_anchor = _cc.get("vp_anchor", "Full history")
             vp_anchor_date = _cc.get("vp_anchor_date")
@@ -3086,7 +3307,7 @@ with main_col:
             # instead of stopping a token few candles past "now" — one
             # shared boundary (PRICE_PROJECTION_BARS) for both, so they can
             # never silently drift out of sync with each other.
-            FUTURE_EXTEND_CANDLES = PRICE_PROJECTION_BARS if "Price Projection" in layers else 3
+            FUTURE_EXTEND_CANDLES = price_projection_bars if "Price Projection" in layers else 3
             bar_step = (axis_secs[-1] - axis_secs[-2]) if len(axis_secs) > 1 else 1
             future_edge = axis_secs[-1] + FUTURE_EXTEND_CANDLES * bar_step
 
@@ -3145,6 +3366,15 @@ with main_col:
             # docstring for what these are and why they persist across
             # sessions instead of resetting with each new profile.
             naked_poc_rows = []
+            # One normalized entry per drawn geometry (rect/level/point),
+            # built alongside the rows above in the same per-layer blocks —
+            # what a click on the chart gets hit-tested against (Feature C,
+            # "click a zone, get a confluence readout"). "type" is the
+            # zone's own bullish/bearish bias where it has one, None where
+            # it doesn't (Naked POC, Swing Points, Poor High/Low) — see
+            # the click-handling block's own comment on why those skip
+            # confluence scoring entirely rather than guess a direction.
+            clickable_zones = []
             # Set inside the Naked POC layer block below when it runs —
             # stays None otherwise (feature off, or too little history for
             # even 2 sessions), so the detail expander further down can
@@ -3438,13 +3668,15 @@ with main_col:
             else:
                 st.session_state["_bt_viz_status"] = {"checked": False}
 
-            # The MA+FVG strategy's own two EMAs, drawn as real lines on
-            # the main chart (not just an inferred sidebar label) — see
-            # feedback_ui_obviousness: a signal a human needs to notice
-            # should be visible at the thing it's about, not just named in
-            # a list. Uses the SAME periods recommender.py checks for
-            # overlap (MA_FVG_PERIODS), so the lines on screen are always
-            # exactly what the strategy is actually reading.
+            # Two EMAs, drawn as real lines on the main chart (not just an
+            # inferred sidebar label) — see feedback_ui_obviousness: a
+            # signal a human needs to notice should be visible at the thing
+            # it's about, not just named in a list. Periods are now user-
+            # adjustable (ma_fast_period/ma_slow_period, default 20/50 —
+            # MA_FVG_PERIODS' own values) for READING the chart; the MA+FVG
+            # strategy's own confluence/win-rate math still keys off the
+            # fixed MA_FVG_PERIODS pair regardless of what's chosen here
+            # (see the period controls' own help text).
             _chart_indicators = {}
             if show_indicators:
                 # "Chart TF" (default) reuses the main df directly, same as
@@ -3465,8 +3697,14 @@ with main_col:
                         _ind_df = resample_ohlc(_ind_df, _ind_conf["resample"])
                 if not _ind_df.empty:
                     _close_col = _ind_df["Close"] if "Close" in _ind_df else _ind_df["close"]
-                    for _period in MA_FVG_PERIODS:
-                        _chart_indicators[f"ma{_period}"] = _series_to_points(ema(_close_col, _period))
+                    # Generic ma_fast/ma_slow keys (not ma20/ma50 literals) —
+                    # the periods are now user-adjustable, so the frontend
+                    # needs the chosen period alongside the line data to
+                    # label it correctly rather than a hardcoded "EMA 20".
+                    _chart_indicators["ma_fast"] = _series_to_points(ema(_close_col, ma_fast_period))
+                    _chart_indicators["ma_slow"] = _series_to_points(ema(_close_col, ma_slow_period))
+                    _chart_indicators["ma_fast_period"] = ma_fast_period
+                    _chart_indicators["ma_slow_period"] = ma_slow_period
 
             # RSI/MACD/Bollinger Bands/ATR — plain technical indicators,
             # always read off the main chart's own df at its own timeframe
@@ -3474,16 +3712,16 @@ with main_col:
             if (show_rsi or show_macd or show_bb or show_atr) and not df.empty:
                 _ti_close = df["Close"] if "Close" in df else df["close"]
                 if show_rsi:
-                    _chart_indicators["rsi"] = _series_to_points(rsi(_ti_close))
+                    _chart_indicators["rsi"] = _series_to_points(rsi(_ti_close, rsi_period))
                 if show_macd:
-                    _macd_line, _signal_line, _hist = macd(_ti_close)
+                    _macd_line, _signal_line, _hist = macd(_ti_close, macd_fast, macd_slow, macd_signal)
                     _chart_indicators["macd"] = {
                         "macd": _series_to_points(_macd_line),
                         "signal": _series_to_points(_signal_line),
                         "histogram": _hist_to_points(_hist, theme.NEON_GREEN, theme.NEON_MAGENTA),
                     }
                 if show_bb:
-                    _bb_upper, _bb_basis, _bb_lower = bollinger_bands(_ti_close)
+                    _bb_upper, _bb_basis, _bb_lower = bollinger_bands(_ti_close, bb_period, bb_std)
                     _chart_indicators["bb"] = {
                         "upper": _series_to_points(_bb_upper),
                         "basis": _series_to_points(_bb_basis),
@@ -3495,7 +3733,7 @@ with main_col:
                     # high-low AND the gap from the prior close (see atr's
                     # own docstring), so it reads df directly rather than
                     # the already-sliced _ti_close series the others share.
-                    _chart_indicators["atr"] = _series_to_points(atr(df))
+                    _chart_indicators["atr"] = _series_to_points(atr(df, atr_period_ind))
 
             # Volume Profile — how much volume traded at each PRICE level
             # over this chart's own currently-loaded history (see
@@ -3884,7 +4122,7 @@ with main_col:
                             })
 
             if "Price Projection" in layers:
-                _proj = _compute_price_projection(df, c_col)
+                _proj = _compute_price_projection(df, c_col, n_bars=price_projection_bars)
                 if _proj is not None:
                     _proj_bar_secs = _TF_BAR_SECONDS[tf_label]
                     _proj_n = len(_proj["center"])
@@ -3923,7 +4161,7 @@ with main_col:
             if "FVG" in layers:
                 rf = tf_frames.get(layer_tf["FVG"])
                 if rf is not None:
-                    all_fvgs = detect_fvgs(rf["confirmed"])
+                    all_fvgs = detect_fvgs(rf["confirmed"], min_body_ratio=displacement_ratio)
                     fvgs = all_fvgs if show_mitigated else [g for g in all_fvgs if not g["filled"]]
                     # Two deliberately different selections merged together
                     # — direct request, for the whole detection system, not
@@ -4039,13 +4277,19 @@ with main_col:
                             "first_touch": g["first_touch"],
                             "hist_win_rate": _win_rate_label(wr, precision=1) or "insufficient data",
                         })
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "FVG", "event_type": "fvg", "type": g["type"],
+                            "top": g["raw_top"] if g["filled"] else g["top"],
+                            "bottom": g["raw_bottom"] if g["filled"] else g["bottom"],
+                            "start": g["start"], "end": g["end"], "df_ref": rf["confirmed"],
+                        })
                     open_n = sum(1 for g in fvgs if not g["filled"])
                     legend_items.append((f"FVG ({layer_tf['FVG']})", f"{len(fvgs)} shown · {open_n} open", theme.NEON_CYAN))
 
             if "IFVG" in layers:
                 rf = tf_frames.get(layer_tf["IFVG"])
                 if rf is not None:
-                    ifvgs = detect_ifvgs(rf["confirmed"])
+                    ifvgs = detect_ifvgs(rf["confirmed"], min_body_ratio=displacement_ratio)
                     # Same two-engine merge as every other zone layer — see
                     # the FVG block's own comment above. No "still open"
                     # eaten/encroachment shading here (see detect_ifvgs' own
@@ -4073,12 +4317,17 @@ with main_col:
                             "status": "touched" if z["first_touch"] else "untouched",
                             "first_touch": z["first_touch"], "hist_win_rate": "not tracked yet",
                         })
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "IFVG", "event_type": None, "type": z["type"],
+                            "top": z["top"], "bottom": z["bottom"],
+                            "start": z["start"], "end": rf["confirmed"].index[-1], "df_ref": rf["confirmed"],
+                        })
                     legend_items.append((f"IFVG ({layer_tf['IFVG']})", f"{len(ifvgs)} shown", theme.NEON_CYAN))
 
             if "Order Blocks" in layers:
                 rf = tf_frames.get(layer_tf["Order Blocks"])
                 if rf is not None:
-                    all_obs = detect_order_blocks(rf["confirmed"])
+                    all_obs = detect_order_blocks(rf["confirmed"], min_body_ratio=displacement_ratio)
                     obs = all_obs if show_mitigated else [o for o in all_obs if not o["mitigated"]]
                     # Same two-engine merge as the FVG layer above — see
                     # its own comment.
@@ -4115,13 +4364,18 @@ with main_col:
                             "first_touch": ob["first_touch"],
                             "hist_win_rate": _win_rate_label(wr, precision=1) or "insufficient data",
                         })
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "Order Blocks", "event_type": "order_block",
+                            "type": ob["type"], "top": ob["top"], "bottom": ob["bottom"],
+                            "start": ob["start"], "end": ob["end"], "df_ref": rf["confirmed"],
+                        })
                     unmit = sum(1 for o in obs if not o["mitigated"])
                     legend_items.append((f"Order Blocks ({layer_tf['Order Blocks']})", f"{len(obs)} shown · {unmit} unmit.", theme.NEON_GREEN))
 
             if "Breaker Block" in layers:
                 rf = tf_frames.get(layer_tf["Breaker Block"])
                 if rf is not None:
-                    breakers = detect_breaker_blocks(rf["confirmed"])
+                    breakers = detect_breaker_blocks(rf["confirmed"], min_body_ratio=displacement_ratio)
                     # Same reasoning as the IFVG block above, applied to
                     # Order Blocks instead of FVGs — see detect_breaker_
                     # blocks' own docstring.
@@ -4143,6 +4397,11 @@ with main_col:
                             "status": "touched" if z["first_touch"] else "untouched",
                             "first_touch": z["first_touch"], "hist_win_rate": "not tracked yet",
                         })
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "Breaker Block", "event_type": None, "type": z["type"],
+                            "top": z["top"], "bottom": z["bottom"],
+                            "start": z["start"], "end": rf["confirmed"].index[-1], "df_ref": rf["confirmed"],
+                        })
                     legend_items.append((f"Breaker Block ({layer_tf['Breaker Block']})", f"{len(breakers)} shown", theme.NEON_GREEN))
 
             if "Swing Points" in layers:
@@ -4159,7 +4418,7 @@ with main_col:
                     # values for every already-closed row), so this now hits
                     # cache the same way every other detector call already
                     # does via rf["confirmed"] elsewhere in this function.
-                    highs, lows = detect_swings(rf["confirmed"])
+                    highs, lows = detect_swings(rf["confirmed"], atr_period=swing_atr_period, atr_mult=swing_atr_mult)
                     highs = highs[-max_items_per_layer:]
                     lows = lows[-max_items_per_layer:]
                     hi_color = _hex_to_rgba(theme.NEON_MAGENTA, 1.0)
@@ -4167,9 +4426,15 @@ with main_col:
                     for p in highs:
                         markers.append({"time": _ny_fake_utc_seconds(p["time"]), "position": "aboveBar",
                                          "color": hi_color, "shape": "arrowDown"})
+                        clickable_zones.append({"kind": "point", "layer": "Swing Points", "event_type": None,
+                                                 "type": None, "price": p["price"], "time": p["time"],
+                                                 "df_ref": rf["confirmed"]})
                     for p in lows:
                         markers.append({"time": _ny_fake_utc_seconds(p["time"]), "position": "belowBar",
                                          "color": lo_color, "shape": "arrowUp"})
+                        clickable_zones.append({"kind": "point", "layer": "Swing Points", "event_type": None,
+                                                 "type": None, "price": p["price"], "time": p["time"],
+                                                 "df_ref": rf["confirmed"]})
                     legend_items.append((f"Swings ({layer_tf['Swing Points']})", f"{len(highs)}▲ {len(lows)}▼", theme.NEON_MAGENTA))
 
             if "Equal Highs/Lows" in layers:
@@ -4201,10 +4466,12 @@ with main_col:
                 rf = tf_frames.get(layer_tf["Equal Highs/Lows"])
                 if rf is not None:
                     # rf["confirmed"] — see Swing Points' own comment above.
-                    highs, lows = detect_swings(rf["confirmed"])
+                    highs, lows = detect_swings(rf["confirmed"], atr_period=swing_atr_period, atr_mult=swing_atr_mult)
                     eq_count = 0
-                    for group, color, label, direction in [(detect_equal_levels(highs), theme.NEON_MAGENTA, "EQH", "above"),
-                                                             (detect_equal_levels(lows), theme.NEON_GREEN, "EQL", "below")]:
+                    for group, color, label, direction in [
+                        (detect_equal_levels(highs, tolerance=eq_tolerance), theme.NEON_MAGENTA, "EQH", "above"),
+                        (detect_equal_levels(lows, tolerance=eq_tolerance), theme.NEON_GREEN, "EQL", "below"),
+                    ]:
                         recent = sorted(group, key=lambda pts: max(p["time"] for p in pts))[-max_items_per_layer:]
                         for pts in recent:
                             times = sorted(p["time"] for p in pts)
@@ -4214,6 +4481,11 @@ with main_col:
                                                  "color": _hex_to_rgba(color, 1.0),
                                                  "title": f"{label} ({layer_tf['Equal Highs/Lows']})",
                                                  "above": direction == "above"})
+                            clickable_zones.append({
+                                "kind": "level", "layer": "Equal Highs/Lows", "event_type": "equal_highs_lows",
+                                "type": "bearish" if direction == "above" else "bullish",
+                                "price": price, "start": times[0], "end": t1, "df_ref": rf["confirmed"],
+                            })
                             eq_count += 1
                     legend_items.append((f"Equal H/L ({layer_tf['Equal Highs/Lows']})", f"{eq_count} clusters", theme.NEON_MAGENTA))
 
@@ -4241,7 +4513,8 @@ with main_col:
                 # separate shape vocabulary to stay legible.
                 rf = tf_frames.get(layer_tf["Market Structure"])
                 if rf is not None:
-                    breaks = detect_structure_breaks(rf["confirmed"])
+                    breaks = detect_structure_breaks(rf["confirmed"], mode=ms_mode,
+                                                      atr_period=swing_atr_period, atr_mult=swing_atr_mult)
                     breaks = breaks[-max_items_per_layer:]
                     bos_n = choch_n = 0
                     for b in breaks:
@@ -4251,6 +4524,11 @@ with main_col:
                                              "price": b["level"], "color": _hex_to_rgba(color, 1.0),
                                              "title": f"{b['structure']} ({layer_tf['Market Structure']})",
                                              "above": b["type"] == "bullish"})
+                        clickable_zones.append({
+                            "kind": "level", "layer": "Market Structure",
+                            "event_type": "choch" if is_choch else "bos", "type": b["type"],
+                            "price": b["level"], "start": b["start"], "end": b["end"], "df_ref": rf["confirmed"],
+                        })
                         if is_choch:
                             choch_n += 1
                         else:
@@ -4270,7 +4548,7 @@ with main_col:
                 # state currently sits.
                 rf = tf_frames.get(layer_tf["Premium/Discount"])
                 if rf is not None:
-                    dr = current_dealing_range(rf["confirmed"])
+                    dr = current_dealing_range(rf["confirmed"], atr_period=swing_atr_period, atr_mult=swing_atr_mult)
                     if dr is not None:
                         t0 = _ny_fake_utc_seconds(dr["start"])
                         # Zone opacity here is dampened relative to the same
@@ -4283,6 +4561,19 @@ with main_col:
                                             "fill": _hex_to_rgba(theme.NEON_MAGENTA, fill_opacity), "border": None})
                         rectangles.append({"t0": t0, "t1": future_edge, "p0": dr["bottom"], "p1": dr["eq"],
                                             "fill": _hex_to_rgba(theme.NEON_GREEN, fill_opacity), "border": None})
+                        # Premium half (above EQ) = bearish bias, discount
+                        # half (below EQ) = bullish — same "which side of
+                        # fair value" reading this layer's own legend uses.
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "Premium/Discount", "event_type": None, "type": "bearish",
+                            "top": dr["top"], "bottom": dr["eq"], "start": dr["start"],
+                            "end": rf["confirmed"].index[-1], "df_ref": rf["confirmed"],
+                        })
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "Premium/Discount", "event_type": None, "type": "bullish",
+                            "top": dr["eq"], "bottom": dr["bottom"], "start": dr["start"],
+                            "end": rf["confirmed"].index[-1], "df_ref": rf["confirmed"],
+                        })
                         price_lines.append({"t0": t0, "t1": future_edge, "price": dr["eq"],
                                              "color": _hex_to_rgba(theme.NEON_AMBER, 1.0),
                                              "title": f"EQ 50% ({layer_tf['Premium/Discount']})", "above": True})
@@ -4336,7 +4627,8 @@ with main_col:
                     # Wiring the same control in here is the fix, not an
                     # extra slice afterward.
                     above, below = detect_liquidity_levels(rf["confirmed"], n_above=max_items_per_layer,
-                                                             n_below=max_items_per_layer)
+                                                             n_below=max_items_per_layer,
+                                                             atr_period=swing_atr_period, atr_mult=swing_atr_mult)
                     # A swept HIGH (BSL) points bearish, a swept LOW (SSL)
                     # points bullish — same direction convention
                     # detect_liquidity_sweeps' own `type` field already
@@ -4363,6 +4655,10 @@ with main_col:
                                              "price": lvl["price"], "color": _hex_to_rgba(bsl_color, 1.0),
                                              "title": title, "line_width": 2 if matched_inds else 1, "above": True})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "BSL (buy-side)", "price": lvl["price"], "formed": lvl["time"]})
+                        clickable_zones.append({
+                            "kind": "level", "layer": "Liquidity", "event_type": None, "type": "bearish",
+                            "price": lvl["price"], "start": lvl["time"], "end": t1, "df_ref": rf["confirmed"],
+                        })
                     for lvl in below:
                         t1 = _line_stop_time(rf["confirmed"], lvl["time"], lvl["price"])
                         title = f"SSL ({layer_tf['Liquidity']})" + (f" · {ssl_label}" if ssl_label else "")
@@ -4374,6 +4670,10 @@ with main_col:
                                              "price": lvl["price"], "color": _hex_to_rgba(ssl_color, 1.0),
                                              "title": title, "line_width": 2 if matched_inds else 1, "above": False})
                         liquidity_rows.append({"tf": layer_tf["Liquidity"], "kind": "SSL (sell-side)", "price": lvl["price"], "formed": lvl["time"]})
+                        clickable_zones.append({
+                            "kind": "level", "layer": "Liquidity", "event_type": None, "type": "bullish",
+                            "price": lvl["price"], "start": lvl["time"], "end": t1, "df_ref": rf["confirmed"],
+                        })
 
                     # rf["confirmed"], not rf["df"] — same caching fix as
                     # Swing Points above, plus this was ALSO the exact
@@ -4388,7 +4688,8 @@ with main_col:
                     # silently stopped exactly where price had printed so
                     # far. Missed when that fix was applied to every other
                     # layer; this call site just hadn't been touched yet.
-                    reactions = detect_liquidity_reactions(rf["confirmed"])
+                    reactions = detect_liquidity_reactions(rf["confirmed"], max_candles_after=liquidity_reaction_window,
+                                                            atr_period=swing_atr_period, atr_mult=swing_atr_mult)
                     reactions = reactions[-max_items_per_layer:]
                     for r in reactions:
                         color = theme.NEON_MAGENTA if r["type"] == "bearish" else theme.NEON_AMBER
@@ -4396,6 +4697,11 @@ with main_col:
                             "t0": _ny_fake_utc_seconds(r["start"]), "t1": rf["t1_axis"](r["end"]),
                             "p0": r["bottom"], "p1": r["top"],
                             "fill": _hex_to_rgba(color, 0.22), "border": _hex_to_rgba(color, 1.0),
+                        })
+                        clickable_zones.append({
+                            "kind": "rect", "layer": "Liquidity", "event_type": "liquidity_reaction",
+                            "type": r["type"], "top": r["top"], "bottom": r["bottom"],
+                            "start": r["start"], "end": r["end"], "df_ref": rf["confirmed"],
                         })
 
                     legend_items.append((f"Liquidity ({layer_tf['Liquidity']})",
@@ -4421,7 +4727,7 @@ with main_col:
                     # max_items_per_layer cap already uses — a naked POC
                     # from months back, far from price, is much less
                     # actionable than one price is sitting right next to.
-                    nakeds = sorted(detect_naked_pocs(rf["confirmed"]),
+                    nakeds = sorted(detect_naked_pocs(rf["confirmed"], max_days=session_lookback_days),
                                      key=lambda r: abs(r["price"] - current_price))[:max_items_per_layer]
                     for np_ in nakeds:
                         price_lines.append({
@@ -4431,6 +4737,11 @@ with main_col:
                             "above": np_["price"] >= current_price,
                         })
                         naked_poc_rows.append({"tf": layer_tf["Naked POC"], "day": np_["day"], "price": np_["price"]})
+                        clickable_zones.append({
+                            "kind": "level", "layer": "Naked POC", "event_type": None, "type": None,
+                            "price": np_["price"], "start": np_["time"], "end": rf["confirmed"].index[-1],
+                            "df_ref": rf["confirmed"],
+                        })
                     legend_items.append((f"Naked POC ({layer_tf['Naked POC']})",
                                           f"{len(nakeds)} untouched", theme.NEON_GREEN))
                     # Same underlying per-session data (see poc_migration's
@@ -4450,7 +4761,7 @@ with main_col:
                     # No "still live" concept here (see the detector's own
                     # docstring) — most-recent-first, same as Swing Points/
                     # Equal H-L/Structure above, not a nearest-to-price sort.
-                    poor_hl = detect_poor_highs_lows(rf["confirmed"])[:max_items_per_layer]
+                    poor_hl = detect_poor_highs_lows(rf["confirmed"], max_days=session_lookback_days)[:max_items_per_layer]
                     for p in poor_hl:
                         markers.append({
                             "time": _ny_fake_utc_seconds(p["time"]),
@@ -4458,6 +4769,10 @@ with main_col:
                             "color": _hex_to_rgba(theme.NEON_AMBER, 1.0),
                             "shape": "square",
                             "text": f"Poor {p['kind']} ({p['day']})",
+                        })
+                        clickable_zones.append({
+                            "kind": "point", "layer": "Poor High/Low", "event_type": None, "type": None,
+                            "price": p["price"], "time": p["time"], "df_ref": rf["confirmed"],
                         })
                     legend_items.append((f"Poor High/Low ({layer_tf['Poor High/Low']})",
                                           f"{len(poor_hl)} flagged", theme.NEON_AMBER))
@@ -4533,6 +4848,19 @@ with main_col:
                 rectangles = _trade_only_rectangles + _pick_rects
                 price_lines = _trade_only_price_lines + _pick_conf_lines
                 markers = []
+
+            # Feature C's own confluence factors, drawn ADDITIVELY on top
+            # of whatever's already showing (not an isolated replace like
+            # the lock-trade view above) — a click is a "tell me more
+            # about this," not "hide everything else." Reuses
+            # _scan_pick_overlays unchanged by feeding it the same
+            # scan_pick shape the lock-trade view itself uses.
+            _clicked_result = st.session_state.get("_clicked_zone_result")
+            if _clicked_result and _clicked_result.get("status") == "hit":
+                _click_rects, _click_lines = _scan_pick_overlays(
+                    _clicked_result["scan_pick_shape"], future_edge, _ny_fake_utc_seconds)
+                rectangles = rectangles + _click_rects
+                price_lines = price_lines + _click_lines
 
             fingerprint = (f"{ticker}|{tf_label}|{'+'.join(sorted(selected_kill_zones))}|{show_mitigated}|"
                             f"{bars[0]['time'] if bars else 0}")
@@ -4629,6 +4957,51 @@ with main_col:
                     st.rerun(scope="fragment")
             _select_chart("main", clicked)
 
+            # Feature C — "click an area, scan for known patterns/levels
+            # that are meaningful." Only a genuinely NEW click (a fresh
+            # clickId) gets processed — repeat reruns that carry the same
+            # already-handled click (e.g. an unrelated widget change
+            # elsewhere on the page) shouldn't re-run the hit-test/
+            # confluence-score work for nothing.
+            if isinstance(clicked, dict) and clicked.get("clickId") is not None and \
+                    st.session_state.get("_last_click_zone_test") != clicked.get("clickId"):
+                st.session_state["_last_click_zone_test"] = clicked.get("clickId")
+                _hit = _hit_test_zone(clicked, clickable_zones)
+                if _hit is None:
+                    st.session_state["_clicked_zone_result"] = {"status": "miss"}
+                elif _hit.get("type") is None:
+                    # Naked POC / Swing Points / Poor High/Low — no
+                    # inherent direction, so no confluence/validation
+                    # readout to fake one for; just the plain facts.
+                    st.session_state["_clicked_zone_result"] = {
+                        "status": "no_direction", "layer": _hit["layer"],
+                        "price": _hit.get("price"),
+                        "start": _hit.get("start") or _hit.get("time"),
+                    }
+                else:
+                    _direction = _hit["type"]
+                    _hit_price = (_hit["top"] + _hit["bottom"]) / 2 if _hit["kind"] == "rect" else _hit["price"]
+                    _score, _factor_details = _confluence_score(_direction, _hit_price, _hit["df_ref"])
+                    _event_type = _hit.get("event_type")
+                    if _event_type and _event_type in EVENT_TYPE_TO_HYPOTHESIS:
+                        _val_label, _val_tone = validation_badge(_event_type, ticker)
+                    else:
+                        _val_label, _val_tone = "no validation model defined for this layer yet", "info"
+                    st.session_state["_clicked_zone_result"] = {
+                        "status": "hit", "layer": _hit["layer"], "direction": _direction,
+                        "price": _hit_price, "score": _score, "factor_details": _factor_details,
+                        "validation_label": _val_label, "validation_tone": _val_tone,
+                        "scan_pick_shape": {
+                            "direction": _direction, "entry": _hit_price,
+                            "label": f"Clicked {_hit['layer']}",
+                            "source_zone": ({"start": _hit["start"], "end": _hit["end"],
+                                              "top": _hit["top"], "bottom": _hit["bottom"]}
+                                             if _hit["kind"] == "rect" else None),
+                            "confluence_entry_details": _factor_details,
+                            "confluence_context_details": [],
+                        },
+                    }
+
             # Direct request: "where is price more likely to head next" —
             # every currently-open level (FVG/IFVG/Order Block/Breaker
             # Block/resting liquidity) ranked by an actual historical
@@ -4688,6 +5061,10 @@ with main_col:
             if _vp is not None:
                 _detail_tabs.append((f"🔍 Volume Profile — {_vp['shape_label']}", "volume_profile"))
             _detail_tabs.append(("🧪 Experiments", "experiments"))
+            # Unconditionally appended, like Experiments above — this
+            # needs to be discoverable BEFORE a first click, not appear
+            # out of nowhere only after one happens.
+            _detail_tabs.append(("🎯 Clicked zone", "clicked_zone"))
 
             def _render_detail_body(_key):
                 if _key == "legend":
@@ -5016,6 +5393,29 @@ with main_col:
                                                  "mean_return_train", "p_value_train", "q_value_train",
                                                  "holdout_verdict", "survived"]],
                                     hide_index=True, width="stretch")
+
+                elif _key == "clicked_zone":
+                    _cz = st.session_state.get("_clicked_zone_result")
+                    if not _cz:
+                        st.caption("Click a drawn zone on the chart to see what's meaningful about it.")
+                    elif _cz["status"] == "miss":
+                        st.caption("That click didn't land on a known zone — try clicking closer to a "
+                                   "drawn box or line.")
+                    elif _cz["status"] == "no_direction":
+                        st.markdown(f"**{_cz['layer']}** — price {_cz['price']:.5g}, formed {_cz['start']}")
+                        st.caption("This layer has no inherent bullish/bearish bias, so there's no "
+                                   "direction to score confluence or validation against.")
+                    else:
+                        _tone_fn = {"bullish": st.success, "warn": st.warning, "info": st.info}[_cz["validation_tone"]]
+                        st.markdown(f"**{_cz['layer']}** — {_cz['direction']} · price {_cz['price']:.5g} · "
+                                    f"{_cz['score']} confluence factor(s)")
+                        _tone_fn(_cz["validation_label"])
+                        if _cz["factor_details"]:
+                            for _factor in _cz["factor_details"]:
+                                st.markdown(f"- {_factor['label']}")
+                        else:
+                            st.caption("No other currently-active ICT reads agree with this direction "
+                                       "right now.")
 
             if len(_detail_tabs) == 1:
                 _only_label, _only_key = _detail_tabs[0]

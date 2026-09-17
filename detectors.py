@@ -402,7 +402,7 @@ def detect_swings(df, atr_period=14, atr_mult=1.5):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def detect_structure_breaks(df, mode="close"):
+def detect_structure_breaks(df, mode="close", atr_period=14, atr_mult=1.5):
     """Market structure shifts — BOS (Break of Structure) and CHoCH (Change
     of Character), the primitive most other ICT reads implicitly lean on
     ("is this pullback likely to continue or reverse" needs a trend bias to
@@ -439,7 +439,7 @@ def detect_structure_breaks(df, mode="close"):
     low = df["Low"] if "Low" in df else df["low"]
     idx = df.index
     n = len(df)
-    highs, lows = detect_swings(df)
+    highs, lows = detect_swings(df, atr_period=atr_period, atr_mult=atr_mult)
     # Keyed on confirmed_pos, not pos — a pending level can't fire a break
     # before the market has actually confirmed it as a swing (see
     # detect_swings' own docstring on the pos/confirmed_pos distinction).
@@ -483,7 +483,7 @@ def detect_structure_breaks(df, mode="close"):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def detect_order_blocks(df, max_scan_bars=None, record_history=False):
+def detect_order_blocks(df, max_scan_bars=None, record_history=False, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
     """OBSERVED: the last opposing candle before a displacement move that
     breaks clean through it. Bullish OB = last down-candle before a candle
     that closes above its high; bearish OB = mirror image. That is the
@@ -523,7 +523,7 @@ def detect_order_blocks(df, max_scan_bars=None, record_history=False):
         # move — a candle that merely closes past the prior high/low on a
         # long wick doesn't clear DISPLACEMENT_MIN_BODY_RATIO's own body-size
         # bar, just noise that technically satisfies the raw price condition.
-        if not _is_displacement(o[i + 1], h[i + 1], l[i + 1], c[i + 1]):
+        if not _is_displacement(o[i + 1], h[i + 1], l[i + 1], c[i + 1], min_ratio=min_body_ratio):
             continue
         bearish_i = c[i] < o[i]
         bullish_i = c[i] > o[i]
@@ -593,7 +593,7 @@ def detect_order_blocks(df, max_scan_bars=None, record_history=False):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def detect_breaker_blocks(df, max_scan_bars=None):
+def detect_breaker_blocks(df, max_scan_bars=None, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
     """Breaker Block — the Order Block equivalent of detect_ifvgs above,
     same mechanism applied to detect_order_blocks' own output instead of
     detect_fvgs': an order block that gets fully mitigated WITH the
@@ -607,7 +607,7 @@ def detect_breaker_blocks(df, max_scan_bars=None):
     test it from the new direction. See detect_ifvgs' own docstring for
     the full reasoning (separate detector, not a flag; "closes beyond" on
     the completing bar as the engineering choice for confirmation)."""
-    base = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=True)
+    base = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=True, min_body_ratio=min_body_ratio)
     if not base:
         return []
     high_arr = (df["High"] if "High" in df else df["high"]).to_numpy()
@@ -718,7 +718,7 @@ def detect_equal_highs_lows(df):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def detect_liquidity_levels(df, n_above=2, n_below=2):
+def detect_liquidity_levels(df, n_above=2, n_below=2, atr_period=14, atr_mult=1.5):
     """ICT's External Range Liquidity: the nearest swing highs/lows that price
     hasn't traded through yet — buy-side liquidity resting above (stops above
     the recent high), sell-side resting below. A swing point drops out the
@@ -730,7 +730,7 @@ def detect_liquidity_levels(df, n_above=2, n_below=2):
     close_col = "Close" if "Close" in df else "close"
     high_arr = df[high_col].to_numpy()
     low_arr = df[low_col].to_numpy()
-    highs, lows = detect_swings(df)
+    highs, lows = detect_swings(df, atr_period=atr_period, atr_mult=atr_mult)
     last_price = float(df[close_col].iloc[-1])
 
     def untouched_high(point):
@@ -1069,7 +1069,8 @@ def detect_liquidity_sweeps(df, tier=False):
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None, record_history=False):
+def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None, record_history=False,
+                                atr_period=14, atr_mult=1.5):
     """Once external liquidity is swept, ICT expects a reaction from the order
     block that formed right at that sweep — the "external area" price reverses
     from. Finds the MOST RECENT high-sweep and MOST RECENT low-sweep, and for
@@ -1095,7 +1096,7 @@ def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None, reco
     low_col = "Low" if "Low" in df else "low"
     high_arr = df[high_col].to_numpy()
     low_arr = df[low_col].to_numpy()
-    highs, lows = detect_swings(df)
+    highs, lows = detect_swings(df, atr_period=atr_period, atr_mult=atr_mult)
     obs = detect_order_blocks(df, max_scan_bars=max_scan_bars, record_history=record_history)
     reactions = []
 
@@ -1129,7 +1130,7 @@ def detect_liquidity_reactions(df, max_candles_after=5, max_scan_bars=None, reco
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def current_dealing_range(df):
+def current_dealing_range(df, atr_period=14, atr_mult=1.5):
     """The active premium/discount range: the most recent swing high and
     swing low that price hasn't closed back through yet — the same
     pending-high/pending-low tracking detect_structure_breaks uses to fire
@@ -1158,7 +1159,7 @@ def current_dealing_range(df):
     close = df["Close"] if "Close" in df else df["close"]
     idx = df.index
     n = len(df)
-    highs, lows = detect_swings(df)
+    highs, lows = detect_swings(df, atr_period=atr_period, atr_mult=atr_mult)
     # confirmed_pos, not pos — see detect_swings' own docstring. The range
     # can't anchor to a swing before the market has actually confirmed it.
     highs_by_pos = {h["confirmed_pos"]: h for h in highs}
