@@ -726,9 +726,37 @@ def load_experiment_trials():
     """Every trial ever run through run_deep_backtest, BH-corrected
     across the FULL log (not just today's session) — same convention as
     research/setups.py's load_edge_lab_validation. Empty DataFrame if
-    nothing's been run yet."""
+    nothing's been run yet.
+
+    Thin, uncached wrapper around _load_experiment_trials_cached: this
+    file has grown to 80k+ lines/30+MB over the course of a single day's
+    testing, and re-reading/re-parsing/re-BH-correcting the WHOLE thing
+    had no caching at all -- confirmed as a real, live performance bug,
+    not a hypothetical one: every caller of this function sits inside a
+    Streamlit tab/expander body, and Streamlit executes EVERY tab's body
+    on EVERY rerun regardless of which one is actually visible (confirmed
+    directly elsewhere in this project). With an auto-refreshing chart
+    fragment on intraday timeframes, that meant a ~0.4s+ file parse plus a
+    full Benjamini-Hochberg pass across 22,000+ scored rows, repeated on
+    close to every single tick, whether or not anyone had the Experiments
+    tab open -- exactly the kind of continuous, unnecessary CPU load that
+    reads as "the app clogs sometimes." os.stat() is effectively free, so
+    checking it fresh every call and only doing the real work when the
+    file has genuinely changed (a NEW trial got appended) costs nothing
+    while fixing everything."""
     if not os.path.exists(_TRIALS_PATH):
         return pd.DataFrame()
+    stat = os.stat(_TRIALS_PATH)
+    return _load_experiment_trials_cached(stat.st_mtime, stat.st_size)
+
+
+@st.cache_data(ttl=_CACHE_TTL)
+def _load_experiment_trials_cached(_mtime, _size):
+    """The actual read+parse+BH-correct, cached on (mtime, size) so
+    Streamlit's own cache key changes exactly when the file's contents
+    do -- not a blind time-based TTL, which would either serve stale
+    results right after a fresh 'Run deep backtest' or still redo the
+    full pass on a timer regardless of whether anything changed."""
     trials = []
     with open(_TRIALS_PATH) as f:
         for line in f:

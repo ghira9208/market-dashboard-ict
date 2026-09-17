@@ -5324,10 +5324,34 @@ with main_col:
                             if _exp_scored.empty:
                                 st.caption("Nothing scored yet — every run so far had too little data.")
                             else:
+                                # Capped, not the full ~20k+ scored rows every
+                                # time — this expander's own body still runs
+                                # on every rerun regardless of whether it's
+                                # open (Streamlit executes every tab/expander's
+                                # content, it only hides the DOM for inactive
+                                # ones), so an uncapped st.dataframe here was
+                                # real, continuous serialization cost paid on
+                                # every tick whether anyone was looking or
+                                # not. Any survivor is kept regardless of
+                                # recency (there's never more than a handful,
+                                # and that's the one row worth never missing);
+                                # otherwise just the most recent _EXP_TABLE_CAP.
+                                _EXP_TABLE_CAP = 300
+                                _exp_recent = _exp_scored.head(_EXP_TABLE_CAP)
+                                _exp_old_survivors = _exp_scored[_exp_scored["survived"].fillna(False)
+                                                                   & ~_exp_scored.index.isin(_exp_recent.index)]
+                                _exp_display = (pd.concat([_exp_old_survivors, _exp_recent])
+                                                 if not _exp_old_survivors.empty else _exp_recent)
+                                _exp_cap_note = f"Showing {len(_exp_display)} of {len(_exp_scored)} scored trials"
+                                if not _exp_old_survivors.empty:
+                                    _exp_cap_note += f" — most recent {_EXP_TABLE_CAP} plus {len(_exp_old_survivors)} older survivor(s)"
+                                else:
+                                    _exp_cap_note += f" — most recent {_EXP_TABLE_CAP}"
+                                st.caption(_exp_cap_note + ".")
                                 st.dataframe(
-                                    _exp_scored[["logged_at", "ticker", "label", "n_events",
-                                                 "mean_return_train", "p_value_train", "q_value_train",
-                                                 "holdout_verdict", "survived"]],
+                                    _exp_display[["logged_at", "ticker", "label", "n_events",
+                                                  "mean_return_train", "p_value_train", "q_value_train",
+                                                  "holdout_verdict", "survived"]],
                                     hide_index=True, width="stretch")
 
                 elif _key == "clicked_zone":
