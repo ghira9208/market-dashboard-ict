@@ -2035,7 +2035,22 @@ function handleRender(args) {
   // no-data path) — where args.ohlc.is_full_reload is simply undefined —
   // are correctly exempt rather than matching by accident.
   const pythonSaysFullReload = args.ohlc ? args.ohlc.is_full_reload : undefined;
-  const neededResyncBeforeThisRender = pythonSaysFullReload === false && barsByTime.size === 0 && bars.length > 0;
+  // Same exact class of mismatch as the bars check right below, just for
+  // indicator series instead of candles: Python thinks this is a plain
+  // incremental tick (indicators._full_reload === false) and sent only a
+  // few trailing points, but THIS frontend instance's own indicatorSeriesMap
+  // is empty — meaning it never actually received the full series to
+  // begin with (a fresh mount/reconnect that happened to land in between
+  // Python's own bookkeeping updates). Checked BEFORE applyIndicators
+  // below (which would populate the map), same ordering reason as the
+  // bars check. Only fires when there's actually indicator data to be
+  // missing — an indicator-free chart has nothing to resync.
+  const indHasData = !!(indicators && (indicators.ma_fast || indicators.ma_slow || indicators.rsi
+    || indicators.atr || indicators.macd || indicators.bb));
+  const indicatorsNeedResync = indicators && indicators._full_reload === false
+    && Object.keys(indicatorSeriesMap).length === 0 && indHasData;
+  const neededResyncBeforeThisRender = (pythonSaysFullReload === false && barsByTime.size === 0 && bars.length > 0)
+    || indicatorsNeedResync;
   // What actually governs setData() vs. a last-bar-only patch below, and
   // whether barsByTime gets rebuilt vs. merged — NOT plain isFullReload.
   // Confirmed directly as a second bug on top of the first: the corrective

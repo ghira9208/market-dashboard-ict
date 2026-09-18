@@ -5042,6 +5042,15 @@ with main_col:
                 st.session_state["_main_resync_tries"] = (fingerprint, _resync_tries)
                 if _resync_tries <= 2:
                     st.session_state.pop("_main_last_sent_fp", None)
+                    # Belt-and-suspenders alongside the OR in
+                    # _indicators_full_reload's own computation (which
+                    # already forces a full indicator resend whenever
+                    # _is_full_reload does) — clearing this too means the
+                    # corrective render can't possibly still think
+                    # indicator SETTINGS are what's unchanged and skip a
+                    # full resend on some future edge case this fingerprint
+                    # alone doesn't cover.
+                    st.session_state.pop("_main_last_indicator_fp", None)
                     st.rerun(scope="fragment")
             _select_chart("main", clicked)
 
