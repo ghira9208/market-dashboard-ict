@@ -14,6 +14,11 @@ __pycache__/
 research/.cache/
 .cache/ohlcv/
 .streamlit/secrets.toml
+# Unlike the tracked .cache/*.json history logs above, this one holds real
+# account data (balances, position IDs) pulled through a private eToro MCP
+# session, not something the public scheduled collector can regenerate —
+# stays local-only, never committed.
+.cache/etoro_snapshot.json
 *.log
 .last_state*.json
 *.pre_fill_fix_backup_*.db
