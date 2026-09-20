@@ -24,6 +24,12 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "streamlit", "run", "institutional_app.py", "--server.headless", "true", "--server.port", "8508", "--server.fileWatcherType", "none"],
       "port": 8508
+    },
+    {
+      "name": "market-dashboard-ict-etoro",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "streamlit", "run", "etoro_app.py", "--server.headless", "true", "--server.port", "8509", "--server.fileWatcherType", "none"],
+      "port": 8509
     }
   ]
 }

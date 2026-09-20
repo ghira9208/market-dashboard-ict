@@ -1181,6 +1181,7 @@ PROJECTS = [
     ("Crypto", "http://localhost:8506"),
     ("News", "http://localhost:8507"),
     ("Institutional", "http://localhost:8508"),
+    ("eToro", "http://localhost:8509"),
 ]
 
 

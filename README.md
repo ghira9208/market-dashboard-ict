@@ -10,6 +10,9 @@ trade right now" Entry/Stop/Target read.
   majors, major indices, commodities.
 - **Crypto** (`crypto_app.py`, port 8506) — Bitcoin/crypto, with a live
   Binance WebSocket tick feed on top of the usual polling.
+- **eToro** (`etoro_app.py`, port 8509) — WIP scaffold for an ICT edge
+  being validated on eToro's demo account in a separate session; chart
+  works today, the actual validated edge isn't wired in yet.
 
 Both are independent Streamlit scripts that share the same underlying
 modules (`detectors.py`, `theme.py`, `data.py`, `recommender.py`, `ict_chart/`)
