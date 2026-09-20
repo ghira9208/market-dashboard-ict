@@ -44,8 +44,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from detectors import (detect_breaker_blocks, detect_fvgs, detect_ifvgs, detect_liquidity_sweeps,
-                        detect_order_blocks, detect_swings)
+from detectors import (DISPLACEMENT_MIN_BODY_RATIO, detect_breaker_blocks, detect_fvgs, detect_ifvgs,
+                        detect_liquidity_sweeps, detect_order_blocks, detect_swings)
 from edge_lab.multiple_testing import benjamini_hochberg
 from research.evidence import run_event_study
 
@@ -750,6 +750,23 @@ def load_experiment_trials():
     return _load_experiment_trials_cached(stat.st_mtime, stat.st_size)
 
 
+# Different sweep scripts across this project's history have logged the
+# same real timeframes under different spellings — the ORIGINAL detector-
+# reaction family (and app.py's own TIMEFRAMES dict) always writes
+# "1D"/"1W"/"1M"; research/data_loader.py's INTERVAL_LABELS (used by a
+# same-day all-timeframes sweep for clean_expansion_retracement) spells
+# the same three "1d"/"1wk"->"1W"/"1mo"->"1M" (1d specifically
+# lowercase). Normalized once here, at the single root every caller of
+# load_experiment_trials() reads through (list_validated_pairs,
+# find_live_validated_signal, ticker_behavior.py's own rebuild_db), so
+# nothing downstream needs its own copy of this map — confirmed as a
+# real bug: list_validated_pairs surfacing a lowercase "1d" pair straight
+# into app.py's TIMEFRAMES["1d"] (only "1D" exists there) crashed the
+# sidebar's "Scan for validated setups" the moment clean_expansion_
+# retracement's first 1d survivor showed up.
+TF_LABEL_NORMALIZE = {"1d": "1D", "1wk": "1W", "1mo": "1M"}
+
+
 @st.cache_data(ttl=_CACHE_TTL)
 def _load_experiment_trials_cached(_mtime, _size):
     """The actual read+parse+BH-correct, cached on (mtime, size) so
@@ -767,6 +784,7 @@ def _load_experiment_trials_cached(_mtime, _size):
         return pd.DataFrame()
 
     df = pd.DataFrame(trials)
+    df["tf_label"] = df["tf_label"].map(lambda t: TF_LABEL_NORMALIZE.get(t, t))
     scored = df[df["verdict"] == "SCORED"]
     if not scored.empty:
         q_values, significant = benjamini_hochberg(scored["p_value_train"].tolist(), alpha=0.05)
@@ -827,41 +845,114 @@ def find_live_validated_signal(df, ticker, tf_label):
     if matches.empty:
         return None
     matches = matches.sort_values("p_value_train")
-    n = len(df)
-    close = (df["Close"] if "Close" in df else df["close"])
-    close_arr = close.to_numpy()
-
     for _, trial in matches.iterrows():
-        settings = trial["settings"]
-        touches = _qualifying_touches(df, settings["detector"], settings["min_volatility_pctile"],
-                                       settings["reaction_window"], settings["reaction_mult"])
-        if not touches:
-            continue
-        latest = max(touches, key=lambda t: t["confirm_pos"])
-        bars_since = n - 1 - latest["confirm_pos"]
-        if bars_since > settings["forward_bars"]:
-            continue  # already past this trial's own hold length -- no longer live
-        direction = latest["direction"]
-        # Entry is confirm_pos, not touch_pos — see build_experiment_events'
-        # own comment: you can only realistically act once the reaction has
-        # actually confirmed, and this must match how the trial itself
-        # measured its own p-value/returns or the live pick would be
-        # showing a different (and again look-ahead-biased) entry point
-        # than what was actually validated.
-        entry_price = float(close_arr[latest["confirm_pos"]])
-        stop_price = latest["zone_bottom"] if direction == "bullish" else latest["zone_top"]
-        sign = 1 if direction == "bullish" else -1
-        target_price = entry_price * (1 + sign * abs(trial["mean_return_holdout"]))
-        return {
-            "ticker": ticker, "tf_label": tf_label, "direction": direction,
-            "entry_price": entry_price, "stop_price": float(stop_price), "target_price": float(target_price),
-            "label": trial["label"], "p_value_train": trial["p_value_train"],
-            "mean_return_train": trial["mean_return_train"], "mean_return_holdout": trial["mean_return_holdout"],
-            "n_events": int(trial["n_events"]), "entry_time": df.index[latest["confirm_pos"]],
-            "bars_since_touch": bars_since, "forward_bars": settings["forward_bars"],
-            "zone_start": latest["zone_start"], "zone_top": latest["zone_top"], "zone_bottom": latest["zone_bottom"],
-        }
+        touches = _touches_for_settings(df, trial)
+        result = _signal_from_touches(df, ticker, tf_label, trial, touches, require_live=True)
+        if result is not None:
+            return result
     return None
+
+
+def _touches_for_settings(df, trial):
+    """Dispatches to whichever strategy family a trial belongs to.
+    Settings-SHAPE alone stopped being unique once clean_expansion_
+    retracement and clean_retracement_resumption both landed on the
+    identical {min_streak, retr_window_bars, forward_bars} shape (same
+    detection core, see _scan_clean_zone_streaks — they only disagree on
+    what to DO with the streaks found) — dispatching on the trial's own
+    `label` prefix (every build_* function's own family name, always the
+    text before the first " · ") is the only thing guaranteed unique per
+    strategy, so that's the primary key; settings-shape is kept only as
+    the original family's own fallback, from before this needed to be
+    unambiguous. Add a new branch here whenever a new strategy family
+    earns its own validated survivor, not before."""
+    label = trial["label"] if isinstance(trial, (pd.Series, dict)) else ""
+    settings = trial["settings"] if isinstance(trial, (pd.Series, dict)) else trial
+    family = str(label).split(" · ", 1)[0].strip() if label else ""
+    if family == "clean_expansion_retracement":
+        return _clean_expansion_touches(df, settings["min_streak"], settings["retr_window_bars"])
+    if family == "clean_retracement_resumption":
+        return _clean_retracement_resumption_touches(df, settings["min_streak"], settings["retr_window_bars"])
+    if family == "clean_structure_trend":
+        return _clean_structure_touches(df, settings["min_swings"],
+                                         settings.get("atr_period", 14), settings.get("atr_mult", 1.5))
+    if family == "clean_expansion_liquidity":
+        return _clean_expansion_liquidity_touches(df, settings["min_streak"], settings["retr_window_bars"],
+                                                   settings.get("sweep_window_bars", 10))
+    if "detector" in settings:
+        return _qualifying_touches(df, settings["detector"], settings["min_volatility_pctile"],
+                                    settings["reaction_window"], settings["reaction_mult"])
+    if "min_streak" in settings:
+        return _clean_expansion_touches(df, settings["min_streak"], settings["retr_window_bars"])
+    return []
+
+
+def _signal_from_touches(df, ticker, tf_label, trial, touches, require_live):
+    """Shared by find_live_validated_signal (require_live=True — only
+    ever returns a signal still inside its own forward_bars hold) and
+    latest_validated_example (require_live=False — the Survivors tab's
+    "apply to chart" wants to show the most recent instance even after
+    its hold period is long over, honestly labeled as such via the
+    returned is_live flag). One place computing entry/stop/target from a
+    touch, so the two call sites can't drift apart on the math."""
+    if not touches:
+        return None
+    n = len(df)
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    settings = trial["settings"]
+    latest = max(touches, key=lambda t: t["confirm_pos"])
+    bars_since = n - 1 - latest["confirm_pos"]
+    if require_live and bars_since > settings["forward_bars"]:
+        return None  # already past this trial's own hold length -- no longer live
+    direction = latest["direction"]
+    # Entry is confirm_pos, not touch_pos — see build_experiment_events'
+    # own comment: you can only realistically act once the reaction has
+    # actually confirmed, and this must match how the trial itself
+    # measured its own p-value/returns or the live pick would be
+    # showing a different (and again look-ahead-biased) entry point
+    # than what was actually validated.
+    entry_price = float(close_arr[latest["confirm_pos"]])
+    # The zone's own far edge is the natural stop for the original
+    # detector-reaction family (zone direction == trade direction, entry
+    # sits at/near the zone). clean_expansion_retracement's own touches
+    # are the OPPOSITE case by construction (see _clean_expansion_touches
+    # — the zone here is the retracement leg, trade direction is the
+    # ORIGINAL expansion) and its entry (next bar's open after the zone's
+    # own confirming candle) can legitimately land already past that
+    # zone's edge — confirmed directly on a live BTC-USD 1h signal, where
+    # the "stop" would otherwise have sat ABOVE a bullish entry. Clamping
+    # to stay strictly on the risk side of entry keeps this correct for
+    # both families with no behavior change for the original one (whose
+    # zone edge is already on the right side in practice).
+    if direction == "bullish":
+        stop_price = latest["zone_bottom"] if latest["zone_bottom"] < entry_price else entry_price * 0.999
+    else:
+        stop_price = latest["zone_top"] if latest["zone_top"] > entry_price else entry_price * 1.001
+    sign = 1 if direction == "bullish" else -1
+    target_price = entry_price * (1 + sign * abs(trial["mean_return_holdout"]))
+    return {
+        "ticker": ticker, "tf_label": tf_label, "direction": direction,
+        "entry_price": entry_price, "stop_price": float(stop_price), "target_price": float(target_price),
+        "label": trial["label"], "p_value_train": trial["p_value_train"],
+        "mean_return_train": trial["mean_return_train"], "mean_return_holdout": trial["mean_return_holdout"],
+        "n_events": int(trial["n_events"]), "entry_time": df.index[latest["confirm_pos"]],
+        "bars_since_touch": bars_since, "forward_bars": settings["forward_bars"],
+        "zone_start": latest["zone_start"], "zone_top": latest["zone_top"], "zone_bottom": latest["zone_bottom"],
+        "is_live": bars_since <= settings["forward_bars"],
+    }
+
+
+def latest_validated_example(df, ticker, tf_label, trial):
+    """Same result shape as find_live_validated_signal, for ONE specific
+    trial (not "the strongest one for this ticker/timeframe") and WITHOUT
+    requiring it to still be live — the Survivors tab's "apply to chart"
+    button uses this so picking a validated strategy always shows
+    something (its most recent instance, live or not), rather than
+    silently doing nothing on the (usual) day nothing's live right now.
+    None only when this trial's own settings never produced a single
+    touch anywhere on df."""
+    touches = _touches_for_settings(df, trial)
+    return _signal_from_touches(df, ticker, tf_label, trial, touches, require_live=False)
 
 
 # A genuinely different kind of bet from everything above: every prior
@@ -2640,3 +2731,731 @@ def build_smt_divergence_events(signal_df, confirm_df, forward_bars, extreme_loo
         rows.append({"entry_time": signal_df.index[entry_pos], "raw_return": fwd_return, "direction": direction})
         last_exit_pos = exit_pos
     return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def build_clean_expansion_retracement_events(df, min_streak=3, retr_window_bars=40, forward_bars=10,
+                                              min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """events_df (entry_time, raw_return, direction).
+
+    Thesis (a same-session finding, not assumed): a run of min_streak+
+    consecutive same-direction FVG/Order Block zones that ALL get
+    genuinely respected — no close breaks them, none gets 100%
+    wick-mitigated, checked over a bounded retr_window_bars-bar window so
+    a zone near the end of that window isn't unfairly called "clean" just
+    because it hasn't had time to fail yet — measurably raises the odds
+    that the FIRST opposite-direction zone forming right after it also
+    holds (a same-session study on 8 tickers/1h/2yr found +3.1pp on
+    average, same-sign on 7/8, permutation p=0.004 — see this project's
+    own session notes; that study only measured zone-hold RATES, this
+    function turns it into an actual entry). Trade the ORIGINAL expansion's
+    own direction (classic ICT "buy the dip at a respected zone during a
+    pullback in an uptrend"), entering once that first opposite-direction
+    retracement zone appears — NOT the retracement's own direction: tried
+    that first (fade/continue the pullback itself) and it backtested to a
+    statistically significant NEGATIVE mean return on ES=F (same trades,
+    wrong-signed), i.e. the exact mirror of this rule — confirms the
+    retracement zone reads as a continuation entry, not a place to keep
+    riding the pullback.
+
+    Zone formation timing (so entries stay causal, no lookahead):
+      - FVG: "start" = idx[i-1]; the gap isn't confirmed until candle i+1
+        closes (start_pos + 2), so entry fills at (start_pos + 3)'s open.
+      - Order Block: "start" = the opposing candle itself; the breakout
+        that confirms it is the very next candle (start_pos + 1), so
+        entry fills at (start_pos + 2)'s open.
+    Same "decide on the confirming candle's own close, fill at the next
+    candle's open" rule this whole module already uses elsewhere — these
+    two detectors just confirm one bar apart from each other.
+
+    One trade at a time (last_exit_pos), same as every other builder
+    here. Shares its actual zone/streak/trigger detection with
+    _clean_expansion_touches (used by find_live_validated_signal for the
+    sidebar's live scan and the Survivors tab's "apply to chart") — one
+    definition of "what counts as a signal," not two that could drift
+    apart."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    open_arr = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    n = len(df)
+    touches = _clean_expansion_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)
+
+    rows = []
+    last_exit_pos = -1
+    for t in touches:
+        entry_pos = t["confirm_pos"] + 1
+        if entry_pos <= last_exit_pos or entry_pos >= n:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = open_arr[entry_pos]
+        exit_price = close_arr[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": t["direction"]})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def _confirmed_zone_pos(z):
+    """When a zone actually becomes KNOWABLE, not just when it starts —
+    FVG's own "start" is idx[i-1], but the gap isn't confirmed until
+    candle i+1 closes (start_pos + 2); an Order Block's "start" is the
+    opposing candle itself, confirmed one candle later (start_pos + 1).
+    Shared by every clean-zone-streak reader below so none of them can
+    disagree on this."""
+    return z["_pos"] + (2 if z["layer"] == "FVG" else 1)
+
+
+def _scan_clean_zone_streaks(df, min_streak, retr_window_bars, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """Shared detection core behind every clean-zone-streak strategy in
+    this module (build_clean_expansion_retracement_events and
+    build_clean_retracement_resumption_events, plus find_live_validated_
+    signal's own live-touch lookups for both) — one definition of "what
+    counts as a streak," so they can't quietly drift apart. Returns
+    (merged, qualifying): `merged` is every FVG/Order Block zone in
+    formation order, each tagged with its own bar position (_pos) and
+    layer; `qualifying` is every run of min_streak+ CONSECUTIVE zones,
+    same direction, that ALL get genuinely respected within
+    retr_window_bars of their own formation (no close breaks them, none
+    gets 100% wick-mitigated) — a single non-respected or opposite-
+    direction zone ends the current run. Each qualifying entry is
+    {"zones", "direction", "last_pos"} — the full streak, not just where
+    it ends, since a caller may want to react to any zone in it (the
+    retracement-resumption strategy needs the SECOND streak's own last
+    zone, not just its position)."""
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    n = len(df)
+    if n < retr_window_bars + 10:
+        return [], []
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+
+    merged = []
+    for z in detect_fvgs(df, min_body_ratio=min_body_ratio, max_scan_bars=retr_window_bars):
+        merged.append({**z, "layer": "FVG"})
+    for z in detect_order_blocks(df, min_body_ratio=min_body_ratio, max_scan_bars=retr_window_bars):
+        merged.append({**z, "layer": "Order Block"})
+    merged.sort(key=lambda z: z["start"])
+    for z in merged:
+        z["_pos"] = pos_by_time.get(z["start"])
+    merged = [z for z in merged if z["_pos"] is not None]
+
+    def _respected(z):
+        mitigated_flag = z.get("filled") if z["layer"] == "FVG" else z.get("mitigated")
+        if mitigated_flag:
+            return False
+        top = z.get("raw_top", z["top"])
+        bottom = z.get("raw_bottom", z["bottom"])
+        end_pos = min(n, z["_pos"] + 1 + retr_window_bars)
+        future_closes = close_arr[z["_pos"] + 1:end_pos]
+        if len(future_closes) == 0:
+            return True
+        if z["type"] == "bullish":
+            return not bool((future_closes < bottom).any())
+        else:
+            return not bool((future_closes > top).any())
+
+    qualifying = []
+    current = []
+    for z in merged:
+        ok = _respected(z)
+        if current and z["type"] != current[0]["type"]:
+            if len(current) >= min_streak:
+                qualifying.append({"zones": list(current), "direction": current[0]["type"],
+                                    "last_pos": current[-1]["_pos"]})
+            current = [z] if ok else []
+        elif ok:
+            current.append(z)
+        else:
+            if len(current) >= min_streak:
+                qualifying.append({"zones": list(current), "direction": current[0]["type"],
+                                    "last_pos": current[-1]["_pos"]})
+            current = []
+    if len(current) >= min_streak:
+        qualifying.append({"zones": list(current), "direction": current[0]["type"],
+                            "last_pos": current[-1]["_pos"]})
+    return merged, qualifying
+
+
+def _clean_expansion_touches(df, min_streak, retr_window_bars, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """The detection core behind build_clean_expansion_retracement_events,
+    factored out so find_live_validated_signal can check "is there a
+    signal as of the last bar in df" without needing a completed
+    forward_bars hold the way a real backtest event does — a live signal
+    by definition hasn't exited yet. Same shape _qualifying_touches
+    already returns for the original detector-reaction family (touch_pos,
+    confirm_pos, direction, zone_top, zone_bottom, zone_start), same
+    field meanings, so find_live_validated_signal's own downstream
+    stop-price/live-check logic needs zero changes to accept either.
+
+    "zone_top"/"zone_bottom" here describe the RETRACEMENT trigger zone
+    (the one actually being entered on), not the expansion streak itself
+    — that's the zone whose far edge is the natural stop, exactly the
+    role zone_top/zone_bottom plays for the original family too."""
+    merged, qualifying = _scan_clean_zone_streaks(df, min_streak, retr_window_bars, min_body_ratio)
+    touches = []
+    for streak in qualifying:
+        last_pos, expansion_dir = streak["last_pos"], streak["direction"]
+        retr_zone = next((z for z in merged
+                           if z["_pos"] > last_pos and z["_pos"] <= last_pos + retr_window_bars
+                           and z["type"] != expansion_dir), None)
+        if retr_zone is None:
+            continue
+        touches.append({
+            "touch_pos": retr_zone["_pos"], "confirm_pos": _confirmed_zone_pos(retr_zone),
+            "direction": expansion_dir,
+            "zone_top": retr_zone.get("raw_top", retr_zone["top"]),
+            "zone_bottom": retr_zone.get("raw_bottom", retr_zone["bottom"]),
+            "zone_start": retr_zone["start"],
+        })
+    return touches
+
+
+def _clean_retracement_resumption_touches(df, min_streak, retr_window_bars,
+                                           min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """The mirror question to _clean_expansion_touches: instead of "does a
+    clean expansion predict a good entry AT the first retracement zone,"
+    this asks "does the RETRACEMENT ITSELF being clean (its own qualifying
+    min_streak+ run of respected zones, not just one) predict anything."
+    Looks for two ADJACENT qualifying streaks of opposite direction —
+    streak A (the expansion), streak B immediately after it (the
+    retracement, itself clean) — and reads streak B's own completion as
+    the signal.
+
+    Trades streak B's OWN direction (the retracement continuing into a
+    genuine reversal), NOT a resumption of streak A: tried resumption
+    first (entering back in streak A's direction) and it backtested to a
+    statistically significant NEGATIVE mean return on BTC-USD 1h (same
+    trades, wrong-signed) — the exact mirror of build_clean_expansion_
+    retracement_events' own history (that one ALSO needed the opposite
+    of its first guess). Read together, the two findings say something
+    coherent: a retracement that's merely a lone zone reads as "noise,
+    the trend will resume" (that IS the other strategy's own edge), but
+    a retracement clean enough to form its OWN multi-zone streak reads
+    as real strength changing hands, not a dip to buy.
+
+    A streak that isn't immediately followed by an OPPOSITE qualifying
+    streak (the expansion just fizzles, or the "retracement" never
+    itself forms a clean run) produces no touch — this is a strictly
+    narrower, stricter-filtered condition than _clean_expansion_touches,
+    by design.
+
+    zone_top/zone_bottom/zone_start describe streak B's own LAST zone —
+    the retracement's own most recent respected level, the natural stop
+    (a break through it undoes the very thing that made the retracement
+    read as "clean")."""
+    _, qualifying = _scan_clean_zone_streaks(df, min_streak, retr_window_bars, min_body_ratio)
+    touches = []
+    for i in range(len(qualifying) - 1):
+        a, b = qualifying[i], qualifying[i + 1]
+        if a["direction"] == b["direction"]:
+            continue  # both the same direction -- not an expansion/retracement pair
+        last_zone = b["zones"][-1]
+        touches.append({
+            "touch_pos": last_zone["_pos"], "confirm_pos": _confirmed_zone_pos(last_zone),
+            "direction": b["direction"],
+            "zone_top": last_zone.get("raw_top", last_zone["top"]),
+            "zone_bottom": last_zone.get("raw_bottom", last_zone["bottom"]),
+            "zone_start": last_zone["start"],
+        })
+    return touches
+
+
+def build_clean_retracement_resumption_events(df, min_streak=3, retr_window_bars=40, forward_bars=10,
+                                               min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """events_df (entry_time, raw_return, direction) — see
+    _clean_retracement_resumption_touches for the exact rule. Same
+    causal-fill (confirm_pos + 1's open) and one-trade-at-a-time
+    convention as every other builder here."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    open_arr = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    n = len(df)
+    touches = _clean_retracement_resumption_touches(df, min_streak, retr_window_bars,
+                                                     min_body_ratio=min_body_ratio)
+    rows = []
+    last_exit_pos = -1
+    for t in touches:
+        entry_pos = t["confirm_pos"] + 1
+        if entry_pos <= last_exit_pos or entry_pos >= n:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = open_arr[entry_pos]
+        exit_price = close_arr[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": t["direction"]})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def _clean_structure_touches(df, min_swings=3, atr_period=14, atr_mult=1.5):
+    """A "clean trend" defined structurally instead of by zones: a run of
+    min_swings+ CONSECUTIVE confirmed swing pivots (detect_swings — ATR-
+    scaled ZigZag, strictly alternating high/low by construction) each
+    one extending the same direction relative to the pivot of the SAME
+    kind two positions back — a proper higher-high/higher-low sequence
+    for an uptrend, lower-low/lower-high for a downtrend. A single pivot
+    that fails to extend ends the run immediately, same "one bad one
+    ends the streak" discipline as _clean_expansion_touches' own zone
+    streaks, just applied to swing structure instead of FVG/OB zones —
+    this project's OTHER natural reading of "clean" for a trend.
+
+    Emits a touch every time the run is AT OR PAST min_swings length (not
+    just once) — a trend that keeps extending keeps re-confirming itself,
+    each one its own fresh continuation entry; one-trade-at-a-time in the
+    caller naturally spaces these out. Same {"touch_pos","confirm_pos",
+    "direction","zone_top","zone_bottom","zone_start"} shape every other
+    touch-finder in this module returns — zone_top/zone_bottom here are
+    both the LAST swing against the trend (the low behind a higher-low
+    run, the high behind a lower-high run), the natural structural stop:
+    a break back through it invalidates the "clean trend" read.
+
+    confirmed_pos (not pos) is what a caller can actually act on — using
+    a swing's own pos would be a lookahead bug (see detect_swings' own
+    docstring: a swing isn't KNOWN until price has already reversed away
+    from it)."""
+    highs, lows = detect_swings(df, atr_period=atr_period, atr_mult=atr_mult)
+    tagged = ([{**h, "kind": "high"} for h in highs] + [{**l, "kind": "low"} for l in lows])
+    tagged.sort(key=lambda p: p["pos"])
+
+    touches = []
+    run_dir = None
+    run_len = 0
+    last_price = {"high": None, "low": None}
+    for piv in tagged:
+        kind = piv["kind"]
+        prev_price = last_price[kind]
+        last_price[kind] = piv["price"]
+        if prev_price is None:
+            run_dir, run_len = None, 0
+            continue
+        extends_up = piv["price"] > prev_price
+        extends_down = piv["price"] < prev_price
+        if run_dir == "up":
+            if extends_up:
+                run_len += 1
+            else:
+                run_dir = "down" if extends_down else None
+                run_len = 1 if run_dir else 0
+        elif run_dir == "down":
+            if extends_down:
+                run_len += 1
+            else:
+                run_dir = "up" if extends_up else None
+                run_len = 1 if run_dir else 0
+        else:
+            if extends_up:
+                run_dir, run_len = "up", 1
+            elif extends_down:
+                run_dir, run_len = "down", 1
+            else:
+                run_dir, run_len = None, 0
+        if run_dir and run_len >= min_swings:
+            # The stop reference is the LAST swing AGAINST the trend —
+            # for an uptrend that's the most recent confirmed LOW (not
+            # necessarily THIS pivot, which could itself be the high
+            # side of the pair); last_price["low"]/["high"] already
+            # holds exactly that, updated in swing-formation order same
+            # as everything else here.
+            stop_ref = last_price["low"] if run_dir == "up" else last_price["high"]
+            touches.append({
+                "touch_pos": piv["pos"], "confirm_pos": piv["confirmed_pos"],
+                "direction": "bullish" if run_dir == "up" else "bearish",
+                "zone_top": stop_ref, "zone_bottom": stop_ref, "zone_start": piv["time"],
+            })
+    return touches
+
+
+def build_clean_structure_trend_events(df, min_swings=3, forward_bars=10, atr_period=14, atr_mult=1.5):
+    """events_df (entry_time, raw_return, direction) — the structural
+    sibling of build_clean_expansion_retracement_events: same "clean ==
+    no violation yet" thesis, applied to swing highs/lows instead of
+    FVG/OB zones (see _clean_structure_touches' own docstring for the
+    exact definition). Trade WITH the confirmed trend direction, entering
+    once a run of min_swings+ consecutive higher-highs/higher-lows (or
+    the bearish mirror) is established — a different, structure-based
+    answer to the same "clean trend" question this session's own zone-
+    based strategy already validated an edge for, not a variant of it.
+
+    Same causal-fill convention as every other builder here: a swing's
+    own confirmed_pos is when it becomes KNOWABLE (see detect_swings),
+    entry fills at confirmed_pos + 1's open — not confirmed_pos's own
+    close, which would already be known-in-the-past by the time a real
+    trader could act. One trade at a time."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    open_arr = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    n = len(df)
+    touches = _clean_structure_touches(df, min_swings=min_swings, atr_period=atr_period, atr_mult=atr_mult)
+
+    rows = []
+    last_exit_pos = -1
+    for t in touches:
+        entry_pos = t["confirm_pos"] + 1
+        if entry_pos <= last_exit_pos or entry_pos >= n:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = open_arr[entry_pos]
+        exit_price = close_arr[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": t["direction"]})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def _clean_expansion_liquidity_touches(df, min_streak, retr_window_bars, sweep_window_bars=10,
+                                        min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """A stricter version of _clean_expansion_touches: the same clean-
+    expansion-then-first-opposite-zone setup, kept ONLY when a genuine
+    liquidity sweep (detect_liquidity_sweeps — a real swing high/low
+    actually getting wicked through, not an inferred shape) pointing the
+    SAME direction as the continuation trade happened during the
+    retracement leg itself (between the expansion streak's own end and
+    the retracement zone's confirmation, plus a small sweep_window_bars
+    margin on each side for a sweep that lands just outside that exact
+    span). Thesis: a clean expansion's retracement zone is a plausible
+    entry on its own (already validated); one that ALSO coincides with
+    real stops getting run is a stronger version of the same setup — a
+    mechanistically grounded reason (actual resting orders triggered),
+    not just another inferred pattern. Same touch shape as
+    _clean_expansion_touches — this filters that function's own touches
+    down to the subset with a matching sweep, it doesn't find new ones."""
+    merged, qualifying = _scan_clean_zone_streaks(df, min_streak, retr_window_bars, min_body_ratio)
+    if not qualifying:
+        return []
+    pos_by_time = {t: i for i, t in enumerate(df.index)}
+    sweeps = detect_liquidity_sweeps(df)
+    for s in sweeps:
+        s["_end_pos"] = pos_by_time.get(s["end"])
+    sweeps = [s for s in sweeps if s["_end_pos"] is not None]
+
+    touches = []
+    for streak in qualifying:
+        last_pos, expansion_dir = streak["last_pos"], streak["direction"]
+        retr_zone = next((z for z in merged
+                           if z["_pos"] > last_pos and z["_pos"] <= last_pos + retr_window_bars
+                           and z["type"] != expansion_dir), None)
+        if retr_zone is None:
+            continue
+        confirm_pos = _confirmed_zone_pos(retr_zone)
+        has_sweep = any(s["type"] == expansion_dir
+                         and (last_pos - sweep_window_bars) <= s["_end_pos"] <= (confirm_pos + sweep_window_bars)
+                         for s in sweeps)
+        if not has_sweep:
+            continue
+        touches.append({
+            "touch_pos": retr_zone["_pos"], "confirm_pos": confirm_pos,
+            "direction": expansion_dir,
+            "zone_top": retr_zone.get("raw_top", retr_zone["top"]),
+            "zone_bottom": retr_zone.get("raw_bottom", retr_zone["bottom"]),
+            "zone_start": retr_zone["start"],
+        })
+    return touches
+
+
+def build_clean_expansion_liquidity_events(df, min_streak=3, retr_window_bars=40, forward_bars=10,
+                                            sweep_window_bars=10, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """events_df (entry_time, raw_return, direction) — see
+    _clean_expansion_liquidity_touches for the exact rule. Same causal-
+    fill (confirm_pos + 1's open) and one-trade-at-a-time convention as
+    every other builder here."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    open_arr = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    n = len(df)
+    touches = _clean_expansion_liquidity_touches(df, min_streak, retr_window_bars, sweep_window_bars,
+                                                  min_body_ratio=min_body_ratio)
+    rows = []
+    last_exit_pos = -1
+    for t in touches:
+        entry_pos = t["confirm_pos"] + 1
+        if entry_pos <= last_exit_pos or entry_pos >= n:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = open_arr[entry_pos]
+        exit_price = close_arr[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": t["direction"]})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def _htf_trend_direction(daily_df, ema_daily, touch_time):
+    """Which way the daily trend was pointing as of the last COMPLETED
+    daily bar strictly before touch_time — never the still-forming bar,
+    which would be a lookahead (the daily candle touch_time falls inside
+    hasn't closed yet at that moment). None when there's no prior daily
+    history at all, or its own 50-EMA hasn't warmed up yet."""
+    prior = daily_df[daily_df.index < touch_time]
+    if len(prior) < 2:
+        return None
+    last_close = prior["Close"].iloc[-1] if "Close" in prior else prior["close"].iloc[-1]
+    last_ema = ema_daily.reindex(prior.index).iloc[-1]
+    if pd.isna(last_ema):
+        return None
+    return "bullish" if last_close > last_ema else "bearish"
+
+
+def _filter_touches_by_htf_trend(df, touches, daily_df, ema_period=50):
+    """Keeps only the touches whose own direction agrees with the daily
+    trend (Close vs its own ema_period-EMA) as of the last daily bar
+    already closed at that touch's own moment — see _htf_trend_direction.
+    Same-session finding this filters toward: on 5 already-validated
+    (ticker, setting) clean-expansion combos, HTF-aligned trades averaged
+    +1.50% vs +0.95% for disaligned ones (p=0.01, permutation test) — both
+    still positive, so this is a magnitude booster, not a loss filter."""
+    ema_daily = (daily_df["Close"] if "Close" in daily_df else daily_df["close"]).ewm(span=ema_period, adjust=False).mean()
+    kept = []
+    for t in touches:
+        touch_time = df.index[t["confirm_pos"]]
+        trend = _htf_trend_direction(daily_df, ema_daily, touch_time)
+        if trend is not None and trend == t["direction"]:
+            kept.append(t)
+    return kept
+
+
+def _events_from_touches(df, touches, forward_bars):
+    """Shared entry/exit mechanics (causal fill, one-trade-at-a-time) for
+    any already-built touches list — every clean-* builder above
+    duplicated this same loop; the HTF-filtered variants below are what
+    finally made sharing it worth doing."""
+    cols = ["entry_time", "raw_return", "direction"]
+    close_arr = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    open_arr = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    n = len(df)
+    rows = []
+    last_exit_pos = -1
+    for t in sorted(touches, key=lambda t: t["confirm_pos"]):
+        entry_pos = t["confirm_pos"] + 1
+        if entry_pos <= last_exit_pos or entry_pos >= n:
+            continue
+        exit_pos = entry_pos + forward_bars
+        if exit_pos >= n:
+            continue
+        entry_price = open_arr[entry_pos]
+        exit_price = close_arr[exit_pos]
+        fwd_return = float((exit_price - entry_price) / entry_price)
+        rows.append({"entry_time": df.index[entry_pos], "raw_return": fwd_return, "direction": t["direction"]})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+def build_clean_expansion_retracement_htf_events(df, daily_df, min_streak=3, retr_window_bars=40, forward_bars=10,
+                                                  ema_period=50, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """build_clean_expansion_retracement_events, gated to only the touches
+    where the daily trend agrees with the trade's own direction (see
+    _filter_touches_by_htf_trend) — same participants visible at two
+    timescales at once, tested as a magnitude booster, not a new entry
+    rule. daily_df is a plain argument, not run_deep_backtest's own
+    (JSON-logged) settings dict — a dataframe can't serialize into the
+    trial log anyway, and every OTHER setting here already fully
+    describes the rule that produced a given result."""
+    touches = _clean_expansion_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)
+    touches = _filter_touches_by_htf_trend(df, touches, daily_df, ema_period)
+    return _events_from_touches(df, touches, forward_bars)
+
+
+def build_clean_expansion_liquidity_htf_events(df, daily_df, min_streak=3, retr_window_bars=40, forward_bars=10,
+                                                sweep_window_bars=10, ema_period=50,
+                                                min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """build_clean_expansion_liquidity_events, HTF-trend-gated the same
+    way build_clean_expansion_retracement_htf_events is — see that
+    function's own docstring."""
+    touches = _clean_expansion_liquidity_touches(df, min_streak, retr_window_bars, sweep_window_bars,
+                                                  min_body_ratio=min_body_ratio)
+    touches = _filter_touches_by_htf_trend(df, touches, daily_df, ema_period)
+    return _events_from_touches(df, touches, forward_bars)
+
+
+def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40):
+    """A genuinely different EXIT mechanic on the SAME already-validated
+    entries (touches, from any of the _clean_*_touches finders above) —
+    a fixed stop (atr_mult_stop x ATR at entry) and a fixed target
+    (rr_multiple x that same distance), walked forward bar-by-bar until
+    one is touched, instead of the time-based forward_bars close-to-close
+    exit every OTHER builder here uses. This is the honest way to chase
+    a higher win rate: a smaller target relative to the stop hits more
+    often BY CONSTRUCTION, so testing this only means something if the
+    resulting expectancy (mean R) is ALSO still positive and beats
+    random direction-calling — see run_deep_backtest_rr's own real-vs-
+    flipped permutation test for that check.
+
+    ATR at entry, not the zone's own edge: the zone edge (used as the
+    stop for the time-exit builders) is sometimes clamped to an
+    artificial 0.1%-of-price distance when the zone sits on the wrong
+    side of entry (see _signal_from_touches' own comment) — using that
+    as a FIXED R-multiple's own risk unit was tried first and produced
+    nonsense (46% win rate at RR=0.3, which should be far higher for a
+    target that much closer than the stop) because "risk" was sometimes
+    a near-zero distance the very next candle's ordinary noise clears
+    either way. ATR is a stable, always-real distance regardless of
+    which side of entry the zone landed on.
+
+    On a bar where both stop and target fall inside its own high-low
+    range, this assumes the stop hit first — the standard conservative
+    convention for reconstructing intrabar order from OHLC alone, which
+    has no real path between the open and close to check.
+
+    Returns a DataFrame (entry_time, r_real, r_flip, direction) —
+    r_real is the realized R multiple trading the touch's own real
+    direction; r_flip is what the SAME touch would have realized had the
+    direction been the opposite call, computed from the same entry bar
+    with mirrored stop/target — the pairing run_deep_backtest_rr's own
+    permutation test needs to ask "did calling the real direction
+    actually beat a coin flip on this exact set of entries," not just
+    "was the mean positive," which a merely lucky exit rule could
+    produce even from uninformed entries."""
+    high = (df["High"] if "High" in df else df["high"]).to_numpy()
+    low = (df["Low"] if "Low" in df else df["low"]).to_numpy()
+    close = (df["Close"] if "Close" in df else df["close"]).to_numpy()
+    open_ = (df["Open"] if "Open" in df else df["open"]).to_numpy()
+    atr = atr_series(df).to_numpy()
+    n = len(df)
+
+    def _run(entry_pos, entry_price, risk, direction):
+        if direction == "bullish":
+            stop_price = entry_price - risk
+            target_price = entry_price + risk * rr_multiple
+        else:
+            stop_price = entry_price + risk
+            target_price = entry_price - risk * rr_multiple
+        for j in range(entry_pos, min(n, entry_pos + max_bars)):
+            h, l = high[j], low[j]
+            if direction == "bullish":
+                hit_stop, hit_target = l <= stop_price, h >= target_price
+            else:
+                hit_stop, hit_target = h >= stop_price, l <= target_price
+            if hit_stop:
+                return -1.0, j
+            if hit_target:
+                return rr_multiple, j
+        j = min(n - 1, entry_pos + max_bars - 1)
+        exit_price = close[j]
+        realized = (exit_price - entry_price) if direction == "bullish" else (entry_price - exit_price)
+        return realized / risk, j
+
+    rows = []
+    last_exit_pos = -1
+    for t in sorted(touches, key=lambda t: t["confirm_pos"]):
+        entry_pos = t["confirm_pos"] + 1
+        if entry_pos <= last_exit_pos or entry_pos >= n:
+            continue
+        a = atr[entry_pos]
+        if pd.isna(a) or a <= 0:
+            continue
+        entry_price = open_[entry_pos]
+        risk = a * atr_mult_stop
+        real_dir = t["direction"]
+        opp_dir = "bearish" if real_dir == "bullish" else "bullish"
+        r_real, exit_pos = _run(entry_pos, entry_price, risk, real_dir)
+        r_flip, _ = _run(entry_pos, entry_price, risk, opp_dir)
+        rows.append({"entry_time": df.index[entry_pos], "r_real": r_real, "r_flip": r_flip, "direction": real_dir})
+        last_exit_pos = exit_pos
+    return pd.DataFrame(rows, columns=["entry_time", "r_real", "r_flip", "direction"])
+
+
+def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fraction=0.8, n_permutations=5000,
+                          seed=0):
+    """The R-multiple-metric sibling of run_deep_backtest — same 80/20
+    time split, same same-sign-across-splits discipline, same accumulating
+    trial log (_append_trial, so load_experiment_trials' own BH-correction
+    and ticker_behavior.py both pick this up with zero changes — they
+    only ever read p_value_train/mean_return_train/mean_return_holdout/
+    holdout_verdict/same_sign, never caring what UNITS mean_return is in).
+
+    The significance test itself has to be different: run_event_study's
+    own permutation shuffles which events get which DIRECTION LABEL
+    across the whole sample, which only makes sense when direction is
+    independent of the outcome computation — for a fixed-R:R exit, the
+    stop/target placement itself depends on direction, so relabeling
+    would silently paste one touch's real outcome onto a different
+    touch's own entry price/ATR. Instead, events_df carries BOTH r_real
+    (the touch's own real-direction outcome) and r_flip (the SAME touch,
+    same entry bar, mirrored stop/target) — the null is "for each touch
+    independently, a coin flip decides whether you get r_real or r_flip,"
+    which tests the right thing (does calling the ACTUAL direction beat
+    chance on these exact entries) without ever mixing outcomes across
+    touches."""
+    trial = {
+        "logged_at": pd.Timestamp.now("UTC").isoformat(), "ticker": ticker, "tf_label": tf_label,
+        "label": label, "settings": settings, "n_events": len(events_df),
+    }
+    if len(events_df) < 30:
+        trial["verdict"] = "INSUFFICIENT_DATA"
+        _append_trial(trial)
+        return trial
+
+    events_df = events_df.sort_values("entry_time").reset_index(drop=True)
+    cutoff_pos = int(len(events_df) * train_fraction)
+    train = events_df.iloc[:cutoff_pos]
+    holdout = events_df.iloc[cutoff_pos:]
+    rng = np.random.default_rng(seed)
+
+    def _score(split):
+        n = len(split)
+        if n == 0:
+            return {"n": 0, "mean": None, "p": None}
+        real = split["r_real"].to_numpy()
+        flip = split["r_flip"].to_numpy()
+        observed = real.mean()
+        null = np.empty(n_permutations)
+        for i in range(n_permutations):
+            coin = rng.integers(0, 2, size=n).astype(bool)
+            null[i] = np.where(coin, real, flip).mean()
+        p = float((null >= observed).mean())
+        return {"n": n, "mean": float(observed), "p": p}
+
+    train_score = _score(train)
+    holdout_score = _score(holdout)
+    if train_score["n"] == 0:
+        trial["verdict"] = "INSUFFICIENT_DATA"
+        _append_trial(trial)
+        return trial
+
+    mean_train, mean_holdout = train_score["mean"], holdout_score["mean"]
+    trial.update({
+        "n_train": train_score["n"], "n_holdout": holdout_score["n"],
+        "mean_return_train": mean_train, "p_value_train": train_score["p"],
+        "mean_return_holdout": mean_holdout,
+        "holdout_verdict": "PASSED" if (holdout_score["p"] is not None and holdout_score["p"] < 0.05
+                                         and mean_holdout is not None and mean_holdout > 0) else "FAILED",
+        "same_sign": bool(mean_train is not None and mean_holdout is not None
+                           and mean_train > 0 and mean_holdout > 0),
+        "verdict": "SCORED",
+    })
+    _append_trial(trial)
+    return trial
+
+
+def build_clean_expansion_fixed_rr_events(df, min_streak=3, retr_window_bars=40, rr_multiple=0.5,
+                                           atr_mult_stop=1.0, max_bars=40, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """clean_expansion_retracement's own entries, exited with a fixed
+    stop/target (see _simulate_fixed_rr) instead of a time-based hold —
+    the high-win-rate sibling of build_clean_expansion_retracement_events,
+    same entries, different question."""
+    touches = _clean_expansion_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)
+    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars)
+
+
+def build_clean_expansion_liquidity_fixed_rr_events(df, min_streak=3, retr_window_bars=40, sweep_window_bars=10,
+                                                     rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40,
+                                                     min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """clean_expansion_liquidity's own entries, fixed-R:R exit — see
+    build_clean_expansion_fixed_rr_events's own docstring."""
+    touches = _clean_expansion_liquidity_touches(df, min_streak, retr_window_bars, sweep_window_bars,
+                                                  min_body_ratio=min_body_ratio)
+    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars)
+
+
+def build_clean_retracement_resumption_fixed_rr_events(df, min_streak=3, retr_window_bars=40, rr_multiple=0.5,
+                                                        atr_mult_stop=1.0, max_bars=40,
+                                                        min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+    """clean_retracement_resumption's own entries, fixed-R:R exit — see
+    build_clean_expansion_fixed_rr_events's own docstring."""
+    touches = _clean_retracement_resumption_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)
+    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars)

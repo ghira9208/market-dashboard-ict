@@ -23,6 +23,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 import backtest_ui
 import experiments
 import news
+import survivors_ui
 import theme
 from data import get_latest_bars, get_yf_ohlcv, is_ticker_alive, resample_ohlc, warm_in_background
 from detectors import (
@@ -2012,8 +2013,9 @@ with main_col:
     @st.fragment
     def _render_layer_controls():
         _prev_cc = st.session_state.get("_chart_controls")
-        _tab_layers, _tab_strategy, _tab_backtest, _tab_settings, _tab_charts = st.tabs([
+        _tab_layers, _tab_strategy, _tab_survivors, _tab_backtest, _tab_settings, _tab_charts = st.tabs([
             ":material/layers: Layers", ":material/rule: Strategy",
+            ":material/emoji_events: Survivors",
             ":material/monitoring: Backtest", ":material/tune: Settings",
             ":material/candlestick_chart: Charts",
         ])
@@ -2385,6 +2387,17 @@ with main_col:
                 backtest_ui.render_sweep_tab(TICKER_INFO)
             with _heatmap_tab:
                 backtest_ui.render_heatmap_tab()
+
+        with _tab_survivors, st.container(key="_panel_survivors"):
+            # Everything that's ever cleared a REAL statistical bar
+            # (survived BH-correction across the whole accumulated
+            # experiments.py trial log, held up on untouched holdout
+            # data) — see ticker_behavior.py/survivors_ui.py. Distinct
+            # from the Strategy tab's own sweep above: that engine builds
+            # generic anchor-based rules on demand, this browses what's
+            # already been proven and lets you jump straight to it.
+            survivors_ui.render_survivors_tab(
+                ticker, TF_KEY_BY_CHART["main"], TIMEFRAMES, TICKER_INFO, data_source)
 
         with _tab_backtest, st.container(key="_panel_backtest"):
             # The currently active rule — whatever result row was last sent

@@ -24,6 +24,88 @@ def _binance_symbol(yahoo_ticker):
     return yahoo_ticker.replace("-USD", "").upper() + "USDT"
 
 
+def default_tick_for_price(price):
+    """A sane price-bucket size with no user picking one — the standalone
+    tab's own fp_tick widget always starts at a flat 5.0 regardless of
+    ticker (its own help text says as much: "a coin under $10 wants 0.01
+    or smaller; BTC wants 5-50"), fine when a human is about to look at
+    the number and adjust it, not fine for something that has to pick a
+    tick size on its own the instant a candle gets wide enough to reveal
+    footprints. Coarse, deliberately: too many rows just means most of
+    them are empty and thin, not wrong."""
+    if price >= 10000:
+        return 10.0
+    if price >= 1000:
+        return 1.0
+    if price >= 100:
+        return 0.1
+    if price >= 10:
+        return 0.01
+    if price >= 1:
+        return 0.001
+    return 0.0001
+
+
+def fetch_footprint_for_window(df, symbol, from_time, to_time, tick, imbalance_ratio=3.0, max_candles=80):
+    """Real per-trade footprint data for exactly the candles of `df` (the
+    MAIN chart's own already-loaded OHLC — real candle boundaries, not a
+    second, separately-fetched Binance klines series) whose own open time
+    falls in [from_time, to_time] — real, tz-aware pandas Timestamps
+    (from_time/to_time can be in any tz; comparison against df's own
+    index normalizes by real instant either way). Only the underlying
+    real-trade data (aggTrades) is fetched fresh, so footprint cells land
+    exactly on the candles already drawn instead of a second, potentially
+    slightly-offset candle grid.
+
+    None when the window is empty or wider than max_candles — a
+    defensive floor, not the normal case: the caller (the main chart's
+    own zoom-triggered footprint reveal) only ever calls this once the
+    chart's own candles are individually wide enough on screen to be
+    worth it, which already keeps the visible count small on its own;
+    this just refuses a stray call that would otherwise try to
+    bucket-trade an unbounded range."""
+    window = df[(df.index >= from_time) & (df.index <= to_time)]
+    if window.empty or len(window) > max_candles:
+        return None
+
+    idx = window.index
+    o = window["Open"] if "Open" in window else window["open"]
+    h = window["High"] if "High" in window else window["high"]
+    l = window["Low"] if "Low" in window else window["low"]
+    c = window["Close"] if "Close" in window else window["close"]
+    klines = []
+    for i in range(len(idx)):
+        open_ms = int(idx[i].value // 1_000_000)
+        if i + 1 < len(idx):
+            close_ms = int(idx[i + 1].value // 1_000_000) - 1
+        else:
+            step_ms = (open_ms - int(idx[i - 1].value // 1_000_000)) if i > 0 else 60_000
+            close_ms = open_ms + step_ms - 1
+        klines.append({"open_time": open_ms, "close_time": close_ms,
+                        "open": float(o.iloc[i]), "high": float(h.iloc[i]),
+                        "low": float(l.iloc[i]), "close": float(c.iloc[i])})
+
+    start_ms, end_ms = klines[0]["open_time"], klines[-1]["close_time"]
+    # Same pagination-headroom heuristic as the standalone tab's own Load
+    # button (see render_footprint_tab) — scaled off the real window
+    # width in minutes instead of a user-picked candle count, since this
+    # caller's "candle count" is whatever's currently zoomed in, not a
+    # slider value.
+    span_minutes = max(1, (end_ms - start_ms) / 60_000)
+    max_calls = min(150, max(20, int(span_minutes // 2) + 20))
+    trades, truncated = _fetch_agg_trades(symbol, start_ms, end_ms, max_calls)
+    payload = _build_footprint_payload(symbol, "chart", klines, trades, tick, imbalance_ratio)
+    # Real unix-seconds bar time, added AFTER _build_footprint_payload
+    # (left completely untouched — the standalone tab's own "%H:%M"
+    # display string in base["time"] stays exactly as it was) so this
+    # payload's candles can be placed at the main chart's own real x-axis
+    # coordinates instead of the standalone tool's fixed per-candle lane.
+    for i, cand in enumerate(payload["candles"]):
+        cand["time"] = klines[i]["open_time"] // 1000
+    payload["truncated"] = truncated
+    return payload
+
+
 @st.cache_resource(show_spinner=False)
 def _binance_session():
     """One pooled HTTP connection reused across every Binance call in this

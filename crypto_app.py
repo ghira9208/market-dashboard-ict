@@ -16,6 +16,7 @@ from datetime import time as dtime
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
@@ -23,6 +24,7 @@ import backtest_ui
 import experiments
 import footprint
 import news
+import survivors_ui
 import theme
 from data import get_crypto_universe, get_latest_bars, get_yf_ohlcv, is_ticker_alive, resample_ohlc, warm_in_background
 from detectors import (
@@ -1947,8 +1949,9 @@ with main_col:
     @st.fragment
     def _render_layer_controls():
         _prev_cc = st.session_state.get("_chart_controls")
-        _tab_layers, _tab_strategy, _tab_backtest, _tab_settings, _tab_charts = st.tabs([
+        _tab_layers, _tab_strategy, _tab_survivors, _tab_backtest, _tab_settings, _tab_charts = st.tabs([
             ":material/layers: Layers", ":material/rule: Strategy",
+            ":material/emoji_events: Survivors",
             ":material/monitoring: Backtest", ":material/tune: Settings",
             ":material/candlestick_chart: Charts",
         ])
@@ -2326,6 +2329,17 @@ with main_col:
                 backtest_ui.render_sweep_tab(TICKER_INFO)
             with _heatmap_tab:
                 backtest_ui.render_heatmap_tab()
+
+        with _tab_survivors, st.container(key="_panel_survivors"):
+            # Everything that's ever cleared a REAL statistical bar
+            # (survived BH-correction across the whole accumulated
+            # experiments.py trial log, held up on untouched holdout
+            # data) — see ticker_behavior.py/survivors_ui.py. Distinct
+            # from the Strategy tab's own sweep above: that engine builds
+            # generic anchor-based rules on demand, this browses what's
+            # already been proven and lets you jump straight to it.
+            survivors_ui.render_survivors_tab(
+                ticker, TF_KEY_BY_CHART["main"], TIMEFRAMES, TICKER_INFO, data_source)
 
         with _tab_backtest, st.container(key="_panel_backtest"):
             # The currently active rule — whatever result row was last sent
@@ -4893,6 +4907,15 @@ with main_col:
                 # bearish (arrowDown) markers were disappearing at
                 # some zoom levels.
                 "markers": sorted(markers, key=lambda m: m["time"]),
+                # Only present once the footprint-on-zoom dispatch below
+                # has actually run at least once this session (key
+                # presence itself is what tells the frontend "something
+                # changed" — see applyOverlays' own comment) — a stale
+                # None here would otherwise fire a needless detach on
+                # every single render before the user has ever zoomed in
+                # far enough to trigger it even once.
+                **({"footprint": st.session_state["_fp_overlay_payload"]}
+                   if "_fp_overlay_payload" in st.session_state else {}),
             }
             # ghost_candles/volume_profile only ever change on a genuine
             # full reload (ticker/timeframe/overlay-TF/backfill depth) —
@@ -4920,6 +4943,15 @@ with main_col:
                           # from barSpacing with no separate thickness knob,
                           # see candleWidthFactor in the frontend.
                           "candle_width_factor": 0.85,
+                          # Real per-trade footprint data only exists for a
+                          # Binance-backed crypto ticker (see footprint.py's
+                          # own "Crypto only, always") — every OTHER ticker
+                          # this dashboard could show would need this to be
+                          # False, but crypto_app.py's own ticker universe is
+                          # crypto-only already, so this is unconditional
+                          # here (app.py/Markets never sets it at all, which
+                          # already defaults the frontend's own flag False).
+                          "footprint_enabled": ticker.upper().endswith("-USD"),
                           # Direct request: "default the chart to about 60%
                           # of the width to the right to make room for the
                           # trades" — the active-trade box and rebalance-
@@ -4988,7 +5020,82 @@ with main_col:
                     # alone doesn't cover.
                     st.session_state.pop("_main_last_indicator_fp", None)
                     st.rerun(scope="fragment")
-            _select_chart("main", clicked)
+
+            # Footprint-on-zoom — the frontend's own debounced listener
+            # (see FOOTPRINT_MIN_BAR_SPACING) sends this once per genuine
+            # pan/zoom settle while candles are wide enough on screen;
+            # from/to are None when it zoomed back out past the threshold
+            # (an explicit "turn it off" signal, not silence). Intercepted
+            # HERE, before _select_chart, for the same reason the resync
+            # sentinel above is: _select_chart's own "did the value
+            # change" check has no idea this isn't a real click, and would
+            # otherwise fire a full st.rerun() on every debounced pan/zoom
+            # tick — a real, confirmed-in-testing-during-this-build
+            # regression before this guard existed.
+            #
+            # _fp_last_range_key guards against reprocessing: Streamlit
+            # components keep returning the SAME last value on every
+            # subsequent rerun until the frontend sends a genuinely new
+            # one (the auto-ticking fragment's own run_every reruns this
+            # whole function far more often than the user actually
+            # zooms) — without this, every tick would re-fetch the exact
+            # same Binance window for no reason.
+            if isinstance(clicked, dict) and clicked.get("kind") == "footprint_range":
+                # Scoped by ticker+timeframe, not just the raw seconds —
+                # the frontend's own iframe persists across a ticker/TF
+                # switch (same component key), and two different tickers'
+                # own default "last ~120 bars up to now" views can easily
+                # round to the exact same visible-range seconds. Without
+                # this, switching ticker while already zoomed in could
+                # silently keep showing the PREVIOUS ticker's footprint
+                # payload — same real risk the frontend's own
+                # lastFootprintSentKey reset (see effectiveFullReload's
+                # own comment there) closes on that side; this closes it
+                # on the side that actually decides whether to hit
+                # Binance and build new data at all.
+                _fp_key = (ticker, tf_label, clicked.get("from"), clicked.get("to"))
+                if st.session_state.get("_fp_last_range_key") != _fp_key:
+                    st.session_state["_fp_last_range_key"] = _fp_key
+                    if clicked.get("from") is None or not ticker.upper().endswith("-USD"):
+                        st.session_state["_fp_overlay_payload"] = None
+                    else:
+                        _fp_from = _reverse_ny_fake_utc_seconds(clicked["from"])
+                        _fp_to = _reverse_ny_fake_utc_seconds(clicked["to"])
+                        _fp_window = df[(df.index >= _fp_from) & (df.index <= _fp_to)]
+                        try:
+                            _fp_payload = footprint.fetch_footprint_for_window(
+                                df, footprint._binance_symbol(ticker), _fp_from, _fp_to,
+                                footprint.default_tick_for_price(current_price))
+                        except requests.RequestException:
+                            _fp_payload = None
+                        if _fp_payload and not _fp_window.empty:
+                            # Real unix-seconds bar time -> this chart's own
+                            # display-shifted x-axis convention (see
+                            # _ny_fake_utc_seconds' own docstring) — without
+                            # this, timeToCoordinate on the frontend would
+                            # never match any of the candle series' own
+                            # loaded points, and every footprint cell would
+                            # silently fail to place at all.
+                            _fp_times = _ny_fake_utc_seconds_vec(_fp_window.index[:len(_fp_payload["candles"])])
+                            for _fp_c, _fp_t in zip(_fp_payload["candles"], _fp_times):
+                                _fp_c["time"] = _fp_t
+                        st.session_state["_fp_overlay_payload"] = _fp_payload
+                    st.rerun(scope="fragment")
+            else:
+                # Never reaches _select_chart on ANY pass for a footprint-
+                # range value, not just the one that gets intercepted
+                # above — a footprint dict that's already been processed
+                # (the branch above's own _fp_last_range_key guard skips
+                # it, falling through with no rerun) would otherwise still
+                # look like a brand-new value to _select_chart's own
+                # separate "did this change" check on marker_key, firing
+                # an unwanted full st.rerun() one pass later — traced
+                # through by hand while building this (not yet reproduced
+                # live): without this `else`, every debounced zoom-settle
+                # would produce one correct fragment rerun immediately
+                # followed by one FULL app rerun right after, from this
+                # exact call.
+                _select_chart("main", clicked)
 
             # Feature C — "click an area, scan for known patterns/levels
             # that are meaningful." Only a genuinely NEW click (a fresh

@@ -333,6 +333,66 @@ chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
   }, 150);
 });
 
+// Footprint reveal-on-zoom — a SEPARATE listener from the settle-timer
+// one just above (that one exists to restore a preserved calendar
+// window across ticker/TF switches; this one exists to tell Python
+// "the user is looking at roughly this many pixels per candle now,"
+// a completely unrelated concern that happens to fire off the same
+// underlying chart event). Direct request: reveal real per-trade detail
+// once a candle is wide enough on screen to actually show it, not on a
+// fixed zoom LEVEL or candle COUNT — barSpacing (px allocated per bar,
+// uniform across every bar at a given zoom) is exactly "how wide is one
+// candle right now," read fresh off the timeScale's own options rather
+// than derived from the logical range.
+//
+// Debounced for real, not just for a smoother feel: each send triggers
+// a live Binance aggTrades fetch in Python (see footprint.py's own
+// fetch_footprint_for_window) — sending on every intermediate frame of
+// a drag would hammer that endpoint for no reason once the user's still
+// mid-gesture and about to look somewhere else entirely. 400ms of
+// actual quiet (not just a fixed post-event delay — see the EXISTING
+// settle timer's own comment on why a duration alone isn't reliable,
+// same reasoning applies here) is enough to feel immediate once a pan/
+// zoom genuinely stops, without firing mid-drag.
+const FOOTPRINT_MIN_BAR_SPACING = 55; // px per bar — enough width for a thin proportional buy/sell bar per price row
+let footprintQuietTimer = null;
+let lastFootprintSentKey = null;
+chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+  if (!footprintEnabled) return;
+  if (footprintQuietTimer) clearTimeout(footprintQuietTimer);
+  footprintQuietTimer = setTimeout(() => {
+    footprintQuietTimer = null;
+    const barSpacing = chart.timeScale().options().barSpacing;
+    if (barSpacing < FOOTPRINT_MIN_BAR_SPACING) {
+      // Zoomed back out past the threshold — tell Python to clear
+      // whatever footprint payload is currently attached, once, not on
+      // every subsequent pan/zoom tick while it stays zoomed out.
+      if (lastFootprintSentKey !== 'off') {
+        lastFootprintSentKey = 'off';
+        sendToStreamlit('streamlit:setComponentValue', {
+          value: { kind: 'footprint_range', from: null, to: null, bar_spacing: barSpacing },
+          dataType: 'json',
+        });
+      }
+      return;
+    }
+    const visible = chart.timeScale().getVisibleRange();
+    if (!visible) return;
+    // Rounded to the nearest second — sub-second jitter in the exact
+    // visible-range float from one settle to the next shouldn't count
+    // as "a new window" and re-trigger a real network fetch for
+    // essentially the same candles.
+    const from = Math.floor(visible.from), to = Math.ceil(visible.to);
+    const key = from + '|' + to;
+    if (key === lastFootprintSentKey) return;
+    lastFootprintSentKey = key;
+    sendToStreamlit('streamlit:setComponentValue', {
+      value: { kind: 'footprint_range', from, to, bar_spacing: barSpacing },
+      dataType: 'json',
+    });
+  }, 400);
+});
+
 // The calendar window a TF switch should try to preserve isn't always the
 // same thing as "whatever's actually rendered right now" — confirmed
 // directly: a saved multi-month window that translates to more bars than
@@ -445,6 +505,14 @@ let futureMarginFrac = 0;
 // they still need the heavier calendar-conversion path; this is a
 // narrower, simpler alternative for the one caller that doesn't.
 let preserveLogicalRange = false;
+
+// Set from options.footprint_enabled (see handleRender) — crypto tickers
+// only, real per-trade footprint data doesn't exist for a Yahoo-sourced
+// forex/futures/indices bar (see footprint.py's own "Crypto only,
+// always"). False (the Markets dashboard's every render) means the
+// listener below never sends anything at all, so this whole feature is
+// completely inert there with zero code path difference otherwise.
+let footprintEnabled = false;
 
 // How many of the most recent real bars fitContentWhenReady shows by
 // default when futureMarginFrac is also set — see its own call site for
@@ -1014,6 +1082,111 @@ class VolumeProfilePrimitive {
 }
 
 /* ---------------------------------------------------------------------
+ * Footprint primitive — real per-trade buy/sell volume, one row per
+ * price tick, drawn directly over whichever candles are currently both
+ * (a) wide enough on screen to be worth it (see FOOTPRINT_MIN_BAR_SPACING
+ * above) and (b) have a footprint payload Python's actually fetched for
+ * them (only ever the currently-visible window — see
+ * footprint.py's own fetch_footprint_for_window). zOrder 'top' is
+ * deliberate: this needs to sit ABOVE the real candle body/wick, not
+ * beside it — the footprint cells ARE the candle at this zoom level, per
+ * direct request ("when the width of the candle is a certain size, it
+ * should reveal footprints"), not an addition next to a still-visible
+ * plain candle.
+ *
+ * No text is drawn — a proportional buy(blue)/sell(red) split per row
+ * reads correctly at any width down to a couple of pixels, where fitting
+ * real numbers would just overflow or need to be skipped inconsistently.
+ * The point-of-control row gets an amber wash + outline (same accent
+ * this project's own theme.NEON_AMBER already means "the significant
+ * level" everywhere else); an imbalance-stack row (see
+ * _detect_imbalance_stacks) gets a brighter, more saturated version of
+ * its own buy/sell color rather than a separate hue, so a busy chart
+ * doesn't accumulate a fourth/fifth meaning for color on top of what
+ * every other layer already uses red/blue/amber for.
+ *
+ * ONE primitive holding every candle's every row (not one primitive per
+ * candle, and not one per row) — same reasoning as
+ * GhostCandleBatchPrimitive above: this can legitimately be dozens of
+ * candles times dozens of price levels each, and per-primitive dispatch
+ * overhead is the actual cost that matters at that count, not the raw
+ * fillRect calls themselves.
+ * ------------------------------------------------------------------- */
+class FootprintRenderer {
+  constructor(rows) { this._rows = rows; }
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      const ctx = scope.context;
+      for (const r of this._rows) {
+        const hb = positionsBox(r.x0, r.x1, scope.horizontalPixelRatio);
+        const vb = positionsBox(r.y0, r.y1, scope.verticalPixelRatio);
+        if (hb.length < 1 || vb.length < 1) continue;
+        ctx.fillStyle = r.isPoc ? 'rgba(255,159,10,0.20)' : 'rgba(28,28,30,0.92)';
+        ctx.fillRect(hb.position, vb.position, hb.length, vb.length);
+        const total = r.buy + r.sell;
+        if (total > 0) {
+          const sellW = Math.max(0, Math.round(hb.length * (r.sell / total)));
+          const buyW = hb.length - sellW;
+          ctx.fillStyle = r.sellImb ? 'rgba(255,69,58,0.95)' : 'rgba(255,69,58,0.55)';
+          if (sellW > 0) ctx.fillRect(hb.position, vb.position, sellW, vb.length);
+          ctx.fillStyle = r.buyImb ? 'rgba(10,132,255,0.95)' : 'rgba(10,132,255,0.55)';
+          if (buyW > 0) ctx.fillRect(hb.position + sellW, vb.position, buyW, vb.length);
+        }
+        if (r.isPoc) {
+          ctx.strokeStyle = 'rgba(255,159,10,0.9)';
+          ctx.lineWidth = Math.max(1, Math.round(scope.verticalPixelRatio));
+          ctx.strokeRect(hb.position + 0.5, vb.position + 0.5, hb.length - 1, vb.length - 1);
+        }
+      }
+    });
+  }
+}
+
+class FootprintPaneView {
+  constructor(source) { this._source = source; this._rows = []; }
+  update() {
+    const { chart, series, candles, tick } = this._source;
+    if (!chart || !series || !candles || !candles.length) { this._rows = []; return; }
+    const timeScale = chart.timeScale();
+    const barSpacing = timeScale.options().barSpacing;
+    const half = barSpacing / 2;
+    const visible = timeScale.getVisibleRange();
+    const rows = [];
+    for (const cand of candles) {
+      if (visible && (cand.time < visible.from || cand.time > visible.to)) continue;
+      const xCenter = timeScale.timeToCoordinate(cand.time);
+      if (xCenter === null) continue; // this exact bar isn't (yet) one of the series' own loaded points
+      const x0 = xCenter - half, x1 = xCenter + half;
+      for (const lvl of cand.levels) {
+        const yA = series.priceToCoordinate(lvl.price + tick / 2);
+        const yB = series.priceToCoordinate(lvl.price - tick / 2);
+        if (yA === null || yB === null) continue;
+        rows.push({
+          x0, x1, y0: Math.min(yA, yB), y1: Math.max(yA, yB),
+          buy: lvl.buy, sell: lvl.sell,
+          isPoc: lvl.idx === cand.poc_idx, buyImb: !!lvl.buy_imb, sellImb: !!lvl.sell_imb,
+        });
+      }
+    }
+    this._rows = rows;
+  }
+  renderer() { return new FootprintRenderer(this._rows); }
+  zOrder() { return 'top'; }
+}
+
+class FootprintPrimitive {
+  constructor(payload) {
+    this.candles = payload.candles;
+    this.tick = payload.tick;
+    this._paneViews = [new FootprintPaneView(this)];
+  }
+  attached({ chart, series }) { this.chart = chart; this.series = series; }
+  detached() { this.chart = undefined; this.series = undefined; }
+  updateAllViews() { this._paneViews.forEach((v) => v.update()); }
+  paneViews() { return this._paneViews; }
+}
+
+/* ---------------------------------------------------------------------
  * Horizontal line SEGMENT primitive — BSL/SSL/EQH/EQL/EQ50-style levels,
  * drawn from their origin candle to wherever they get invalidated (a later
  * candle's wick crossing back through the exact price), instead of
@@ -1388,6 +1561,7 @@ let activeRectangles = [];
 let activeHLines = [];
 let activeGhostCandles = [];
 let activeVolumeProfile = null;
+let activeFootprint = null;
 // Measure-tool state — deliberately separate from the arrays above:
 // clearOverlays() runs on every data re-render (new bars, ticker switch),
 // and a user's own measurements should survive that, not vanish the next
@@ -1677,7 +1851,8 @@ container.addEventListener('contextmenu', (e) => {
 // `rectangles` but not `ghost_candles`, and re-touching the (potentially
 // thousands of) ghost-candle primitives just because SOME unrelated
 // layer changed would defeat the whole point.
-let lastOverlayRaw = { rectangles: null, price_lines: null, ghost_candles: null, volume_profile: null, markers: null };
+let lastOverlayRaw = { rectangles: null, price_lines: null, ghost_candles: null, volume_profile: null,
+                        footprint: null, markers: null };
 
 function _overlayArrayChanged(key, value) {
   const nextValue = value || [];
@@ -1738,6 +1913,23 @@ function applyOverlays(overlays) {
     if ((overlays.volume_profile || []).length) {
       activeVolumeProfile = new VolumeProfilePrimitive(overlays.volume_profile);
       candleSeries.attachPrimitive(activeVolumeProfile);
+    }
+  }
+  // footprint is a single {tick, candles} object, not an array (see
+  // _overlayArrayChanged's own "falls back to []" default — works for an
+  // object too, it just always reads as "different from []" the one
+  // time it's genuinely absent, which is exactly what should trigger a
+  // detach). Present-but-empty candles (Python sends {tick, candles: []}
+  // rather than omitting the key when the user zoomed back out) still
+  // detaches cleanly through the same `.candles.length` check below.
+  if ('footprint' in overlays && _overlayArrayChanged('footprint', overlays.footprint)) {
+    if (activeFootprint) {
+      candleSeries.detachPrimitive(activeFootprint);
+      activeFootprint = null;
+    }
+    if (overlays.footprint && (overlays.footprint.candles || []).length) {
+      activeFootprint = new FootprintPrimitive(overlays.footprint);
+      candleSeries.attachPrimitive(activeFootprint);
     }
   }
   if (_overlayArrayChanged('rectangles', overlays.rectangles)) {
@@ -1988,6 +2180,7 @@ function handleRender(args) {
   alwaysFit = !!(options && options.always_fit);
   futureMarginFrac = (options && options.future_margin_frac) || 0;
   preserveLogicalRange = !!(options && options.preserve_logical_range);
+  footprintEnabled = !!(options && options.footprint_enabled);
   // Idempotent and cheap (unlike the logical-range settling this file's
   // retry helpers exist for) — just applied straight through every render
   // when the caller passes it. Undefined leaves createChart's own default
@@ -2067,6 +2260,29 @@ function handleRender(args) {
   // isFullReload unchanged for every call site that never opts in (mini
   // panels, the no-data path), matching their existing behavior exactly.
   const effectiveFullReload = pythonSaysFullReload !== undefined ? pythonSaysFullReload : isFullReload;
+  // A ticker/timeframe switch doesn't remount this iframe (same component
+  // key across the switch — see the module docstring on "one instance
+  // per call site"), so lastFootprintSentKey survives it untouched. Left
+  // alone, a coincidental match — the new ticker's own default view
+  // happening to round to the exact same visible-range seconds as the
+  // old one, plausible since both simply show "the last ~120 bars up to
+  // now" — would make the debounced listener believe nothing's changed
+  // and never even ask Python to re-check, silently leaving the PREVIOUS
+  // ticker's footprint cells (or lack thereof) showing over the new
+  // ticker's candles indefinitely, until an actual pan/zoom happened to
+  // produce a genuinely different key. Forcing a re-send on every real
+  // full reload closes that gap; also proactively detaching the stale
+  // primitive itself rather than leaving it attached hoping every one of
+  // its candle times simply fails to resolve against the new series.
+  window.__ictDebug._fpResetCount = (window.__ictDebug._fpResetCount || 0);
+  if (effectiveFullReload) {
+    window.__ictDebug._fpResetCount++;
+    lastFootprintSentKey = null;
+    if (activeFootprint) {
+      candleSeries.detachPrimitive(activeFootprint);
+      activeFootprint = null;
+    }
+  }
 
   // Synced on EVERY render now, not gated to full reloads — Python is the
   // single source of truth (a real checkbox, see app.py's "Log scale"),
@@ -2365,6 +2581,13 @@ Object.assign(window.__ictDebug, {
     lines: measurePrimitives.map((p) => ({ p1: p.p1, p2: p.p2, label: p.label })),
   }),
   getViewState: () => ({ futureMarginFrac, hasRenderedOnce, lastKnownLogicalRange, lastIntendedTimeRange }),
+  getFootprintState: () => ({
+    footprintEnabled, lastFootprintSentKey,
+    barSpacing: chart.timeScale().options().barSpacing,
+    minBarSpacing: FOOTPRINT_MIN_BAR_SPACING,
+    hasActivePrimitive: !!activeFootprint,
+    fpResetCount: window.__ictDebug._fpResetCount || 0,
+  }),
 });
 </script>
 </body></html>
