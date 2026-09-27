@@ -9,13 +9,17 @@ account and save the resulting access/refresh tokens locally:
     python3 ctrader_auth.py
 
 Opens your browser to cTrader's own consent screen; you log in and click
-Allow there, never here. Scope is deliberately "accounts" (view-only),
-not "trading" — the resulting access token is then structurally
-incapable of placing an order, regardless of what any calling code does
-with it. Never widen this to "trading" for this project — the whole
-point of this integration is price data, not execution.
+Allow there, never here.
 
-See ctrader_data.py for the actual client that uses the saved tokens."""
+Scope is "trading" — deliberately widened from this project's original
+"accounts" (view-only) scope, now that the etoro-dashboard project's own
+bot needs real demo-account order execution via cTrader (not just price
+data). The resulting broker implementation (see etoro-dashboard's
+brokers/ctrader.py) explicitly selects and hard-locks onto a DEMO
+ctidTraderAccountId — the same "never touch real capital" guarantee
+already enforced for eToro — so a "trading"-scoped token, which covers
+both live and demo accounts under this cTrader ID, never gets used
+against the live one by that code."""
 import http.server
 import json
 import os
@@ -46,9 +50,9 @@ def main():
     # product=web matches cTrader's own documented example URL exactly;
     # the SDK's own getAuthUri doesn't add it, so append it ourselves
     # rather than assume it's optional.
-    auth_uri = auth.getAuthUri(scope="accounts") + "&product=web"
+    auth_uri = auth.getAuthUri(scope="trading") + "&product=web"
 
-    print("Opening your browser to authorize this app (view-only 'accounts' scope)...")
+    print("Opening your browser to authorize this app ('trading' scope)...")
     print(auth_uri)
     webbrowser.open(auth_uri)
 
