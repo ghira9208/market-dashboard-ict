@@ -429,9 +429,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
         try:
+            # Found in a systematic pass over this file: every OTHER error
+            # path here returns a clean {"error": ...} JSON response, but
+            # this parse used to happen before the try — a malformed or
+            # truncated body raised json.JSONDecodeError uncaught, which
+            # HTTPServer's default per-request error handling turns into a
+            # traceback on stderr and a reset connection instead of the
+            # same clean error shape every other failure mode gets here.
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
             if parsed.path == "/order":
                 result = _bridge.place_order(
                     body["symbolId"], body["isBuy"], body["volumeUnits"],
