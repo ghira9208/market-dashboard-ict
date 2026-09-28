@@ -23,7 +23,7 @@ import json
 import os
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import crochet
@@ -461,7 +461,21 @@ def main():
         _bridge.start()
         print(f"Connected. Demo account: {_bridge._account_id}. "
               f"Serving bridge API on http://localhost:{_BRIDGE_PORT}")
-        HTTPServer(("localhost", _BRIDGE_PORT), _Handler).serve_forever()
+        # Found live: bot_engine.py now sources live detection candles
+        # straight from this bridge (one real round trip per unique
+        # ticker/timeframe, ~0.5-2s each against cTrader's own servers) —
+        # a plain single-threaded HTTPServer means bot_engine's own
+        # sequential loop of those calls blocks every OTHER caller (the
+        # API server's balance/reconcile checks) from even being ACCEPTED
+        # until the whole loop finishes, not just from being answered.
+        # CTraderBridge._send()'s own self._lock already serializes access
+        # to the real underlying connection correctly regardless of how
+        # many OS threads call in, so switching the HTTP layer to threaded
+        # only removes the OS-level head-of-line blocking on TOP of that
+        # — a caller now waits on the lock (bounded by whichever single
+        # call currently holds it), not behind an entire queue of
+        # sequential requests from someone else's unrelated loop.
+        ThreadingHTTPServer(("localhost", _BRIDGE_PORT), _Handler).serve_forever()
     except Exception as e:
         # Confirmed as the real cause of a genuine ~4-hour silent hang: a
         # network hiccup exactly like a MacBook lid-close/wake or a wifi
