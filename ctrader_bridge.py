@@ -276,6 +276,36 @@ class CTraderBridge:
         scale = 10 ** t.moneyDigits
         return {"balance": t.balance / scale, "moneyDigits": t.moneyDigits, "depositAssetId": t.depositAssetId}
 
+    def list_demo_accounts(self):
+        """Every demo account visible under this cTrader ID's token, with
+        its real current balance — not just the id/isLive fields the raw
+        account list alone gives you. A real, recurring need, not a
+        one-off: this same ID has had multiple demo accounts before (old
+        prop-firm demos plus a fresh one, per this file's own docstring)
+        and will again whenever the user opens a new one — deciding which
+        ctidTraderAccountId belongs in CTRADER_DEMO_ACCOUNT_ID has to be
+        done from real balances, not guessed from the id alone. Auths
+        each candidate account in turn to read its balance, but never
+        touches self._account_id — the bridge's own already-selected
+        account keeps working exactly as before while this runs."""
+        accounts_res = self._send(messages.ProtoOAGetAccountListByAccessTokenReq(
+            accessToken=self._tokens["accessToken"]))
+        accounts = Protobuf.extract(accounts_res).ctidTraderAccount
+        demo_accounts = [a for a in accounts if not a.isLive]
+        rows = []
+        for a in demo_accounts:
+            aid = a.ctidTraderAccountId
+            balance = None
+            try:
+                self._send(messages.ProtoOAAccountAuthReq(ctidTraderAccountId=aid, accessToken=self._tokens["accessToken"]))
+                trader_res = self._send(messages.ProtoOATraderReq(ctidTraderAccountId=aid))
+                t = Protobuf.extract(trader_res).trader
+                balance = t.balance / (10 ** t.moneyDigits)
+            except Exception:
+                pass  # this candidate couldn't be read right now — still list it, just with balance=None
+            rows.append({"ctidTraderAccountId": aid, "isCurrent": aid == self._account_id, "balance": balance})
+        return rows
+
     def reconcile(self):
         res = self._send(messages.ProtoOAReconcileReq(ctidTraderAccountId=self._account_id))
         r = Protobuf.extract(res)
@@ -417,6 +447,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(_bridge.trendbars(int(qs["symbolId"]), qs["period"], int(qs.get("count", 200))))
             elif parsed.path == "/trader":
                 self._json(_bridge.trader())
+            elif parsed.path == "/accounts":
+                self._json(_bridge.list_demo_accounts())
             elif parsed.path == "/reconcile":
                 self._json(_bridge.reconcile())
             elif parsed.path == "/deals":
