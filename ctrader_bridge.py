@@ -336,13 +336,39 @@ class CTraderBridge:
             toTimestamp=to_ts_ms, maxRows=max_rows))
         out = []
         for d in Protobuf.extract(res).deal:
-            out.append({
+            row = {
                 "dealId": d.dealId, "positionId": d.positionId, "symbolId": d.symbolId,
                 "volume": d.volume / 100.0, "executionPrice": d.executionPrice,
                 "tradeSide": model.ProtoOATradeSide.Name(d.tradeSide),
                 "executionTimestamp": d.executionTimestamp,
                 "dealStatus": model.ProtoOADealStatus.Name(d.dealStatus),
-            })
+                # This deal's own real commission, in the account's deposit
+                # currency scaled by ITS OWN moneyDigits (proto docs — same
+                # convention trader()'s own balance/scale already uses, not
+                # assumed to match the account-level moneyDigits). Every
+                # order (open leg AND close leg) is commissioned separately
+                # on this account — confirmed live, not assumed — so a real
+                # round-trip cost is open_deal["commission"] +
+                # close_deal["commission"], never the close leg alone.
+                "commission": d.commission / (10 ** d.moneyDigits) if d.moneyDigits else d.commission,
+            }
+            # closePositionDetail: only present on the CLOSING deal of a
+            # position — cTrader's own authoritative real swap (accrued
+            # over the position's whole holding period) and real gross
+            # P&L for this exact close, straight from the broker, not
+            # reverse-engineered from swapLong/swapShort pips-per-day
+            # (ProtoOASymbol) — this was the one honest, undecided gap
+            # flagged all session ("swap unit unverifiable"); it's not
+            # undecided anymore, it's a field cTrader hands back directly.
+            if d.HasField("closePositionDetail"):
+                cpd = d.closePositionDetail
+                cpd_scale = 10 ** cpd.moneyDigits if cpd.moneyDigits else 1
+                row["closePositionDetail"] = {
+                    "grossProfit": cpd.grossProfit / cpd_scale,
+                    "swap": cpd.swap / cpd_scale,
+                    "commission": cpd.commission / cpd_scale,
+                }
+            out.append(row)
         return out
 
     def place_order(self, symbol_id, is_buy, volume_units, stop_loss=None, take_profit=None,
