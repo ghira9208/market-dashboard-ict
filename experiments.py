@@ -3287,7 +3287,7 @@ def build_clean_expansion_liquidity_htf_events(df, daily_df, min_streak=3, retr_
     return _events_from_touches(df, touches, forward_bars)
 
 
-def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40):
+def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40, cost_bps=2.0):
     """A genuinely different EXIT mechanic on the SAME already-validated
     entries (touches, from any of the _clean_*_touches finders above) —
     a fixed stop (atr_mult_stop x ATR at entry) and a fixed target
@@ -3299,6 +3299,30 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
     resulting expectancy (mean R) is ALSO still positive and beats
     random direction-calling — see run_deep_backtest_rr's own real-vs-
     flipped permutation test for that check.
+
+    cost_bps: round-trip trading cost (spread+commission), as basis
+    points of entry price. Deliberately NOT preview_stats/run_deep_
+    backtest's own 10bps — confirmed directly (2026-09-29) that number
+    is calibrated for a much coarser context: 10bps on 5m GBPUSD works
+    out to ~13.2 pips, nearly 6x that timeframe's own typical ~2.2-pip
+    ATR-based stop, i.e. "the round trip costs more than the entire
+    risk" — not a real spread, a different family's assumption reused
+    somewhere it didn't fit. 2.0bps is grounded in real numbers checked
+    live instead: this account's real cTrader commission (fee_engine.py)
+    measured ~0.9bps round-trip on FX majors, $0 on crypto; a realistic
+    1-1.5 pip round-trip spread on a major adds roughly another
+    1-2bps. Sensitivity at 2bps: barely moves 1h/crypto combos (wide
+    ATR stops swallow it easily) but roughly halves 5m FX combos' mean
+    R — a real, proportionate effect, not the near-total wipeout 10bps
+    caused across the board regardless of a combo's actual quality.
+
+    Converted to R-units per trade (cost_bps as a PRICE distance,
+    divided by that trade's own risk) rather than a flat R penalty,
+    since a tight stop relative to price eats a much bigger fraction of
+    R than a wide one — the real dynamic this exists to capture, not a
+    rounding-error afterthought. Charged on every exit path (stop,
+    target, and the time-based fallback alike) — a round trip always
+    pays it.
 
     ATR at entry, not the zone's own edge: the zone edge (used as the
     stop for the time-exit builders) is sometimes clamped to an
@@ -3333,6 +3357,7 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
     n = len(df)
 
     def _run(entry_pos, entry_price, risk, direction):
+        cost_r = (entry_price * cost_bps / 10_000.0) / risk
         if direction == "bullish":
             stop_price = entry_price - risk
             target_price = entry_price + risk * rr_multiple
@@ -3346,13 +3371,13 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
             else:
                 hit_stop, hit_target = h >= stop_price, l <= target_price
             if hit_stop:
-                return -1.0, j
+                return -1.0 - cost_r, j
             if hit_target:
-                return rr_multiple, j
+                return rr_multiple - cost_r, j
         j = min(n - 1, entry_pos + max_bars - 1)
         exit_price = close[j]
         realized = (exit_price - entry_price) if direction == "bullish" else (entry_price - exit_price)
-        return realized / risk, j
+        return realized / risk - cost_r, j
 
     rows = []
     last_exit_pos = -1
@@ -3448,29 +3473,30 @@ def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fra
 
 
 def build_clean_expansion_fixed_rr_events(df, min_streak=3, retr_window_bars=40, rr_multiple=0.5,
-                                           atr_mult_stop=1.0, max_bars=40, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+                                           atr_mult_stop=1.0, max_bars=40, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO,
+                                           cost_bps=2.0):
     """clean_expansion_retracement's own entries, exited with a fixed
     stop/target (see _simulate_fixed_rr) instead of a time-based hold —
     the high-win-rate sibling of build_clean_expansion_retracement_events,
     same entries, different question."""
     touches = _clean_expansion_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)
-    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars)
+    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars, cost_bps)
 
 
 def build_clean_expansion_liquidity_fixed_rr_events(df, min_streak=3, retr_window_bars=40, sweep_window_bars=10,
                                                      rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40,
-                                                     min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+                                                     min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, cost_bps=2.0):
     """clean_expansion_liquidity's own entries, fixed-R:R exit — see
     build_clean_expansion_fixed_rr_events's own docstring."""
     touches = _clean_expansion_liquidity_touches(df, min_streak, retr_window_bars, sweep_window_bars,
                                                   min_body_ratio=min_body_ratio)
-    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars)
+    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars, cost_bps)
 
 
 def build_clean_retracement_resumption_fixed_rr_events(df, min_streak=3, retr_window_bars=40, rr_multiple=0.5,
                                                         atr_mult_stop=1.0, max_bars=40,
-                                                        min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO):
+                                                        min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, cost_bps=2.0):
     """clean_retracement_resumption's own entries, fixed-R:R exit — see
     build_clean_expansion_fixed_rr_events's own docstring."""
     touches = _clean_retracement_resumption_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)
-    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars)
+    return _simulate_fixed_rr(df, touches, rr_multiple, atr_mult_stop, max_bars, cost_bps)

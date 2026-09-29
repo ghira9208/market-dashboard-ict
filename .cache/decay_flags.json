@@ -1,0 +1,89 @@
+{
+  "checked_at": 1790696272.990078,
+  "decayed": [
+    {
+      "ticker": "AUDUSD=X",
+      "tf_label": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "mean_return_holdout": -0.03130039387588283,
+      "was_mean_return_holdout": 1.0649259578483339
+    },
+    {
+      "ticker": "EURUSD=X",
+      "tf_label": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "mean_return_holdout": 0.5741670056841429,
+      "was_mean_return_holdout": 1.0
+    },
+    {
+      "ticker": "NQ=F",
+      "tf_label": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "mean_return_holdout": 0.9652744437313768,
+      "was_mean_return_holdout": 1.4
+    },
+    {
+      "ticker": "RTY=F",
+      "tf_label": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "mean_return_holdout": 1.0569445268184503,
+      "was_mean_return_holdout": 0.9350289787446637
+    },
+    {
+      "ticker": "ES=F",
+      "tf_label": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.6327274940266304,
+      "was_mean_return_holdout": 1.052381418319363
+    },
+    {
+      "ticker": "CL=F",
+      "tf_label": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.9499083801022306,
+      "was_mean_return_holdout": 1.1624033691854307
+    },
+    {
+      "ticker": "SI=F",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "mean_return_holdout": 0.5375817798372182,
+      "was_mean_return_holdout": 0.8550346395489946
+    },
+    {
+      "ticker": "YM=F",
+      "tf_label": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.3704124905526299,
+      "was_mean_return_holdout": 0.4353092391033405
+    },
+    {
+      "ticker": "GC=F",
+      "tf_label": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.7275187169970389,
+      "was_mean_return_holdout": 0.6808303066037337
+    },
+    {
+      "ticker": "GBPUSD=X",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "mean_return_holdout": 0.185610628993988,
+      "was_mean_return_holdout": 0.9285714285714286
+    },
+    {
+      "ticker": "ES=F",
+      "tf_label": "1h",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "mean_return_holdout": 0.21295515502221338,
+      "was_mean_return_holdout": 0.48843590665070064
+    },
+    {
+      "ticker": "EURUSD=X",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.054916546319311754,
+      "was_mean_return_holdout": 0.5042776794449367
+    }
+  ]
+}
