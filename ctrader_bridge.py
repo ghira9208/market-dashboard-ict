@@ -320,6 +320,7 @@ class CTraderBridge:
             "tradeSide": model.ProtoOATradeSide.Name(p.tradeData.tradeSide),
             "volume": p.tradeData.volume / 100.0, "openPrice": p.price,
             "openTimestamp": p.tradeData.openTimestamp,
+            "label": p.tradeData.label or None, "comment": p.tradeData.comment or None,
         } for p in r.position]
         orders = [{
             "orderId": o.orderId, "symbolId": o.tradeData.symbolId,
@@ -344,12 +345,19 @@ class CTraderBridge:
             })
         return out
 
-    def place_order(self, symbol_id, is_buy, volume_units, stop_loss=None, take_profit=None):
+    def place_order(self, symbol_id, is_buy, volume_units, stop_loss=None, take_profit=None,
+                    label=None, comment=None):
         """volume_units: real units of the symbol's base asset (already
         converted from this project's own dollar-notional `amount` by the
         caller, using a recent price) — this method does the units->cents
         conversion and step/min/max rounding, since that's cTrader's own
-        convention, not this project's."""
+        convention, not this project's.
+
+        label/comment: ProtoOANewOrderReq's own fields, round-tripped back
+        via ProtoOATradeData on every position/order/deal this bridge
+        already reads — so the strategy/timeframe that placed a trade
+        shows up directly in cTrader's own terminal (Label/Comment
+        columns), not just this platform's own event log."""
         detail = self.symbol_detail(symbol_id)
         step = detail["stepVolume"] or 100
         min_v = detail["minVolume"] or step
@@ -384,6 +392,10 @@ class CTraderBridge:
             kwargs["stopLoss"] = stop_loss
         if take_profit is not None:
             kwargs["takeProfit"] = take_profit
+        if label is not None:
+            kwargs["label"] = label
+        if comment is not None:
+            kwargs["comment"] = comment
         res = self._send(messages.ProtoOANewOrderReq(**kwargs))
         extracted = Protobuf.extract(res)
         payload_name = type(extracted).__name__
@@ -480,7 +492,8 @@ class _Handler(BaseHTTPRequestHandler):
             if parsed.path == "/order":
                 result = _bridge.place_order(
                     body["symbolId"], body["isBuy"], body["volumeUnits"],
-                    body.get("stopLoss"), body.get("takeProfit"))
+                    body.get("stopLoss"), body.get("takeProfit"),
+                    body.get("label"), body.get("comment"))
                 self._json(result)
             elif parsed.path == "/close":
                 result = _bridge.close_position(body["positionId"], body["volume"])
