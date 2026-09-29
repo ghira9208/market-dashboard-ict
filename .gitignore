@@ -26,5 +26,8 @@ research/.cache/
 .venv_ctrader/
 # Live OAuth tokens, not a data log -- unlike the small accumulating
 # .cache/*.json history files this project deliberately tracks, this one
-# is a real, rotating credential (see ctrader_auth.py).
+# is a real, rotating credential (see ctrader_auth.py). The .bak-* glob
+# covers pre-re-auth backups of it (made by hand before switching demo
+# accounts) -- same real credential, just a copy, never safe to commit.
 .cache/ctrader_tokens.json
+.cache/ctrader_tokens.json.bak-*
