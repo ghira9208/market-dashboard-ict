@@ -126,10 +126,10 @@ def main():
 
     if decayed:
         lines = [f"{d['ticker']} {d['tf_label']} {d['strategy'].replace('_fixed_rr', '')}" for d in decayed]
-        notify("Edge Pipeline",
-               f"Alpha decay check: {len(decayed)} combo(s) no longer pass their own validation on fresh "
+        notify("Decay check",
+               f"{len(decayed)} combo(s) no longer pass their own validation on fresh "
                f"data — {', '.join(lines[:5])}{', ...' if len(lines) > 5 else ''}. Worth a look before "
-               f"trusting them the same way going forward.")
+               f"trusting them the same way going forward.", severity="warning")
     else:
         print("No decay detected — every currently-validated combo still holds up on fresh data.")
 
