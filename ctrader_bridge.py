@@ -274,7 +274,13 @@ class CTraderBridge:
         res = self._send(messages.ProtoOATraderReq(ctidTraderAccountId=self._account_id))
         t = Protobuf.extract(res).trader
         scale = 10 ** t.moneyDigits
-        return {"balance": t.balance / scale, "moneyDigits": t.moneyDigits, "depositAssetId": t.depositAssetId}
+        # leverageInCents/maxLeverage: real margin math needs these, not an
+        # assumed number — found needing this live, checking whether raising
+        # max_position_pct past 100% could ever margin-call this account by
+        # stacking several larger positions at once.
+        return {"balance": t.balance / scale, "moneyDigits": t.moneyDigits, "depositAssetId": t.depositAssetId,
+                "leverage": t.leverageInCents / 100.0 if t.leverageInCents else None,
+                "maxLeverage": t.maxLeverage / 100.0 if t.maxLeverage else None}
 
     def list_demo_accounts(self):
         """Every demo account visible under this cTrader ID's token, with
