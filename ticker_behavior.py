@@ -72,6 +72,27 @@ def rebuild_db():
     trials = trials.copy()
     trials["tf_label"] = trials["tf_label"].map(_normalize_tf)
     trials["strategy"] = trials["label"].map(_strategy_family)
+
+    # Found live (2026-09-29): re-validating a combo (revalidate_combos.py,
+    # or any re-run of the exact same settings after a methodology change
+    # like adding a real trading-cost assumption) APPENDS a new trial under
+    # the identical (ticker, tf_label, label) — it never replaces the old
+    # one. Without this dedup, best_row = idxmax(mean_return_train) below
+    # picks across BOTH freely, and an older, more optimistic trial for the
+    # exact same settings always wins over a newer, more honest one (a
+    # frictionless pre-cost-model trial beats its own cost-aware re-run on
+    # paper every time) — confirmed directly: ETH-USD 5m's own leaderboard
+    # entry was still serving mean_return_holdout=1.879 from 2026-09-27,
+    # not the 1.229 its own 2026-09-29 cost-aware re-validation produced.
+    # Kelly sizing reads this number directly, so a stale duplicate here
+    # means real position sizing bets against an edge larger than what's
+    # actually been validated. Keeping only the newest trial per exact
+    # settings (before ever comparing DIFFERENT settings against each
+    # other) fixes this without touching load_experiment_trials()'s own
+    # BH correction, which already ran across the full, undeduped log.
+    trials = trials.sort_values("logged_at").drop_duplicates(
+        subset=["ticker", "tf_label", "label"], keep="last")
+
     scored = trials[trials["verdict"] == "SCORED"].copy()
 
     rows = []
