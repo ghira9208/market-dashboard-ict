@@ -1,3 +1,14 @@
+# Streamlit's own default bind is 0.0.0.0 — confirmed live (lsof showed
+# crypto_app.py/news_app.py/institutional_app.py all listening on
+# *:850x, reachable from anyone on the same network, not just this
+# Mac). etoro-dashboard's own .streamlit/config.toml already closed this
+# exact gap for the actual trading app; these are read-only research
+# dashboards (no credentials, no trading) so the stakes are lower, but
+# there's no reason for them to broadcast market research/strategy
+# dashboards to the whole LAN by default either.
+[server]
+address = "127.0.0.1"
+
 [theme]
 base = "dark"
 primaryColor = "#0A84FF"
