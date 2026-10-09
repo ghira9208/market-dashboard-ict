@@ -44,6 +44,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import data as research_data
+import strategy_identity
 from detectors import (DISPLACEMENT_MIN_BODY_RATIO, detect_breaker_blocks, detect_fvgs, detect_ifvgs,
                         detect_liquidity_sweeps, detect_order_blocks, detect_swings)
 from edge_lab.multiple_testing import benjamini_hochberg
@@ -51,6 +53,26 @@ from research.evidence import run_event_study
 
 _CACHE_TTL = 300
 _TRIALS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "experiment_trials.jsonl")
+
+# Bump a family's own entry by hand whenever its detection logic changes in a
+# way that could shift a backtested result (e.g. _scan_clean_zone_streaks'
+# own "respected" rule, or a touch-finder's filtering condition) — feeds
+# strategy_identity.py's compute_strategy_id. Only the 3 families actually
+# live-traded (bot_engine.py's TOUCH_FINDERS) need an entry here; the rest of
+# this file's research-only strategies never mint a live strategy identity.
+DETECTOR_LOGIC_VERSIONS = {
+    "clean_expansion": 1,
+    "clean_expansion_liquidity": 1,
+    "clean_retracement_resumption": 1,
+}
+
+# The one real cost assumption every _fixed_rr trial and every live decision
+# is scored/sized under — named so bot_engine.py's own live-side strategy_id
+# computation (bot_engine.py:_current_strategy_id) references the SAME value
+# this file's own trial-scoring functions default to, instead of two
+# independently-maintained "2.0" literals silently drifting apart. See
+# _simulate_fixed_rr's own docstring for where this number comes from.
+DEFAULT_COST_BPS = 2.0
 
 # detect_ifvgs/detect_breaker_blocks don't take a record_history kwarg (they
 # have no "still open" concept of their own to track — an inversion only
@@ -768,12 +790,33 @@ TF_LABEL_NORMALIZE = {"1d": "1D", "1wk": "1W", "1mo": "1M"}
 
 
 @st.cache_data(ttl=_CACHE_TTL)
-def _load_experiment_trials_cached(_mtime, _size):
+def _load_experiment_trials_cached(cache_key_mtime, cache_key_size):
     """The actual read+parse+BH-correct, cached on (mtime, size) so
     Streamlit's own cache key changes exactly when the file's contents
     do -- not a blind time-based TTL, which would either serve stale
     results right after a fresh 'Run deep backtest' or still redo the
-    full pass on a timer regardless of whether anything changed."""
+    full pass on a timer regardless of whether anything changed.
+
+    CONFIRMED REAL BUG, found 2026-10-07 writing the first tests that ever
+    called this twice in one process: both parameters used to be spelled
+    with a leading underscore (_mtime, _size) -- Streamlit's own
+    documented st.cache_data convention treats an underscore-prefixed
+    parameter as EXPLICITLY EXCLUDED from the cache key (it exists so you
+    can pass an unhashable object, like a live DB connection, without
+    cache_data choking on it). With BOTH parameters underscore-prefixed,
+    this function had ZERO real inputs in its cache key -- every call,
+    regardless of what mtime/size were actually passed, hit the exact same
+    cache entry, so it silently returned whatever it computed on the
+    VERY FIRST call for the rest of that process's lifetime. A single
+    `python3 -c` script (every verification run earlier this session) never
+    exposed this -- each only ever called it once. A long-running process
+    that calls load_experiment_trials() more than once -- the real
+    Streamlit app itself, chief among them -- would have: new trials
+    appended, a user clicks "Refresh from trial log" in survivors_ui.py,
+    and nothing changes, forever, until the server restarts. Renamed (no
+    leading underscore) so Streamlit actually hashes them, which is the
+    whole reason this wrapper/cached-function split exists in the first
+    place -- see load_experiment_trials()'s own docstring."""
     trials = []
     with open(_TRIALS_PATH) as f:
         for line in f:
@@ -3287,7 +3330,78 @@ def build_clean_expansion_liquidity_htf_events(df, daily_df, min_streak=3, retr_
     return _events_from_touches(df, touches, forward_bars)
 
 
-def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40, cost_bps=2.0):
+def resolve_entry_pos(confirm_pos):
+    """The one entry-bar convention every fixed-R:R exit in this project
+    uses: the bar AFTER the one that confirmed the touch, never the
+    confirming bar itself (which already printed its own high/low/close
+    before a signal could act on it). Shared by _simulate_fixed_rr below
+    (backtest) and bot_engine.py's live per-combo loop — objective 7's
+    "mechanical equivalence" requirement: previously written out
+    SEPARATELY in both places as `t["confirm_pos"] + 1` /
+    `touch["confirm_pos"] + 1`, two copies of one convention that could
+    silently drift apart from each other."""
+    return confirm_pos + 1
+
+
+def compute_risk_unit(atr, atr_mult_stop):
+    """ATR-at-entry scaled into a real price-distance risk unit — the one
+    risk-sizing primitive both _simulate_fixed_rr (backtest, below) and
+    bot_engine.py's _size_and_levels (live) build their stop/target off
+    of. Previously written out separately in both places as
+    `atr * atr_mult_stop` / `atr * settings["atr_mult_stop"]`."""
+    return atr * atr_mult_stop
+
+
+def compute_stop_target(entry_price, risk_unit, rr_multiple, direction):
+    """The one stop/target placement formula every fixed-R:R exit in this
+    project uses: a fixed stop one risk_unit from entry, a fixed target
+    rr_multiple risk_units away in the trade's own direction. Shared by
+    _simulate_fixed_rr's own _run closure (backtest, below) and
+    bot_engine.py's _size_and_levels (live) — previously two independent
+    copies of the identical algebra; now one real implementation both
+    sides call. Returns (stop_price, target_price)."""
+    if direction == "bullish":
+        return entry_price - risk_unit, entry_price + risk_unit * rr_multiple
+    return entry_price + risk_unit, entry_price - risk_unit * rr_multiple
+
+
+def _classify_regimes(close, atr, vol_window=100, trend_window=50, vol_min_periods=20, trend_threshold=1.5):
+    """A deliberately simple, deliberately documented regime heuristic for
+    the Strategy Observatory's regime matrix — NOT a formal volatility/
+    trend model, just enough of a real, lookahead-free label to ask "does
+    this combo's edge concentrate in some regimes and not others."
+
+    vol_regime: each bar's ATR ranked against its own trailing `vol_window`
+    bars (percentile rank, using only PAST bars — no lookahead) -> "low"
+    (bottom third), "normal" (middle third), "high" (top third). None until
+    `vol_min_periods` bars of trailing history exist.
+
+    trend_regime: |close - trailing SMA(trend_window)| in ATR units ->
+    "trend" when price has moved trend_threshold+ ATRs away from its own
+    recent average, "range" otherwise. This says nothing about DIRECTION
+    (up vs down) on purpose — a short in a downtrend and a long in an
+    uptrend are both "trend-aligned," which is the real question for a
+    direction-agnostic combo. None until trend_window bars of history
+    exist.
+
+    Returns two numpy object arrays (vol_regime, trend_regime), same
+    length as close/atr, elements are "low"/"normal"/"high"/"trend"/
+    "range"/None — never a fabricated label for a bar that doesn't yet
+    have enough trailing history to classify."""
+    atr_s = pd.Series(atr)
+    vol_pct = atr_s.rolling(vol_window, min_periods=vol_min_periods).apply(
+        lambda w: (w.iloc[-1] > w).mean(), raw=False)
+    sma = pd.Series(close).rolling(trend_window, min_periods=vol_min_periods).mean()
+    trend_strength = (pd.Series(close) - sma).abs() / atr_s.replace(0, np.nan)
+
+    vol_regime = np.where(vol_pct.isna(), None,
+                           np.where(vol_pct < 1 / 3, "low", np.where(vol_pct > 2 / 3, "high", "normal")))
+    trend_regime = np.where(trend_strength.isna(), None,
+                             np.where(trend_strength > trend_threshold, "trend", "range"))
+    return vol_regime, trend_regime
+
+
+def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40, cost_bps=DEFAULT_COST_BPS):
     """A genuinely different EXIT mechanic on the SAME already-validated
     entries (touches, from any of the _clean_*_touches finders above) —
     a fixed stop (atr_mult_stop x ATR at entry) and a fixed target
@@ -3340,67 +3454,115 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
     convention for reconstructing intrabar order from OHLC alone, which
     has no real path between the open and close to check.
 
-    Returns a DataFrame (entry_time, r_real, r_flip, direction) —
-    r_real is the realized R multiple trading the touch's own real
-    direction; r_flip is what the SAME touch would have realized had the
-    direction been the opposite call, computed from the same entry bar
-    with mirrored stop/target — the pairing run_deep_backtest_rr's own
-    permutation test needs to ask "did calling the real direction
-    actually beat a coin flip on this exact set of entries," not just
-    "was the mean positive," which a merely lucky exit rule could
-    produce even from uninformed entries."""
+    Returns a DataFrame (entry_time, r_real, r_flip, direction, mfe_r,
+    mae_r, vol_regime, trend_regime) — r_real is the realized R multiple
+    trading the touch's own real direction; r_flip is what the SAME touch
+    would have realized had the direction been the opposite call, computed
+    from the same entry bar with mirrored stop/target — the pairing
+    run_deep_backtest_rr's own permutation test needs to ask "did calling
+    the real direction actually beat a coin flip on this exact set of
+    entries," not just "was the mean positive," which a merely lucky exit
+    rule could produce even from uninformed entries.
+
+    mfe_r/mae_r (added for the Strategy Observatory, 2026-10-08): the real
+    direction's own maximum favorable/adverse excursion in R-units, tracked
+    bar-by-bar during the SAME walk _run already does to find the exit —
+    no second simulation, no new data fetch. Purely additive to this
+    function's existing contract: r_real/r_flip/direction/entry_time are
+    computed byte-for-byte as before, nothing here changes them.
+    vol_regime/trend_regime (also new): a trailing, lookahead-free
+    classification of the market AT the entry bar — see
+    _classify_regimes' own docstring for the exact (deliberately simple,
+    documented) heuristic. None for either when there isn't yet enough
+    trailing history to classify (early bars in a short series)."""
     high = (df["High"] if "High" in df else df["high"]).to_numpy()
     low = (df["Low"] if "Low" in df else df["low"]).to_numpy()
     close = (df["Close"] if "Close" in df else df["close"]).to_numpy()
     open_ = (df["Open"] if "Open" in df else df["open"]).to_numpy()
     atr = atr_series(df).to_numpy()
     n = len(df)
+    vol_regime, trend_regime = _classify_regimes(close, atr)
 
     def _run(entry_pos, entry_price, risk, direction):
         cost_r = (entry_price * cost_bps / 10_000.0) / risk
-        if direction == "bullish":
-            stop_price = entry_price - risk
-            target_price = entry_price + risk * rr_multiple
-        else:
-            stop_price = entry_price + risk
-            target_price = entry_price - risk * rr_multiple
+        stop_price, target_price = compute_stop_target(entry_price, risk, rr_multiple, direction)
+        mfe = 0.0  # best favorable excursion seen so far, price units
+        mae = 0.0  # worst adverse excursion seen so far, price units
         for j in range(entry_pos, min(n, entry_pos + max_bars)):
             h, l = high[j], low[j]
+            fav, adv = (h - entry_price, entry_price - l) if direction == "bullish" else (entry_price - l, h - entry_price)
+            if fav > mfe:
+                mfe = fav
+            if adv > mae:
+                mae = adv
             if direction == "bullish":
                 hit_stop, hit_target = l <= stop_price, h >= target_price
             else:
                 hit_stop, hit_target = h >= stop_price, l <= target_price
             if hit_stop:
-                return -1.0 - cost_r, j
+                return -1.0 - cost_r, j, mfe / risk, mae / risk
             if hit_target:
-                return rr_multiple - cost_r, j
+                return rr_multiple - cost_r, j, mfe / risk, mae / risk
         j = min(n - 1, entry_pos + max_bars - 1)
         exit_price = close[j]
         realized = (exit_price - entry_price) if direction == "bullish" else (entry_price - exit_price)
-        return realized / risk - cost_r, j
+        return realized / risk - cost_r, j, mfe / risk, mae / risk
 
     rows = []
     last_exit_pos = -1
     for t in sorted(touches, key=lambda t: t["confirm_pos"]):
-        entry_pos = t["confirm_pos"] + 1
+        entry_pos = resolve_entry_pos(t["confirm_pos"])
         if entry_pos <= last_exit_pos or entry_pos >= n:
             continue
         a = atr[entry_pos]
         if pd.isna(a) or a <= 0:
             continue
         entry_price = open_[entry_pos]
-        risk = a * atr_mult_stop
+        risk = compute_risk_unit(a, atr_mult_stop)
         real_dir = t["direction"]
         opp_dir = "bearish" if real_dir == "bullish" else "bullish"
-        r_real, exit_pos = _run(entry_pos, entry_price, risk, real_dir)
-        r_flip, _ = _run(entry_pos, entry_price, risk, opp_dir)
-        rows.append({"entry_time": df.index[entry_pos], "r_real": r_real, "r_flip": r_flip, "direction": real_dir})
+        r_real, exit_pos, mfe_r, mae_r = _run(entry_pos, entry_price, risk, real_dir)
+        r_flip, _, _, _ = _run(entry_pos, entry_price, risk, opp_dir)  # flip is a statistical null only, not a real trade — its own excursion is never used
+        rows.append({
+            "entry_time": df.index[entry_pos], "r_real": r_real, "r_flip": r_flip, "direction": real_dir,
+            "mfe_r": mfe_r, "mae_r": mae_r,
+            "vol_regime": vol_regime[entry_pos], "trend_regime": trend_regime[entry_pos],
+        })
         last_exit_pos = exit_pos
-    return pd.DataFrame(rows, columns=["entry_time", "r_real", "r_flip", "direction"])
+    return pd.DataFrame(rows, columns=["entry_time", "r_real", "r_flip", "direction",
+                                        "mfe_r", "mae_r", "vol_regime", "trend_regime"])
+
+
+def _score_split(split, n_permutations, rng):
+    """The one real statistical test shared by every train/holdout-style
+    split in this file: is calling the touch's ACTUAL direction better
+    than a coin flip on these exact entries (see run_deep_backtest_rr's
+    own docstring for why r_real/r_flip pairing is the right null here).
+    Extracted so run_deep_backtest_rr_with_lock's 3-way RESEARCH/
+    VALIDATION/LOCKED split scores every slice with the IDENTICAL method
+    run_deep_backtest_rr's 80/20 train/holdout split always has — one
+    authoritative implementation, not two independently-drifting copies
+    of the same permutation test."""
+    n = len(split)
+    if n == 0:
+        return {"n": 0, "mean": None, "p": None, "std": None}
+    real = split["r_real"].to_numpy()
+    flip = split["r_flip"].to_numpy()
+    observed = real.mean()
+    null = np.empty(n_permutations)
+    for i in range(n_permutations):
+        coin = rng.integers(0, 2, size=n).astype(bool)
+        null[i] = np.where(coin, real, flip).mean()
+    p = float((null >= observed).mean())
+    # ddof=1 (sample std) for bot_engine.py's uncertainty-aware Kelly
+    # sizing — None (not 0.0) for n<2, since a single-event split has no
+    # real spread to estimate and 0.0 would read as "perfectly certain."
+    std = float(real.std(ddof=1)) if n > 1 else None
+    return {"n": n, "mean": float(observed), "p": p, "std": std}
 
 
 def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fraction=0.8, n_permutations=5000,
-                          seed=0):
+                          seed=0, target_widen_mult=1.0, cost_bps=DEFAULT_COST_BPS):
     """The R-multiple-metric sibling of run_deep_backtest — same 80/20
     time split, same same-sign-across-splits discipline, same accumulating
     trial log (_append_trial, so load_experiment_trials' own BH-correction
@@ -3420,10 +3582,42 @@ def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fra
     independently, a coin flip decides whether you get r_real or r_flip,"
     which tests the right thing (does calling the ACTUAL direction beat
     chance on these exact entries) without ever mixing outcomes across
-    touches."""
+    touches.
+
+    target_widen_mult/cost_bps: not read for scoring (events_df already
+    carries whatever r_real/r_flip the caller's own simulation produced) —
+    recorded purely so compute_strategy_id below can tell apart, say, a
+    rr_multiple=1.0 trial from a rr_multiple=3.0 trial scored under an
+    otherwise-identical settings dict (validate_target_variants.py's whole
+    reason for existing — see strategy_identity.py). Defaults (1.0, 2.0)
+    match what every existing call site has always implicitly meant, so
+    every trial logged before this parameter existed gets tagged exactly
+    as if it had always been passed."""
+    family = label.split(" · ", 1)[0].strip() if label else ""
+    detector_family = family[: -len("_fixed_rr")] if family.endswith("_fixed_rr") else family
+    strategy_id = strategy_identity.compute_strategy_id(
+        family=family, settings=settings, target_widen_mult=target_widen_mult,
+        data_pipeline_version=research_data.DATA_PIPELINE_VERSION,
+        detector_logic_version=DETECTOR_LOGIC_VERSIONS.get(detector_family, 0),
+        cost_bps=cost_bps)
+    # settings stored AS GIVEN, not tagged with the id itself — found live
+    # testing validate_target_variants.py on real data: a trial re-run from
+    # an already-tagged settings dict (revalidate_combos.py's own
+    # match.iloc[0]["settings"]) fed a stray "_strategy_id" kwarg straight
+    # into a build_*_fixed_rr_events(**settings) call and crashed with
+    # "unexpected keyword argument". Nothing actually reads it back out of
+    # settings either — ticker_behavior.py's dedup and bot_engine.py's live
+    # enforcement both key off the TOP-LEVEL strategy_id field below (and
+    # the leaderboard's own best_strategy_id, derived from that) — so
+    # embedding it a second time inside settings was pure risk with no
+    # consumer, not a real requirement.
+
     trial = {
         "logged_at": pd.Timestamp.now("UTC").isoformat(), "ticker": ticker, "tf_label": tf_label,
         "label": label, "settings": settings, "n_events": len(events_df),
+        "strategy_id": strategy_id, "scale_out_enabled": False, "target_widen_mult": target_widen_mult,
+        "git_commit_research": strategy_identity.git_commit(os.path.dirname(os.path.abspath(__file__))),
+        "git_commit_live": strategy_identity.git_commit("/Users/apple/dev/etoro-dashboard"),
     }
     if len(events_df) < 30:
         trial["verdict"] = "INSUFFICIENT_DATA"
@@ -3436,22 +3630,8 @@ def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fra
     holdout = events_df.iloc[cutoff_pos:]
     rng = np.random.default_rng(seed)
 
-    def _score(split):
-        n = len(split)
-        if n == 0:
-            return {"n": 0, "mean": None, "p": None}
-        real = split["r_real"].to_numpy()
-        flip = split["r_flip"].to_numpy()
-        observed = real.mean()
-        null = np.empty(n_permutations)
-        for i in range(n_permutations):
-            coin = rng.integers(0, 2, size=n).astype(bool)
-            null[i] = np.where(coin, real, flip).mean()
-        p = float((null >= observed).mean())
-        return {"n": n, "mean": float(observed), "p": p}
-
-    train_score = _score(train)
-    holdout_score = _score(holdout)
+    train_score = _score_split(train, n_permutations, rng)
+    holdout_score = _score_split(holdout, n_permutations, rng)
     if train_score["n"] == 0:
         trial["verdict"] = "INSUFFICIENT_DATA"
         _append_trial(trial)
@@ -3461,7 +3641,9 @@ def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fra
     trial.update({
         "n_train": train_score["n"], "n_holdout": holdout_score["n"],
         "mean_return_train": mean_train, "p_value_train": train_score["p"],
-        "mean_return_holdout": mean_holdout,
+        "std_return_train": train_score["std"],
+        "mean_return_holdout": mean_holdout, "p_value_holdout": holdout_score["p"],
+        "std_return_holdout": holdout_score["std"],
         "holdout_verdict": "PASSED" if (holdout_score["p"] is not None and holdout_score["p"] < 0.05
                                          and mean_holdout is not None and mean_holdout > 0) else "FAILED",
         "same_sign": bool(mean_train is not None and mean_holdout is not None
@@ -3472,9 +3654,116 @@ def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fra
     return trial
 
 
+def run_deep_backtest_rr_with_lock(ticker, tf_label, events_df, settings, label, research_fraction=0.6,
+                                    validation_fraction=0.2, n_permutations=5000, seed=0, target_widen_mult=1.0,
+                                    cost_bps=DEFAULT_COST_BPS):
+    """run_deep_backtest_rr's own statistics (same _score_split permutation
+    test, same strategy_id tagging, same trial-log schema — bh_significant/
+    survived in ticker_behavior.py and load_experiment_trials' own BH
+    correction read this trial exactly as they'd read any other, since
+    mean_return_train/p_value_train/holdout_verdict/same_sign/verdict mean
+    the same thing here as they always have), but splits time three ways
+    instead of two: RESEARCH (first `research_fraction`) / VALIDATION (next
+    `validation_fraction`) / LOCKED (the remainder). RESEARCH plays today's
+    "train" role and VALIDATION plays today's "holdout" role — same
+    field names, same pass/fail test, same one-sided p<0.05-and-positive
+    rule — so every existing consumer of a run_deep_backtest_rr trial
+    (survived, the leaderboard, BH correction, live enforcement) treats
+    this exactly like one, with zero changes on their end.
+
+    LOCKED is the genuinely new thing: scored with the identical method
+    (so its number means the same thing a holdout score always has), but
+    recorded ONLY as locked_mean_return/locked_p_value/locked_std_return/
+    locked_n — monitoring fields nothing in this codebase selects on.
+    Confirmed by construction, not just by convention: `verdict`,
+    `holdout_verdict`, and `same_sign` above are derived ONLY from
+    research_score/validation_score; nothing here ever reads the locked
+    score to decide anything.
+
+    WRITTEN UNLOCK POLICY (objective 3's own explicit requirement — this
+    is the policy, not just a comment): a strategy_id's LOCKED slice may
+    be used as a research input — to pick parameters, to decide a widen
+    factor, to influence ANY selection — only once that exact strategy_id
+    has been formally RETIRED (ticker_behavior.py's existing
+    invalidated_combos mechanism; the RETIRED lifecycle state itself is
+    phase (g), not yet built as of this writing). Before that, LOCKED
+    exists purely to let a human watch "does performance still hold on
+    data nobody, including this pipeline, has ever adapted anything to"
+    without that watching itself becoming a new, unaudited way to
+    cherry-pick. Never automatic, never triggered by a locked score
+    looking good or bad — retiring a strategy_id is its own deliberate,
+    logged action, independent of what its LOCKED number happens to say.
+
+    Used by validate_target_variants.py — a genuinely new research
+    surface (target-distance widening), started clean on the 3-way split
+    rather than retrofitting run_deep_backtest_rr's own existing 80/20
+    call sites, none of which this function touches."""
+    assert 0 < research_fraction < 1 and 0 < validation_fraction < 1 and research_fraction + validation_fraction < 1, \
+        "research_fraction + validation_fraction must leave a non-empty LOCKED remainder"
+    family = label.split(" · ", 1)[0].strip() if label else ""
+    detector_family = family[: -len("_fixed_rr")] if family.endswith("_fixed_rr") else family
+    strategy_id = strategy_identity.compute_strategy_id(
+        family=family, settings=settings, target_widen_mult=target_widen_mult,
+        data_pipeline_version=research_data.DATA_PIPELINE_VERSION,
+        detector_logic_version=DETECTOR_LOGIC_VERSIONS.get(detector_family, 0),
+        cost_bps=cost_bps)
+
+    trial = {
+        "logged_at": pd.Timestamp.now("UTC").isoformat(), "ticker": ticker, "tf_label": tf_label,
+        "label": label, "settings": settings, "n_events": len(events_df),
+        "strategy_id": strategy_id, "scale_out_enabled": False, "target_widen_mult": target_widen_mult,
+        "git_commit_research": strategy_identity.git_commit(os.path.dirname(os.path.abspath(__file__))),
+        "git_commit_live": strategy_identity.git_commit("/Users/apple/dev/etoro-dashboard"),
+        "split_mode": "research_validation_locked",
+        "research_fraction": research_fraction, "validation_fraction": validation_fraction,
+    }
+    if len(events_df) < 30:
+        trial["verdict"] = "INSUFFICIENT_DATA"
+        _append_trial(trial)
+        return trial
+
+    events_df = events_df.sort_values("entry_time").reset_index(drop=True)
+    n = len(events_df)
+    research_end = int(n * research_fraction)
+    validation_end = int(n * (research_fraction + validation_fraction))
+    research = events_df.iloc[:research_end]
+    validation = events_df.iloc[research_end:validation_end]
+    locked = events_df.iloc[validation_end:]
+    rng = np.random.default_rng(seed)
+
+    research_score = _score_split(research, n_permutations, rng)
+    validation_score = _score_split(validation, n_permutations, rng)
+    locked_score = _score_split(locked, n_permutations, rng)
+    if research_score["n"] == 0:
+        trial["verdict"] = "INSUFFICIENT_DATA"
+        _append_trial(trial)
+        return trial
+
+    mean_research, mean_validation = research_score["mean"], validation_score["mean"]
+    trial.update({
+        "n_train": research_score["n"], "n_holdout": validation_score["n"],
+        "mean_return_train": mean_research, "p_value_train": research_score["p"],
+        "std_return_train": research_score["std"],
+        "mean_return_holdout": mean_validation, "p_value_holdout": validation_score["p"],
+        "std_return_holdout": validation_score["std"],
+        "holdout_verdict": "PASSED" if (validation_score["p"] is not None and validation_score["p"] < 0.05
+                                         and mean_validation is not None and mean_validation > 0) else "FAILED",
+        "same_sign": bool(mean_research is not None and mean_validation is not None
+                           and mean_research > 0 and mean_validation > 0),
+        "verdict": "SCORED",
+        # Monitoring only — see the unlock policy in this function's own
+        # docstring. Never read by survived/bh_significant/best_row
+        # selection anywhere in this codebase.
+        "locked_n": locked_score["n"], "locked_mean_return": locked_score["mean"],
+        "locked_p_value": locked_score["p"], "locked_std_return": locked_score["std"],
+    })
+    _append_trial(trial)
+    return trial
+
+
 def build_clean_expansion_fixed_rr_events(df, min_streak=3, retr_window_bars=40, rr_multiple=0.5,
                                            atr_mult_stop=1.0, max_bars=40, min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO,
-                                           cost_bps=2.0):
+                                           cost_bps=DEFAULT_COST_BPS):
     """clean_expansion_retracement's own entries, exited with a fixed
     stop/target (see _simulate_fixed_rr) instead of a time-based hold —
     the high-win-rate sibling of build_clean_expansion_retracement_events,
@@ -3485,7 +3774,7 @@ def build_clean_expansion_fixed_rr_events(df, min_streak=3, retr_window_bars=40,
 
 def build_clean_expansion_liquidity_fixed_rr_events(df, min_streak=3, retr_window_bars=40, sweep_window_bars=10,
                                                      rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40,
-                                                     min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, cost_bps=2.0):
+                                                     min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, cost_bps=DEFAULT_COST_BPS):
     """clean_expansion_liquidity's own entries, fixed-R:R exit — see
     build_clean_expansion_fixed_rr_events's own docstring."""
     touches = _clean_expansion_liquidity_touches(df, min_streak, retr_window_bars, sweep_window_bars,
@@ -3495,7 +3784,7 @@ def build_clean_expansion_liquidity_fixed_rr_events(df, min_streak=3, retr_windo
 
 def build_clean_retracement_resumption_fixed_rr_events(df, min_streak=3, retr_window_bars=40, rr_multiple=0.5,
                                                         atr_mult_stop=1.0, max_bars=40,
-                                                        min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, cost_bps=2.0):
+                                                        min_body_ratio=DISPLACEMENT_MIN_BODY_RATIO, cost_bps=DEFAULT_COST_BPS):
     """clean_retracement_resumption's own entries, fixed-R:R exit — see
     build_clean_expansion_fixed_rr_events's own docstring."""
     touches = _clean_retracement_resumption_touches(df, min_streak, retr_window_bars, min_body_ratio=min_body_ratio)

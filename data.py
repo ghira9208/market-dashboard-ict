@@ -29,6 +29,12 @@ def _secret(key):
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY") or _secret("TWELVE_DATA_API_KEY")
 TIINGO_API_KEY = os.environ.get("TIINGO_API_KEY") or _secret("TIINGO_API_KEY")
 
+# Bump by hand whenever a change here (provider chain, cache TTL, incremental
+# top-up logic) could shift a backtested result — feeds strategy_identity.py's
+# compute_strategy_id so a methodology change in data fetching mints a new
+# strategy identity instead of silently invalidating old evidence in place.
+DATA_PIPELINE_VERSION = 1
+
 
 def _retry(fn, attempts=2, base_delay=0.5):
     """Transient hiccups (rate-limits, network blips) happen with any of

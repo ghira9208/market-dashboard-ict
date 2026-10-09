@@ -89,7 +89,21 @@ class CTraderBridge:
             clientId=self._client_id, clientSecret=self._client_secret))
         accounts_res = self._send(messages.ProtoOAGetAccountListByAccessTokenReq(
             accessToken=self._tokens["accessToken"]))
-        accounts = Protobuf.extract(accounts_res).ctidTraderAccount
+        extracted_accounts = Protobuf.extract(accounts_res)
+        # Found live 2026-10-03: this crashed with a bare AttributeError
+        # ('ProtoOAErrorRes' object has no attribute 'ctidTraderAccount'),
+        # crash-looping launchd every restart with zero indication of the
+        # REAL cause — the exact same class of bug symbol_detail() already
+        # guards against below. Surfacing cTrader's own real error code/
+        # description instead (almost certainly an expired/revoked
+        # accessToken if _refresh_token_if_needed's own silent refresh
+        # failure above didn't actually get a fresh one).
+        if type(extracted_accounts).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(
+                f"Account list request rejected: {extracted_accounts.errorCode} — "
+                f"{extracted_accounts.description}. The saved OAuth token is likely expired or "
+                f"revoked and needs re-authorization, not a transient network issue.")
+        accounts = extracted_accounts.ctidTraderAccount
         demo_accounts = [a for a in accounts if not a.isLive]
         if not demo_accounts:
             raise BridgeError(
@@ -191,7 +205,10 @@ class CTraderBridge:
 
     def _preload_symbols(self):
         res = self._send(messages.ProtoOASymbolsListReq(ctidTraderAccountId=self._account_id))
-        for s in Protobuf.extract(res).symbol:
+        extracted = Protobuf.extract(res)
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Symbol list request rejected: {extracted.errorCode} — {extracted.description}")
+        for s in extracted.symbol:
             self._symbols_by_name[s.symbolName] = s.symbolId
 
     # -------------------------------------------------------------- api --
@@ -219,6 +236,21 @@ class CTraderBridge:
         # per cTrader's own proto docs ("commission" field says to use
         # this instead), scaled by 10^8 for non-percentage commission
         # types, by 10^5 for PERCENTAGE_OF_VALUE.
+        #
+        # preciseMinCommission/minCommissionType/minCommissionAsset: found
+        # live 2026-10-02 — fee_engine.py's percentage-only formula missed
+        # these entirely, which is exactly why it understated ^AEX's real
+        # commission by ~17x (predicted ~$0.46 round trip, cTrader's own
+        # app showed $8 real, confirmed directly by the account owner on
+        # 3 separate positions). A PERCENTAGE_OF_VALUE symbol can still
+        # carry a real per-side MINIMUM commission charged instead of the
+        # percentage whenever the percentage would come out smaller —
+        # exactly what a tiny broker-minimum-lot position like this one
+        # hits every time. Scaling NOT yet confirmed (unlike
+        # preciseTradingCommissionRate's doc-verified 10^5/10^8 split) —
+        # surfaced raw here deliberately, to be derived empirically against
+        # the real $8 figure rather than guessed. Fix this comment once
+        # fee_engine.py's commission_pct_roundtrip() is updated to use it.
         detail = {
             "symbolId": sym.symbolId, "digits": sym.digits, "pipPosition": sym.pipPosition,
             "minVolume": sym.minVolume, "maxVolume": sym.maxVolume, "stepVolume": sym.stepVolume,
@@ -226,6 +258,10 @@ class CTraderBridge:
             "commissionType": model.ProtoOACommissionType.Name(sym.commissionType) if sym.commissionType else None,
             "preciseTradingCommissionRate": sym.preciseTradingCommissionRate,
             "swapLong": sym.swapLong, "swapShort": sym.swapShort,
+            "minCommission": sym.minCommission,
+            "preciseMinCommission": sym.preciseMinCommission,
+            "minCommissionType": model.ProtoOAMinCommissionType.Name(sym.minCommissionType) if sym.minCommissionType else None,
+            "minCommissionAsset": sym.minCommissionAsset,
         }
         self._symbols_full[symbol_id] = detail
         return detail
@@ -256,7 +292,10 @@ class CTraderBridge:
         res = self._send(messages.ProtoOAGetTrendbarsReq(
             ctidTraderAccountId=self._account_id, period=period_val,
             count=count, symbolId=symbol_id, fromTimestamp=from_ms, toTimestamp=now_ms))
-        bars = Protobuf.extract(res).trendbar
+        extracted = Protobuf.extract(res)
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Trendbar request rejected: {extracted.errorCode} — {extracted.description}")
+        bars = extracted.trendbar
         out = []
         for b in bars:
             low = b.low / 100000.0
@@ -272,7 +311,17 @@ class CTraderBridge:
 
     def trader(self):
         res = self._send(messages.ProtoOATraderReq(ctidTraderAccountId=self._account_id))
-        t = Protobuf.extract(res).trader
+        extracted = Protobuf.extract(res)
+        # Found live 2026-10-06, 36 real occurrences in the bridge's own
+        # error log: a bare AttributeError here (no `.trader` on an error
+        # response) crashed every /trader request mid-handler, after the
+        # socket was already committed to a 200 — the real error got
+        # masked behind a BrokenPipeError instead of ever reaching the
+        # caller as a clean message. Same class of bug symbol_detail()
+        # already guards against; /trader just never got the same fix.
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Trader request rejected: {extracted.errorCode} — {extracted.description}")
+        t = extracted.trader
         scale = 10 ** t.moneyDigits
         # leverageInCents/maxLeverage: real margin math needs these, not an
         # assumed number — found needing this live, checking whether raising
@@ -296,7 +345,12 @@ class CTraderBridge:
         account keeps working exactly as before while this runs."""
         accounts_res = self._send(messages.ProtoOAGetAccountListByAccessTokenReq(
             accessToken=self._tokens["accessToken"]))
-        accounts = Protobuf.extract(accounts_res).ctidTraderAccount
+        extracted_accounts = Protobuf.extract(accounts_res)
+        if type(extracted_accounts).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(
+                f"Account list request rejected: {extracted_accounts.errorCode} — "
+                f"{extracted_accounts.description}.")
+        accounts = extracted_accounts.ctidTraderAccount
         demo_accounts = [a for a in accounts if not a.isLive]
         rows = []
         for a in demo_accounts:
@@ -315,12 +369,26 @@ class CTraderBridge:
     def reconcile(self):
         res = self._send(messages.ProtoOAReconcileReq(ctidTraderAccountId=self._account_id))
         r = Protobuf.extract(res)
+        if type(r).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Reconcile request rejected: {r.errorCode} — {r.description}")
         positions = [{
             "positionId": p.positionId, "symbolId": p.tradeData.symbolId,
             "tradeSide": model.ProtoOATradeSide.Name(p.tradeData.tradeSide),
             "volume": p.tradeData.volume / 100.0, "openPrice": p.price,
             "openTimestamp": p.tradeData.openTimestamp,
             "label": p.tradeData.label or None, "comment": p.tradeData.comment or None,
+            # cTrader's own real current protection on this position — was
+            # never read here before (only amend_position_sltp's own return
+            # value echoed it back, and only for the one position just
+            # amended). Found missing live 2026-10-06 while tracing a real
+            # "2 far-leg positions showing no TP in the cTrader terminal"
+            # report: nothing in this project could even ask the broker
+            # "does this position actually have a take-profit right now,"
+            # so a silently-dropped TP (order accepted, SL/TP attachment
+            # rejected — cTrader's own ProtoOAExecutionEvent doesn't
+            # distinguish the two) had no way to surface anywhere.
+            "stopLoss": p.stopLoss if p.HasField("stopLoss") else None,
+            "takeProfit": p.takeProfit if p.HasField("takeProfit") else None,
         } for p in r.position]
         orders = [{
             "orderId": o.orderId, "symbolId": o.tradeData.symbolId,
@@ -330,12 +398,41 @@ class CTraderBridge:
         } for o in r.order]
         return {"positions": positions, "orders": orders}
 
+    def position_unrealized_pnl(self):
+        """Real floating P&L on every currently open position, in ONE
+        account-wide call — ProtoOAGetPositionUnrealizedPnLReq only takes
+        ctidTraderAccountId (confirmed directly against the installed
+        protobuf schema, 2026-10-08), never a per-position ID; the
+        response already carries one ProtoOAPositionUnrealizedPnL per open
+        position. This is the real gap get_demo_balance() has been
+        hardcoding unrealizedPnL=0.0 for — its own docstring already named
+        the reason (a per-position ProtoOAGetPositionUnrealizedPnLReq loop
+        measured at 53s for 16 positions, once stalled bot_engine.py's
+        whole 60s cycle for over an hour) and named this exact message as
+        the fix, just never finished wiring it up. The real fix was never
+        "batch the slow thing," it was "this message was never per-
+        position to begin with" — one request, every position, no loop.
+
+        netUnrealizedPnL (not gross) — already nets out the position's own
+        commission/swap the same way deals()'s own closePositionDetail
+        does for a CLOSED position, so an open and a closed position's P&L
+        mean the same thing when summed together."""
+        res = self._send(messages.ProtoOAGetPositionUnrealizedPnLReq(ctidTraderAccountId=self._account_id))
+        extracted = Protobuf.extract(res)
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Unrealized P&L request rejected: {extracted.errorCode} — {extracted.description}")
+        scale = 10 ** extracted.moneyDigits if extracted.moneyDigits else 1
+        return {p.positionId: p.netUnrealizedPnL / scale for p in extracted.positionUnrealizedPnL}
+
     def deals(self, from_ts_ms, to_ts_ms, max_rows=200):
         res = self._send(messages.ProtoOADealListReq(
             ctidTraderAccountId=self._account_id, fromTimestamp=from_ts_ms,
             toTimestamp=to_ts_ms, maxRows=max_rows))
+        extracted = Protobuf.extract(res)
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Deal list request rejected: {extracted.errorCode} — {extracted.description}")
         out = []
-        for d in Protobuf.extract(res).deal:
+        for d in extracted.deal:
             row = {
                 "dealId": d.dealId, "positionId": d.positionId, "symbolId": d.symbolId,
                 "volume": d.volume / 100.0, "executionPrice": d.executionPrice,
@@ -448,9 +545,23 @@ class CTraderBridge:
         the raw ProtoOAClosePositionReq field is in cTrader's own
         hundredths-of-a-unit convention, same as place_order's volume —
         passing reconcile()'s real-unit number straight through
-        unconverted would have closed at 1% of the intended size."""
+        unconverted would have closed at 1% of the intended size.
+
+        position_id cast to int here — every caller's own position_id
+        comes from this project's SQLite tracking (positions_seen/
+        scale_out_legs' position_id column is TEXT, so every row read
+        back is a real Python str), but ProtoOAClosePositionReq.positionId
+        is a protobuf int64 field and rejects a str outright with a
+        TypeError at construction time, not a clean cTrader-side error.
+        Found via the identical, CONFIRMED bug in amend_position_sltp
+        below (100% of its own real call attempts failed this exact way,
+        every far-leg breakeven-stop-move this account ever earned
+        silently never happened) — this site shares the same shape and
+        hasn't been proven to fire cleanly yet either, so fixed alongside
+        it rather than left to fail the same way whenever _close_stale_
+        positions' own time-stop enforcement first actually needs it."""
         res = self._send(messages.ProtoOAClosePositionReq(
-            ctidTraderAccountId=self._account_id, positionId=position_id, volume=round(volume * 100)))
+            ctidTraderAccountId=self._account_id, positionId=int(position_id), volume=round(volume * 100)))
         extracted = Protobuf.extract(res)
         payload_name = type(extracted).__name__
         if payload_name in ("ProtoOAErrorRes", "ProtoOAOrderErrorEvent"):
@@ -458,6 +569,63 @@ class CTraderBridge:
         if payload_name == "ProtoOAExecutionEvent":
             return {"error": False, "orderId": extracted.order.orderId,
                     "orderStatus": model.ProtoOAOrderStatus.Name(extracted.order.orderStatus)}
+        return {"error": True, "errorCode": "UNKNOWN_RESPONSE", "description": f"Unexpected response type: {payload_name}"}
+
+    def amend_position_sltp(self, position_id, symbol_id=None, stop_loss=None, take_profit=None):
+        """Moves an already-OPEN position's real stop-loss (and/or take-
+        profit) — confirmed real, not guessed: ProtoOAAmendPositionSLTPReq
+        (payload 2110) exists in this exact installed package, same
+        family as ProtoOANewOrderReq/ProtoOAClosePositionReq above, and
+        has no dedicated response type either — a success still comes
+        back as ProtoOAExecutionEvent, a rejection as
+        ProtoOAOrderErrorEvent/ProtoOAErrorRes, same branching as both
+        methods above.
+
+        symbol_id: optional — when given, applies place_order's own real
+        per-symbol digit-precision rounding (symbol_detail(...)["digits"])
+        to stop_loss/take_profit before sending, the same real bug class
+        place_order's own _round_price already guards against (a raw
+        ATR-derived float with more decimal places than cTrader allows
+        for this symbol gets rejected outright). Omit only when the
+        caller can't resolve a symbol_id — passes the price through
+        unrounded rather than refusing to amend at all."""
+        if symbol_id is not None:
+            digits = self.symbol_detail(symbol_id).get("digits")
+
+            def _round_price(p):
+                return round(p, digits) if (p is not None and digits is not None) else p
+
+            stop_loss = _round_price(stop_loss)
+            take_profit = _round_price(take_profit)
+
+        # Confirmed live 2026-10-06, 100% of this method's own real call
+        # attempts (2 for 2 — every near-leg-target-hit this account ever
+        # had): position_id arrives here as a Python str (every caller's
+        # own position_id comes from this project's SQLite tracking,
+        # whose position_id column is TEXT), but
+        # ProtoOAAmendPositionSLTPReq.positionId is a protobuf int64 field
+        # — passing a str raises a TypeError at message-construction time,
+        # BEFORE this ever reaches cTrader's real server, which do_POST's
+        # outer try/except then turns into a generic 500 with no hint this
+        # was a type bug and not a real broker rejection. The real,
+        # concrete cost: every far leg that should have had its stop
+        # locked to breakeven after its near leg hit target instead kept
+        # running on its ORIGINAL, riskier stop for the rest of its life —
+        # scale-out's own built-in risk-reduction mechanic has never once
+        # actually fired for this account.
+        kwargs = dict(ctidTraderAccountId=self._account_id, positionId=int(position_id))
+        if stop_loss is not None:
+            kwargs["stopLoss"] = stop_loss
+        if take_profit is not None:
+            kwargs["takeProfit"] = take_profit
+        res = self._send(messages.ProtoOAAmendPositionSLTPReq(**kwargs))
+        extracted = Protobuf.extract(res)
+        payload_name = type(extracted).__name__
+        if payload_name in ("ProtoOAErrorRes", "ProtoOAOrderErrorEvent"):
+            return {"error": True, "errorCode": extracted.errorCode, "description": extracted.description}
+        if payload_name == "ProtoOAExecutionEvent":
+            return {"error": False, "positionId": extracted.position.positionId,
+                    "stopLoss": extracted.position.stopLoss, "takeProfit": extracted.position.takeProfit}
         return {"error": True, "errorCode": "UNKNOWN_RESPONSE", "description": f"Unexpected response type: {payload_name}"}
 
 
@@ -495,6 +663,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(_bridge.list_demo_accounts())
             elif parsed.path == "/reconcile":
                 self._json(_bridge.reconcile())
+            elif parsed.path == "/unrealized_pnl":
+                self._json(_bridge.position_unrealized_pnl())
             elif parsed.path == "/deals":
                 self._json(_bridge.deals(int(qs["fromTimestamp"]), int(qs["toTimestamp"]),
                                           int(qs.get("maxRows", 200))))
@@ -523,6 +693,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(result)
             elif parsed.path == "/close":
                 result = _bridge.close_position(body["positionId"], body["volume"])
+                self._json(result)
+            elif parsed.path == "/amend_stop_loss":
+                result = _bridge.amend_position_sltp(
+                    body["positionId"], body.get("symbolId"), body.get("stopLoss"), body.get("takeProfit"))
                 self._json(result)
             else:
                 self._json({"error": "not found"}, status=404)

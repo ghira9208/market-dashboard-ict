@@ -77,7 +77,13 @@ def main():
         if match.empty:
             n_skipped += 1
             continue
-        settings = match.iloc[0]["settings"]
+        # Strip any underscore-prefixed key the stored settings dict might
+        # carry — a real, confirmed hazard: before 2026-10-07, settings was
+        # briefly tagged with its own "_strategy_id" at write time, and the
+        # trial log is append-only, so any trial already written that way
+        # still has it baked in. Passed straight through to a builder
+        # function as **kwargs, it raises "unexpected keyword argument".
+        settings = {k: v for k, v in match.iloc[0]["settings"].items() if not k.startswith("_")}
 
         try:
             df = research_data.get_yf_ohlcv(ticker, **TF_FETCH[tf_label])
