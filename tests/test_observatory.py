@@ -167,3 +167,19 @@ def test_parameter_grid_a_failing_cell_reads_zero_n_not_a_crash(monkeypatch, no_
     )
     bad_cell = next(c for c in result["cells"] if c["rr_multiple"] == 99.0)
     assert bad_cell["n"] == 0 and bad_cell["mean_r"] is None
+
+
+# ---- effective_settings: simulate the target the bot really trades ----
+
+def test_effective_settings_multiplies_the_target_by_the_validated_widen_factor():
+    out = obs.effective_settings({"rr_multiple": 1.5, "atr_mult_stop": 1.0}, 4.0)
+    assert out["rr_multiple"] == pytest.approx(6.0) and out["atr_mult_stop"] == 1.0
+
+
+def test_effective_settings_leaves_unwidened_and_unknown_factors_alone_and_never_mutates():
+    base = {"rr_multiple": 2.0}
+    assert obs.effective_settings(base, 1.0) == {"rr_multiple": 2.0}
+    assert obs.effective_settings(base, None) == {"rr_multiple": 2.0}
+    assert obs.effective_settings(base, float("nan")) == {"rr_multiple": 2.0}
+    obs.effective_settings(base, 3.0)
+    assert base == {"rr_multiple": 2.0}

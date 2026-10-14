@@ -52,7 +52,8 @@ def load_trades():
         m = trials[(trials.ticker == c.ticker) & (trials.tf_label == c.tf_label) & (trials.label == c.best_label)]
         if m.empty:
             continue
-        settings = {k: v for k, v in m.iloc[0]["settings"].items() if not k.startswith("_")}
+        settings = obs.effective_settings({k: v for k, v in m.iloc[0]["settings"].items() if not k.startswith("_")},
+                                          c.get("best_target_widen_mult"))
         try:
             tr = obs.trade_detail(c.ticker, c.tf_label, c.strategy, settings)
         except Exception:

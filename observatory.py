@@ -55,6 +55,20 @@ def _clean_settings(settings):
     return {k: v for k, v in settings.items() if not k.startswith("_")}
 
 
+def effective_settings(settings, widen=1.0):
+    """The settings the LIVE bot actually trades. A combo's stored settings carry its
+    BASE rr_multiple; ticker_behavior's best_target_widen_mult (1.0, 1.5, 2.0, 3.0, 4.0 —
+    validate_target_variants.py) multiplies the target distance on top, exactly as that
+    script built its variants (rr_multiple = base_rr * widen). 57% of validated combos
+    trade a widened target, so simulating the base rr shows a different trade than the
+    one placed. Found 2026-10-13 comparing live signals against Observatory trades."""
+    s = dict(settings)
+    w = widen if widen and widen == widen else 1.0  # NaN/None -> unwidened
+    if w != 1.0 and s.get("rr_multiple"):
+        s["rr_multiple"] = round(s["rr_multiple"] * w, 6)
+    return s
+
+
 def _fetch_df(ticker, tf_label):
     if tf_label not in TF_FETCH:
         raise ValueError(f"no data-fetch recipe for tf_label {tf_label!r}")
