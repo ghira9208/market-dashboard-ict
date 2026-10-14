@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, "/Users/apple/dev/etoro-dashboard")
+sys.path.insert(0, "/Users/apple/dev/edge-pipeline")
 
 import experiments as ex
 import ticker_behavior

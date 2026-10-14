@@ -1,13 +1,13 @@
 """Persistent local bridge to FxPro/cTrader's Open API — the ONE process
 in this whole platform allowed to import ctrader_open_api, because that
 package pins protobuf==3.20.1, which conflicts with Streamlit's own
-protobuf>=7 requirement in the main etoro-dashboard environment (same
+protobuf>=7 requirement in the main edge-pipeline environment (same
 conflict noted in ctrader_auth.py). Runs under the isolated .venv_ctrader
 interpreter, holds the single long-lived TCP connection to cTrader, and
 exposes a plain local HTTP/JSON API — the same shape brokers/etoro.py
 already talks to eToro's own real REST API in, just proxied here instead
 of hitting a remote host directly. brokers/ctrader.py (in the main
-etoro-dashboard environment) is the only intended caller.
+edge-pipeline environment) is the only intended caller.
 
 Run: .venv_ctrader/bin/python3 ctrader_bridge.py
 

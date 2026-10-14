@@ -12,9 +12,9 @@ Opens your browser to cTrader's own consent screen; you log in and click
 Allow there, never here.
 
 Scope is "trading" — deliberately widened from this project's original
-"accounts" (view-only) scope, now that the etoro-dashboard project's own
+"accounts" (view-only) scope, now that the edge-pipeline project's own
 bot needs real demo-account order execution via cTrader (not just price
-data). The resulting broker implementation (see etoro-dashboard's
+data). The resulting broker implementation (see edge-pipeline's
 brokers/ctrader.py) explicitly selects and hard-locks onto a DEMO
 ctidTraderAccountId — the same "never touch real capital" guarantee
 already enforced for eToro — so a "trading"-scoped token, which covers

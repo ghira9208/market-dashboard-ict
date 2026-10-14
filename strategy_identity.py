@@ -7,7 +7,7 @@ triple and a label string that can drift underneath them.
 Deliberately excludes sizing (sizing_mode/kelly_fraction): a bet-size choice
 doesn't change what the backtest evidence says about the trade's own entry/
 exit mechanics, and account-level sizing changes are already captured by
-db.py's own config_changed event log (etoro-dashboard) — minting a new
+db.py's own config_changed event log (edge-pipeline) — minting a new
 strategy identity on every risk_pct tweak would be noise, not rigor.
 
 Deliberately excludes scale_out_enabled from the HASH itself too, for a

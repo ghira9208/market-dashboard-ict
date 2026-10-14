@@ -45,11 +45,11 @@ import pandas as pd
 import experiments as ex
 import ticker_behavior
 
-# research_stats.py lives in etoro-dashboard (it's the module that reads
+# research_stats.py lives in edge-pipeline (it's the module that reads
 # THIS repo's own backtest cache and writes .cache/research_stats.json) —
 # same cross-repo pattern research_stats.py itself already uses in
 # reverse (it sys.path.inserts this directory to reach experiments.py).
-sys.path.insert(0, "/Users/apple/dev/etoro-dashboard")
+sys.path.insert(0, "/Users/apple/dev/edge-pipeline")
 import research_stats
 
 STARTING_BALANCE = 1000.0

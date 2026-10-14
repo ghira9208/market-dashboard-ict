@@ -1,7 +1,7 @@
 """compute_risk_unit / compute_stop_target / resolve_entry_pos —
 objective 7's shared primitives. The cross-repo end-to-end proof (same
 synthetic OHLCV through _simulate_fixed_rr AND bot_engine.py's own
-_size_and_levels) lives in etoro-dashboard's own tests/
+_size_and_levels) lives in edge-pipeline's own tests/
 test_mechanical_equivalence.py, since it needs bot_engine.py; this file
 covers the three functions themselves plus confirming _simulate_fixed_rr
 genuinely DELEGATES to them rather than merely defining them unused

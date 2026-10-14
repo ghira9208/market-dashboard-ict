@@ -34,7 +34,7 @@ methodology prompted checking for them directly):
    returns, n_bootstrap times, and takes the 5th percentile of the
    resampled means. Requiring that lower bound to still be positive is the
    real Monte Carlo robustness check the same review asked for — same
-   bootstrap technique etoro-dashboard/risk_metrics.py's own
+   bootstrap technique edge-pipeline/risk_metrics.py's own
    monte_carlo_drawdown_percentiles already uses for live drawdown risk,
    applied here to the DISCOVERY gate instead: an edge whose point estimate
    is positive but whose own plausible resamples routinely dip negative is

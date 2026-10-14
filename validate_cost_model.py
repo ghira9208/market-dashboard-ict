@@ -16,7 +16,7 @@ sizing/execution code.
 """
 import sys
 
-sys.path.insert(0, "/Users/apple/dev/etoro-dashboard")
+sys.path.insert(0, "/Users/apple/dev/edge-pipeline")
 
 import brokers  # noqa: E402
 import fee_engine  # noqa: E402

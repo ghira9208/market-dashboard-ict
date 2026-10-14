@@ -9,7 +9,7 @@ One-off script for this specific cleanup — not meant to be scheduled or reused
 import sys
 import time
 
-sys.path.insert(0, "/Users/apple/dev/etoro-dashboard")
+sys.path.insert(0, "/Users/apple/dev/edge-pipeline")
 from notify import notify
 
 import requests

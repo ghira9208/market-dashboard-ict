@@ -3617,7 +3617,7 @@ def run_deep_backtest_rr(ticker, tf_label, events_df, settings, label, train_fra
         "label": label, "settings": settings, "n_events": len(events_df),
         "strategy_id": strategy_id, "scale_out_enabled": False, "target_widen_mult": target_widen_mult,
         "git_commit_research": strategy_identity.git_commit(os.path.dirname(os.path.abspath(__file__))),
-        "git_commit_live": strategy_identity.git_commit("/Users/apple/dev/etoro-dashboard"),
+        "git_commit_live": strategy_identity.git_commit("/Users/apple/dev/edge-pipeline"),
     }
     if len(events_df) < 30:
         trial["verdict"] = "INSUFFICIENT_DATA"
@@ -3713,7 +3713,7 @@ def run_deep_backtest_rr_with_lock(ticker, tf_label, events_df, settings, label,
         "label": label, "settings": settings, "n_events": len(events_df),
         "strategy_id": strategy_id, "scale_out_enabled": False, "target_widen_mult": target_widen_mult,
         "git_commit_research": strategy_identity.git_commit(os.path.dirname(os.path.abspath(__file__))),
-        "git_commit_live": strategy_identity.git_commit("/Users/apple/dev/etoro-dashboard"),
+        "git_commit_live": strategy_identity.git_commit("/Users/apple/dev/edge-pipeline"),
         "split_mode": "research_validation_locked",
         "research_fraction": research_fraction, "validation_fraction": validation_fraction,
     }
