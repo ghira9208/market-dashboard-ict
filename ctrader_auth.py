@@ -32,6 +32,8 @@ import webbrowser
 
 from ctrader_open_api import Auth
 
+import ctrader_tokens
+
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SECRETS_PATH = os.path.join(_PROJECT_DIR, ".streamlit", "secrets.toml")
 _TOKENS_PATH = os.path.join(_PROJECT_DIR, ".cache", "ctrader_tokens.json")
@@ -56,6 +58,12 @@ def _pause_api_if_blocking():
         return False
     stopped = subprocess.run(["launchctl", "bootout", _API_JOB], capture_output=True).returncode == 0
     if stopped:
+        # bootout returns before the old process has actually let go of the port; binding straight away
+        # failed with "Address already in use" (seen 2026-10-16). Wait until it is really free.
+        for _ in range(40):
+            if not _port_in_use(_PORT):
+                break
+            time.sleep(0.5)
         print(f"Paused the dashboard API (it was holding port {_PORT}) — restoring it when done.")
     return stopped
 
@@ -128,9 +136,7 @@ def main():
             print("Token exchange failed:", token_response)
             return
 
-        os.makedirs(os.path.dirname(_TOKENS_PATH), exist_ok=True)
-        with open(_TOKENS_PATH, "w") as f:
-            json.dump(token_response, f, indent=2)
+        ctrader_tokens.save_atomic(_TOKENS_PATH, token_response)
         print(f"Saved tokens to {_TOKENS_PATH}")
         print("Access token valid ~30 days; refresh token has no expiry "
               "(ctrader_data.py refreshes automatically before it needs to).")

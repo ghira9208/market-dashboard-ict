@@ -3401,7 +3401,8 @@ def _classify_regimes(close, atr, vol_window=100, trend_window=50, vol_min_perio
     return vol_regime, trend_regime
 
 
-def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40, cost_bps=DEFAULT_COST_BPS):
+def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars=40, cost_bps=DEFAULT_COST_BPS,
+                       blackout=None, atr_lag=0):
     """A genuinely different EXIT mechanic on the SAME already-validated
     entries (touches, from any of the _clean_*_touches finders above) —
     a fixed stop (atr_mult_stop x ATR at entry) and a fixed target
@@ -3454,6 +3455,16 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
     convention for reconstructing intrabar order from OHLC alone, which
     has no real path between the open and close to check.
 
+    blackout (optional boolean array, one flag per bar): bars where the account must be flat — a
+    position still open when the first blackout bar begins is closed at that bar's OPEN (before
+    whatever happens in it), and no entry is taken on a blackout bar. Default None = unchanged
+    behaviour. Used to ask "what if we stood aside through scheduled news".
+
+    atr_lag (default 0 = unchanged): which bar's ATR sizes the stop. 0 uses the ATR AT the entry bar,
+    which is a rolling mean that INCLUDES that bar's own true range — a range nobody knows at its open
+    (a small lookahead: a bar that goes on to be big widens its own stop and target). 1 uses the ATR as
+    of the previous, completed bar, which is what a live bot can know. The live bot now matches lag 1.
+
     Returns a DataFrame (entry_time, r_real, r_flip, direction, mfe_r,
     mae_r, vol_regime, trend_regime) — r_real is the realized R multiple
     trading the touch's own real direction; r_flip is what the SAME touch
@@ -3489,6 +3500,9 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
         mfe = 0.0  # best favorable excursion seen so far, price units
         mae = 0.0  # worst adverse excursion seen so far, price units
         for j in range(entry_pos, min(n, entry_pos + max_bars)):
+            if blackout is not None and j > entry_pos and blackout[j]:
+                realized = (open_[j] - entry_price) if direction == "bullish" else (entry_price - open_[j])
+                return realized / risk - cost_r, j, mfe / risk, mae / risk
             h, l = high[j], low[j]
             fav, adv = (h - entry_price, entry_price - l) if direction == "bullish" else (entry_price - l, h - entry_price)
             if fav > mfe:
@@ -3514,7 +3528,11 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
         entry_pos = resolve_entry_pos(t["confirm_pos"])
         if entry_pos <= last_exit_pos or entry_pos >= n:
             continue
-        a = atr[entry_pos]
+        if blackout is not None and blackout[entry_pos]:
+            continue
+        if entry_pos - atr_lag < 0:
+            continue
+        a = atr[entry_pos - atr_lag]
         if pd.isna(a) or a <= 0:
             continue
         entry_price = open_[entry_pos]
@@ -3527,10 +3545,13 @@ def _simulate_fixed_rr(df, touches, rr_multiple=0.5, atr_mult_stop=1.0, max_bars
             "entry_time": df.index[entry_pos], "r_real": r_real, "r_flip": r_flip, "direction": real_dir,
             "mfe_r": mfe_r, "mae_r": mae_r,
             "vol_regime": vol_regime[entry_pos], "trend_regime": trend_regime[entry_pos],
+            # the bar the trade left on (stop, target or time exit) — lets an analysis ask what
+            # a trade was exposed to while it was open (e.g. a scheduled news release)
+            "exit_time": df.index[exit_pos],
         })
         last_exit_pos = exit_pos
     return pd.DataFrame(rows, columns=["entry_time", "r_real", "r_flip", "direction",
-                                        "mfe_r", "mae_r", "vol_regime", "trend_regime"])
+                                        "mfe_r", "mae_r", "vol_regime", "trend_regime", "exit_time"])
 
 
 def _score_split(split, n_permutations, rng):

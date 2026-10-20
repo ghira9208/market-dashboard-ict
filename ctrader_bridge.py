@@ -29,6 +29,8 @@ from urllib.parse import urlparse, parse_qs
 import crochet
 crochet.setup()
 
+import ctrader_tokens
+
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol, Auth
 from ctrader_open_api.messages import OpenApiMessages_pb2 as messages
 from ctrader_open_api.messages import OpenApiModelMessages_pb2 as model
@@ -37,7 +39,7 @@ from twisted.internet.defer import Deferred
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _TOKENS_PATH = os.path.join(_PROJECT_DIR, ".cache", "ctrader_tokens.json")
 _SECRETS_PATH = os.path.join(_PROJECT_DIR, ".streamlit", "secrets.toml")
-_BRIDGE_PORT = 8700
+_BRIDGE_PORT = int(os.environ.get("CTRADER_BRIDGE_PORT", 8700))   # a second bridge instance serves a second account
 
 
 def _load_secrets():
@@ -52,8 +54,7 @@ def _load_tokens():
 
 
 def _save_tokens(tokens):
-    with open(_TOKENS_PATH, "w") as f:
-        json.dump(tokens, f, indent=2)
+    ctrader_tokens.save_atomic(_TOKENS_PATH, tokens)
 
 
 class BridgeError(RuntimeError):
@@ -90,6 +91,13 @@ class CTraderBridge:
         accounts_res = self._send(messages.ProtoOAGetAccountListByAccessTokenReq(
             accessToken=self._tokens["accessToken"]))
         extracted_accounts = Protobuf.extract(accounts_res)
+        if type(extracted_accounts).__name__ == "ProtoOAErrorRes":
+            newer = ctrader_tokens.reread_if_changed(_TOKENS_PATH, self._tokens)
+            if newer is not None:           # another bridge refreshed since we loaded: use its token, once
+                self._tokens = newer
+                accounts_res = self._send(messages.ProtoOAGetAccountListByAccessTokenReq(
+                    accessToken=self._tokens["accessToken"]))
+                extracted_accounts = Protobuf.extract(accounts_res)
         # Found live 2026-10-03: this crashed with a bare AttributeError
         # ('ProtoOAErrorRes' object has no attribute 'ctidTraderAccount'),
         # crash-looping launchd every restart with zero indication of the
@@ -116,7 +124,8 @@ class CTraderBridge:
         # explicitly configured account id; only fall back to "first
         # demo" when nothing is configured, and say so loudly rather than
         # quietly picking one.
-        configured_id = self._secrets.get("CTRADER_DEMO_ACCOUNT_ID")
+        configured_id = os.environ.get("CTRADER_DEMO_ACCOUNT_ID") or self._secrets.get("CTRADER_DEMO_ACCOUNT_ID")
+        configured_id = int(configured_id) if configured_id is not None else None
         demo_ids = [a.ctidTraderAccountId for a in demo_accounts]
         if configured_id is not None:
             if configured_id not in demo_ids:
@@ -172,17 +181,9 @@ class CTraderBridge:
             time.sleep(0.1)
 
     def _refresh_token_if_needed(self):
-        # expiresIn is seconds from when the token was issued; this
-        # process doesn't track issue time precisely, so it just
-        # refreshes proactively on every bridge start — cheap, and
-        # guarantees a fresh token rather than guessing an expiry clock.
-        try:
-            refreshed = self._auth.refreshToken(self._tokens["refreshToken"])
-            if refreshed.get("accessToken"):
-                self._tokens = refreshed
-                _save_tokens(refreshed)
-        except Exception:
-            pass  # fall back to the existing token; app-auth will fail loudly if it's actually dead
+        # Refresh only when the token is actually old, under a cross-process lock, adopting a refresh another bridge
+        # already did — see ctrader_tokens.py for why refreshing on every start broke the login repeatedly.
+        self._tokens = ctrader_tokens.ensure_fresh(_TOKENS_PATH, lambda rt: self._auth.refreshToken(rt))
 
     @crochet.wait_for(timeout=20)
     def _send_async(self, message):
@@ -309,6 +310,17 @@ class CTraderBridge:
             })
         return out
 
+    def _asset_name(self, asset_id):
+        """'USD', 'GBP', ... for an account's deposit asset (looked up once). None if it can't be resolved —
+        callers then fall back to their own knowledge rather than assuming."""
+        if getattr(self, "_assets", None) is None:
+            try:
+                res = Protobuf.extract(self._send(messages.ProtoOAAssetListReq(ctidTraderAccountId=self._account_id)))
+                self._assets = {a.assetId: a.name for a in res.asset}
+            except Exception:
+                return None
+        return self._assets.get(asset_id)
+
     def trader(self):
         res = self._send(messages.ProtoOATraderReq(ctidTraderAccountId=self._account_id))
         extracted = Protobuf.extract(res)
@@ -328,6 +340,7 @@ class CTraderBridge:
         # max_position_pct past 100% could ever margin-call this account by
         # stacking several larger positions at once.
         return {"balance": t.balance / scale, "moneyDigits": t.moneyDigits, "depositAssetId": t.depositAssetId,
+                "depositAssetName": self._asset_name(t.depositAssetId),
                 "leverage": t.leverageInCents / 100.0 if t.leverageInCents else None,
                 "maxLeverage": t.maxLeverage / 100.0 if t.maxLeverage else None}
 

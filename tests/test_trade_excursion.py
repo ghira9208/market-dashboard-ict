@@ -110,3 +110,64 @@ def test_simulate_fixed_rr_output_still_carries_every_pre_existing_column():
     events = ex._simulate_fixed_rr(df, touches, rr_multiple=1.0, atr_mult_stop=1.0, max_bars=3, cost_bps=0.0)
     for col in ("entry_time", "r_real", "r_flip", "direction", "mfe_r", "mae_r", "vol_regime", "trend_regime"):
         assert col in events.columns
+
+
+# ---- blackout windows: standing aside through scheduled news -------------------------------------
+
+def _flat_df(n=60, price=100.0):
+    idx = pd.date_range("2026-10-14 08:00", periods=n, freq="5min", tz="UTC")
+    return pd.DataFrame({"Open": price, "High": price + 0.1, "Low": price - 0.1, "Close": price}, index=idx)
+
+
+def test_blackout_closes_an_open_position_at_the_open_of_the_blackout_bar_and_blocks_entries_in_it():
+    import experiments as ex
+    d = _flat_df()
+    # the release lands INSIDE bar 40: it opens at 100 and closes at 101 — a long that stayed in enjoys it
+    d.iloc[40:, d.columns.get_loc("Close")] = 101.0
+    d.iloc[40:, d.columns.get_loc("High")] = 101.1
+    d.iloc[40:, d.columns.get_loc("Low")] = 99.95
+    d.iloc[41:, d.columns.get_loc("Open")] = 101.0
+    touch = [{"confirm_pos": 20, "direction": "bullish"}]
+    plain = ex._simulate_fixed_rr(d, touch, rr_multiple=50.0, atr_mult_stop=1.0, max_bars=30)
+    flag = np.zeros(len(d), bool)
+    flag[40] = True
+    out = ex._simulate_fixed_rr(d, touch, rr_multiple=50.0, atr_mult_stop=1.0, max_bars=30, blackout=flag)
+    assert len(plain) == len(out) == 1
+    assert out["exit_time"].iloc[0] == d.index[40]
+    assert out["r_real"].iloc[0] < plain["r_real"].iloc[0]       # stood aside, so no part of the gap
+    entry_in_blackout = np.zeros(len(d), bool)
+    entry_in_blackout[21] = True                                  # entry bar = confirm_pos + 1
+    assert ex._simulate_fixed_rr(d, touch, 2.0, 1.0, 30, blackout=entry_in_blackout).empty
+
+
+def test_no_blackout_leaves_every_result_unchanged():
+    import experiments as ex
+    d = _flat_df()
+    touch = [{"confirm_pos": 20, "direction": "bullish"}]
+    a = ex._simulate_fixed_rr(d, touch, 2.0, 1.0, 30)
+    b = ex._simulate_fixed_rr(d, touch, 2.0, 1.0, 30, blackout=None)
+    c = ex._simulate_fixed_rr(d, touch, 2.0, 1.0, 30, blackout=np.zeros(len(d), bool))
+    assert a.equals(b) and a.equals(c)
+
+
+# ---- atr_lag: size the stop from information available at the entry bar's open ---------------------
+
+def test_atr_lag_sizes_the_stop_from_the_previous_bar_not_the_entry_bar_itself():
+    import experiments as ex
+    d = _flat_df()                                   # quiet, equal bars: ATR ~0.2
+    d.iloc[21, d.columns.get_loc("High")] = 103.0    # the ENTRY bar (confirm 20 -> entry 21) turns out huge
+    d.iloc[21, d.columns.get_loc("Low")] = 97.0
+    touch = [{"confirm_pos": 20, "direction": "bullish"}]
+    same_bar = ex._simulate_fixed_rr(d, touch, rr_multiple=50.0, atr_mult_stop=1.0, max_bars=5, atr_lag=0)
+    causal = ex._simulate_fixed_rr(d, touch, rr_multiple=50.0, atr_mult_stop=1.0, max_bars=5, atr_lag=1)
+    # ATR at the entry bar jumps 0.20 -> 0.61 purely because of that bar's own 6-point range; lag 1 keeps 0.20
+    assert ex.atr_series(d).iloc[21] > 2.5 * ex.atr_series(d).iloc[20]
+    assert causal["r_real"].iloc[0] == pytest.approx(-1.1, abs=0.02)         # stopped at -1R (+0.1R of cost) on the same bar
+    assert same_bar["r_real"].iloc[0] == pytest.approx(-1.03, abs=0.02)      # lag 0: the stop was ~3x wider than anyone could know
+
+
+def test_atr_lag_zero_is_the_unchanged_default():
+    import experiments as ex
+    d = _flat_df()
+    touch = [{"confirm_pos": 20, "direction": "bullish"}]
+    assert ex._simulate_fixed_rr(d, touch, 2.0, 1.0, 30).equals(ex._simulate_fixed_rr(d, touch, 2.0, 1.0, 30, atr_lag=0))
