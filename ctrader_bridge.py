@@ -30,6 +30,7 @@ import crochet
 crochet.setup()
 
 import ctrader_tokens
+import tick_recorder
 
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol, Auth
 from ctrader_open_api.messages import OpenApiMessages_pb2 as messages
@@ -80,6 +81,7 @@ class CTraderBridge:
         self._symbols_by_name = {}   # symbolName -> symbolId
         self._symbols_full = {}      # symbolId -> ProtoOASymbol (cached after first fetch)
         self._lock = threading.Lock()
+        self._recorder = None        # tick_recorder.TickRecorder when recording (main bridge only)
 
     # -------------------------------------------------------- lifecycle --
     def start(self):
@@ -142,6 +144,7 @@ class CTraderBridge:
             ctidTraderAccountId=self._account_id, accessToken=self._tokens["accessToken"]))
         self._preload_symbols()
         threading.Thread(target=self._health_check_loop, daemon=True).start()
+        self._start_tick_recorder()
 
     def _health_check_loop(self, interval=30):
         """Confirmed directly: the raw TCP connection can report
@@ -169,6 +172,7 @@ class CTraderBridge:
                     self._send(messages.ProtoOAAccountAuthReq(
                         ctidTraderAccountId=self._account_id, accessToken=self._tokens["accessToken"]))
                     print("[health-check] re-auth succeeded, session restored")
+                    self._subscribe_ticks()
                 except Exception as e2:
                     print(f"[health-check] re-auth failed too ({e2}) — exiting for launchd to restart")
                     os._exit(1)
@@ -215,6 +219,65 @@ class CTraderBridge:
     # -------------------------------------------------------------- api --
     def symbols(self):
         return [{"symbolId": sid, "symbolName": name} for name, sid in self._symbols_by_name.items()]
+
+    # ------------------------------------------------------------ ticks --
+    def _start_tick_recorder(self):
+        """Record live bid/ask ticks (see tick_recorder.py). Only on the main bridge (port 8700) and only when
+        .cache/tick_symbols.json lists the symbols to record — the second account's bridge would just duplicate
+        the same quotes. Never allowed to stop the bridge from starting."""
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "tick_symbols.json")
+            if _BRIDGE_PORT != 8700 or not os.path.exists(path):
+                return
+            with open(path) as f:
+                names = json.load(f)
+            ids = {self._symbols_by_name[n]: n for n in names if n in self._symbols_by_name}
+            if not ids:
+                return
+            self._recorder = tick_recorder.TickRecorder()
+            self._recorder.set_symbols(ids)
+            self._client.setMessageReceivedCallback(self._recorder.on_message)
+            self._recorder.start()
+            self._subscribe_ticks()
+            print(f"Recording live ticks for {len(ids)} symbols to {self._recorder.root}")
+        except Exception as e:
+            print(f"tick recorder not started ({e}) — bridge continues without it")
+
+    def _subscribe_ticks(self):
+        if self._recorder is None:
+            return
+        try:
+            res = self._send(messages.ProtoOASubscribeSpotsReq(
+                ctidTraderAccountId=self._account_id, symbolId=list(self._recorder._names),
+                subscribeToSpotTimestamp=True))
+            extracted = Protobuf.extract(res)
+            if type(extracted).__name__ == "ProtoOAErrorRes":
+                print(f"tick subscription rejected: {extracted.errorCode} — {extracted.description}")
+        except Exception as e:
+            print(f"tick subscription failed ({e})")
+
+    def tick_status(self):
+        return self._recorder.status() if self._recorder is not None else {"recording": False}
+
+    def ticks(self, symbol_id, quote_type, from_ms, to_ms, raw=False):
+        """One page of historical ticks. cTrader delta-encodes them (first value absolute, the rest differences);
+        raw=True returns them untouched so the encoding can be checked against real data."""
+        res = self._send(messages.ProtoOAGetTickDataReq(
+            ctidTraderAccountId=self._account_id, symbolId=symbol_id,
+            type=model.ProtoOAQuoteType.Value(quote_type), fromTimestamp=from_ms, toTimestamp=to_ms))
+        extracted = Protobuf.extract(res)
+        if type(extracted).__name__ == "ProtoOAErrorRes":
+            raise BridgeError(f"Tick data request rejected: {extracted.errorCode} — {extracted.description}")
+        pairs = [(t.timestamp, t.tick) for t in extracted.tickData]
+        if raw:
+            return {"hasMore": extracted.hasMore, "n": len(pairs), "first": pairs[:5], "last": pairs[-5:]}
+        ts = px = 0
+        out = []
+        for dt, dp in pairs:
+            ts += dt
+            px += dp
+            out.append((ts, px / 100000.0))
+        return {"hasMore": extracted.hasMore, "ticks": out}
 
     def symbol_detail(self, symbol_id):
         if symbol_id in self._symbols_full:
@@ -678,6 +741,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(_bridge.reconcile())
             elif parsed.path == "/unrealized_pnl":
                 self._json(_bridge.position_unrealized_pnl())
+            elif parsed.path == "/ticks":
+                self._json(_bridge.ticks(int(qs["symbolId"]), qs.get("type", "BID"), int(qs["fromTimestamp"]),
+                                         int(qs["toTimestamp"]), raw=qs.get("raw") == "1"))
+            elif parsed.path == "/tick_status":
+                self._json(_bridge.tick_status())
             elif parsed.path == "/deals":
                 self._json(_bridge.deals(int(qs["fromTimestamp"]), int(qs["toTimestamp"]),
                                           int(qs.get("maxRows", 200))))
