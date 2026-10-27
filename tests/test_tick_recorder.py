@@ -50,3 +50,14 @@ def test_buffer_is_bounded(tmp_path):
     for i in range(tr.MAX_BUFFER + 10):
         r._buf.append((1, i, 1.0, 1.0))
     assert len(r._buf) == tr.MAX_BUFFER
+
+
+def test_quote_returns_the_latest_both_sides_and_its_age(tmp_path):
+    r = _rec(tmp_path)
+    assert r.quote(1) is None
+    r.add_event(_Ev(1, bid=108000))
+    assert r.quote(1) is None                              # one side only: not a quote yet
+    r.add_event(_Ev(1, ask=108012, ts=1_700_000_000_000))
+    q = r.quote(1)
+    assert q["bid"] == 1.08 and q["ask"] == 1.08012 and 0 <= q["age_s"] < 5
+    assert r.quote(2) is None

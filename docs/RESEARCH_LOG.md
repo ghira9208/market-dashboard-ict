@@ -5,6 +5,7 @@ come from the files named in the last column (all under `.cache/` unless noted).
 
 | Date | Question | Answer | Evidence |
 |---|---|---|---|
+| 2026-10-27 | How big is the real spread next to each strategy's stop? | Palladium 77 bps and platinum 52 bps = 1.5x the 5m stop distance (backtest charges 2 bps); everything else 13% of the stop or less (silver 0.13, BTC 0.10, FX 0.01-0.06). Backtest bars are bid-side, a buy fills at the ask. Live gate added at 30% of the stop | measured from `~/dev/tick-data` and bridge candles; `bot_engine._spread_too_wide` |
 | 2026-10-27 | Does stacking confirming layers (news-clear, higher-timeframe trend, calm volatility, EMA aligned) make trades safer? | No. Losing trades rise from 28% (0 layers) to 44% (4 layers); about +0.1R per extra layer. Calm volatility +0.63R, EMA aligned -0.62R, news-clear about 0, trend +0.2R | `layer_confluence.json`, `studies/layer_confluence_study.py` |
 | 2026-10-27 | Can we get broker ticks? | Yes: live spot feed and at least 90 days of bid/ask history; EURUSD ticks about once a second; quotes only, no sizes. Recording to `~/dev/tick-data` | `ctrader_bridge.py`, `tick_recorder.py`, `tick_backfill.py` |
 | 2026-10-21 | Do the detectors read the future? | Barely: expansion 100% of backtest touches reproduce with only live-visible bars, retracement-resumption 90%, expansion-liquidity 66%; the touches live would miss are the weaker ones | `causal_probe.csv`, `studies/causal_probe.py` |

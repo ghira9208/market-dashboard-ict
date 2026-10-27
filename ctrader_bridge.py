@@ -257,6 +257,13 @@ class CTraderBridge:
         except Exception as e:
             print(f"tick subscription failed ({e})")
 
+    def quote(self, symbol_id):
+        """Latest bid/ask from the recorded spot feed. Only the main bridge records; the answer is broker-wide, so
+        every account's bot asks this one."""
+        if self._recorder is None:
+            return {"error": "not recording"}
+        return self._recorder.quote(symbol_id) or {"error": "no quote yet"}
+
     def tick_status(self):
         return self._recorder.status() if self._recorder is not None else {"recording": False}
 
@@ -745,6 +752,8 @@ class _Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/ticks":
                 self._json(_bridge.ticks(int(qs["symbolId"]), qs.get("type", "BID"), int(qs["fromTimestamp"]),
                                          int(qs["toTimestamp"]), raw=qs.get("raw") == "1"))
+            elif parsed.path == "/quote":
+                self._json(_bridge.quote(int(qs["symbolId"])))
             elif parsed.path == "/tick_status":
                 self._json(_bridge.tick_status())
             elif parsed.path == "/deals":

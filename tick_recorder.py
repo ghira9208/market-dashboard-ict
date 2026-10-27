@@ -28,6 +28,7 @@ class TickRecorder:
         self.root = root
         self._names = {}                 # symbolId -> symbolName
         self._last = {}                  # symbolId -> (bid, ask) carried forward
+        self._last_at = {}               # symbolId -> wall-clock seconds of its newest tick
         self._buf = deque(maxlen=MAX_BUFFER)
         self._flush_every = flush_every
         self._stop = threading.Event()
@@ -68,6 +69,15 @@ class TickRecorder:
         self._buf.append((sid, ts_ms, bid, ask))
         self.events += 1
         self.last_event_at = now
+        self._last_at[sid] = now
+
+    def quote(self, symbol_id):
+        """Latest (bid, ask) for a symbol and how old it is, or None when nothing has ticked yet."""
+        bid_ask = self._last.get(symbol_id)
+        at = self._last_at.get(symbol_id)
+        if bid_ask is None or at is None or bid_ask[0] is None or bid_ask[1] is None:
+            return None
+        return {"bid": bid_ask[0], "ask": bid_ask[1], "age_s": round(time.time() - at, 1)}
 
     # ----------------------------------------------------------- disk --
     @staticmethod
