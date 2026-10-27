@@ -11,7 +11,7 @@ Baskets (fixed in advance): BTC-only; 50% BTC + 50% gold; 40% BTC + 20% ETH + 20
 Every possible start week with a full horizon, on the weeks all of an asset set has data for. Nothing is
 sold; a 0.25% fee is charged on every purchase.
 
-    python3 accumulation_basket_study.py
+    python3 studies/accumulation_basket_study.py
 """
 import os
 import sys
@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 from accumulation_study import FEE, weekly_features  # noqa: E402
 

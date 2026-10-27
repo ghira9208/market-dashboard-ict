@@ -40,7 +40,7 @@ def fetch_day(get_page, symbol_id, side, day_start_ms, day_end_ms, sleep=time.sl
 
 def main(days=30, port=8701):
     base = f"http://localhost:{port}"
-    names = json.load(open(os.path.join(HERE, ".cache", "tick_symbols.json")))
+    names = json.load(open(os.path.join(HERE, "config", "tick_symbols.json")))
     ids = {s["symbolName"]: s["symbolId"] for s in requests.get(f"{base}/symbols", timeout=30).json()}
 
     def get_page(sid, side, f, t):

@@ -190,7 +190,7 @@ def status(spec, ledger_path=LEDGER_PATH, rng=None):
 
 def main():
     import data as research_data
-    from run_ema_sweep import universe
+    from universe import universe
     today = datetime.now(timezone.utc).date()
     if not os.path.exists(SPEC_PATH):
         eligible = []

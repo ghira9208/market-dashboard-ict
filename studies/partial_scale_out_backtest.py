@@ -15,7 +15,7 @@ at the already-widened target — on the exact same real historical
 touches, same ATR-based risk unit, same 2.0bps real cost assumption
 experiments.py's own _simulate_fixed_rr already uses.
 
-Run standalone: python3 partial_scale_out_backtest.py
+Run standalone: python3 studies/partial_scale_out_backtest.py
 """
 import sys
 from pathlib import Path
@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, "/Users/apple/dev/edge-pipeline")
 
 import experiments as ex

@@ -5,7 +5,7 @@ the exit structure — small target, wide stop — is measured), on 12 liquid as
 exits at the first of: target hit (win), stop hit (loss), or the time limit (marked to market at the close).
 When one bar could hit both, the stop is assumed first. A round-trip cost is charged on every trade.
 
-    python3 scalp_winrate_study.py
+    python3 studies/scalp_winrate_study.py
 """
 import os
 import sys
@@ -13,7 +13,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import experiments as ex  # noqa: E402
 

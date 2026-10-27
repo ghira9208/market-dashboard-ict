@@ -11,13 +11,13 @@ Rules are FIXED IN ADVANCE (nothing is tuned on this data, so every slice is out
   W3  delay entry 3 bars, only if E1 still holds then and the zone's far edge has not been closed through
 Everything is read from bars up to and including the confirm bar (W3: up to the delayed bar), so no
 lookahead. The first four are OVERLAYS (they only decide which existing trades to skip, like
-overlay_tests.py); W3 is a different entry and is re-simulated.
+overlay_study.py); W3 is a different entry and is re-simulated.
 
 Judged on pooled validated-combo trades, 60/20/20 time slices per combo, permutation p-value from
 shuffling the feature label WITHIN each combo (a better combo cannot fake an effect), a calendar-day
 cluster bootstrap on the pooled difference, and a 6 bps cost stress. Bonferroni over the 5 rules.
 
-    python3 streak_polish_study.py
+    python3 studies/streak_polish_study.py
 """
 import json
 import os
@@ -25,7 +25,7 @@ import sys
 import warnings
 
 warnings.filterwarnings("ignore")
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 import numpy as np
@@ -34,7 +34,7 @@ import pandas as pd
 import experiments as ex
 import observatory as obs
 import ticker_behavior as tb
-from overlay_tests import split_labels
+from overlay_tools import FIND, _utc, day_cluster_ci, ema_state, split_labels, strat_diff_p
 
 B = 5000
 RULES = ["L1", "L2", "E1", "E2", "W3"]
@@ -42,9 +42,6 @@ DELAY = 3
 COVER = [0, 0]  # trades with no streak length found / found
 
 
-def _utc(x):
-    t = pd.Timestamp(x)
-    return t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
 
 
 def streak_lengths(df, strategy, min_streak, retr_window_bars):
@@ -65,19 +62,8 @@ def streak_lengths(df, strategy, min_streak, retr_window_bars):
     return out
 
 
-def ema_state(df):
-    close = df["Close"].to_numpy(dtype=float)
-    f = pd.Series(close).ewm(span=20, adjust=False).mean().to_numpy()
-    s = pd.Series(close).ewm(span=50, adjust=False).mean().to_numpy()
-    atr = ex.atr_series(df).to_numpy()
-    return close, f, s, atr
 
 
-FIND = {
-    "clean_expansion_fixed_rr": ex._clean_expansion_touches,
-    "clean_expansion_liquidity_fixed_rr": ex._clean_expansion_liquidity_touches,
-    "clean_retracement_resumption_fixed_rr": ex._clean_retracement_resumption_touches,
-}
 
 
 def combo_rows(c, s, df, cost_bps):
@@ -155,35 +141,8 @@ def load(cost_bps):
     return pd.DataFrame(base), pd.DataFrame(wait)
 
 
-def strat_diff_p(df, col, rng, b=2000):
-    """mean R (feature true) - mean R (feature false); p from shuffling the label within each combo."""
-    groups = [(g["r"].to_numpy(), g[col].to_numpy().astype(bool)) for _, g in df.groupby("combo")]
-    groups = [(r, m) for r, m in groups if 0 < m.sum() < len(m)]
-    if not groups:
-        return float("nan"), float("nan")
-
-    def diff(masks):
-        t = np.concatenate([r[m] for (r, _), m in zip(groups, masks)])
-        f = np.concatenate([r[~m] for (r, _), m in zip(groups, masks)])
-        return t.mean() - f.mean()
-
-    obs_d = diff([m for _, m in groups])
-    sims = np.array([diff([rng.permutation(m) for _, m in groups]) for _ in range(b)])
-    return float(obs_d), float((1 + (sims >= obs_d).sum()) / (1 + b))
 
 
-def day_cluster_ci(df, col, rng, b=2000):
-    """95% CI of the pooled true-minus-false difference, resampling whole calendar days."""
-    d = df.assign(day=df["entry"].dt.date)
-    days = d["day"].unique()
-    g = {k: v for k, v in d.groupby("day")}
-    out = []
-    for _ in range(b):
-        s = pd.concat([g[k] for k in rng.choice(days, len(days))])
-        t, f = s[s[col]]["r"], s[~s[col]]["r"]
-        if len(t) and len(f):
-            out.append(t.mean() - f.mean())
-    return [round(float(np.percentile(out, 2.5)), 3), round(float(np.percentile(out, 97.5)), 3)]
 
 
 def judge_overlay(df, col, rng):

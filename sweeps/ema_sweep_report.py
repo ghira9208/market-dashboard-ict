@@ -12,7 +12,7 @@ anything beyond chance. Three questions, in order of how hard they are to fake:
      round-trip cost, because the flat 2 bps used by every backtest here
      understates real futures/CFD costs (see validate_cost_model.py).
 
-    python3 ema_sweep_report.py
+    python3 sweeps/ema_sweep_report.py
 """
 import json
 import os
@@ -21,19 +21,19 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import argparse  # noqa: E402
 import importlib  # noqa: E402
 
 import experiments as ex  # noqa: E402
 import data as research_data  # noqa: E402
-from run_ema_sweep import TF_FETCH  # noqa: E402
+from universe import TF_FETCH  # noqa: E402
 
 # Generic over any sweep that follows the same contract (a strategies module
 # with BUILDERS + DETECTOR_VERSIONS, and its own ledger):
-#     python3 ema_sweep_report.py                                  # EMA families
-#     python3 ema_sweep_report.py pattern_strategies pattern_sweep_trials.jsonl
+#     python3 sweeps/ema_sweep_report.py                                  # EMA families
+#     python3 sweeps/ema_sweep_report.py pattern_strategies pattern_sweep_trials.jsonl
 _ap = argparse.ArgumentParser()
 _ap.add_argument("module", nargs="?", default="ema_strategies")
 _ap.add_argument("ledger", nargs="?", default="ema_sweep_trials.jsonl")

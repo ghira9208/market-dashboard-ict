@@ -202,7 +202,7 @@ def run(tickers, fetch, rng, append):
 def main():
     import experiments as ex
     import data as research_data
-    from run_ema_sweep import universe
+    from universe import universe
     tickers = universe()
     ex._TRIALS_PATH = LEDGER
     os.makedirs(os.path.dirname(LEDGER), exist_ok=True)

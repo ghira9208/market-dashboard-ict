@@ -12,7 +12,7 @@ agree (a dose-response), rather than testing one filter at a time:
 Judged with R demeaned per combo (so a better combo cannot fake a trend) and a permutation test that shuffles the
 layer count WITHIN each combo. Reported on the three time slices.
 
-    python3 layer_confluence_study.py
+    python3 studies/layer_confluence_study.py
 """
 import json
 import os
@@ -20,7 +20,7 @@ import sys
 import warnings
 
 warnings.filterwarnings("ignore")
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 import numpy as np
@@ -29,8 +29,8 @@ import pandas as pd
 import data as research_data
 import experiments as ex
 import observatory as obs
-import overlay_tests as ot
-from news_blackout_test import calendar_flags
+import overlay_study as ot
+from news_blackout_study import calendar_flags
 from streak_polish_study import _utc
 
 LAYERS = ["NEWS", "HTF", "CALM", "EMA"]

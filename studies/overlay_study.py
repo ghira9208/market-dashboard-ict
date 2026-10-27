@@ -19,7 +19,7 @@ Both are judged by whether skipping the filtered trades would have raised mean
 R per remaining trade, with a permutation p-value that respects each combo's
 own baseline.
 
-    python3 overlay_tests.py
+    python3 studies/overlay_study.py
 """
 import json
 import os
@@ -28,7 +28,9 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+from overlay_tools import split_labels  # noqa: E402
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 HTF_OF = {"5m": ("1h", pd.Timedelta(hours=1)), "1h": ("1D", pd.Timedelta(days=1))}
@@ -38,9 +40,6 @@ MIN_HOUR_N = 60
 B = 5000
 
 
-def split_labels(n):
-    a, b = int(n * 0.6), int(n * 0.8)
-    return ["research"] * a + ["validation"] * (b - a) + ["locked"] * (n - b)
 
 
 def load_trades():
@@ -209,7 +208,7 @@ def main():
         results["htf"].append(r)
         print(f"\nHTF TREND FILTER, EMA {fast}/{slow} on the next timeframe up (5m->1h, 1h->1D)")
         print(json.dumps(r, indent=2))
-    with open(os.path.join(HERE, ".cache", "overlay_tests.json"), "w") as f:
+    with open(os.path.join(HERE, ".cache", "overlay_study.json"), "w") as f:
         json.dump(results, f, indent=2, default=str)
 
 

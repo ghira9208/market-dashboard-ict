@@ -9,7 +9,7 @@ over days. Everything is corrected together (Benjamini-Hochberg over all tests) 
 BOTH halves of the sample to count. Two positive controls (volatility clustering, the hour-of-day
 volatility profile) are included: if the screen cannot find those, the machinery is broken.
 
-    python3 generic_pattern_screen.py
+    python3 studies/generic_pattern_screen.py
 """
 import json
 import os
@@ -18,7 +18,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 CLASSES = {

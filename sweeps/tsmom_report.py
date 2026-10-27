@@ -3,7 +3,7 @@ anything, does it hold on data nobody selected on, and does it survive
 realistic costs? Per-asset results are shown too, but the portfolio rows are
 the headline (see tsmom_backtest.py for why).
 
-    python3 tsmom_report.py
+    python3 sweeps/tsmom_report.py
 """
 import os
 import sys
@@ -11,7 +11,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import experiments as ex  # noqa: E402
 import data as research_data  # noqa: E402
@@ -21,7 +21,7 @@ STRESS_BPS = 8.0
 
 
 def portfolio_slice_stats(cost_bps):
-    from run_ema_sweep import universe
+    from universe import universe
     out = {}
     for lb in tm.LOOKBACKS:
         frames = {}

@@ -16,7 +16,7 @@ Every trade: protective stop 1.5 x ATR(14) at entry, time exit after H bars, 2 b
 first when a bar could hit both stop and anything else. R = profit / stop distance. Results are
 averaged per day across assets (the same news moves every pair) and bootstrapped over days.
 
-    python3 news_positioning_test.py
+    python3 studies/news_positioning_study.py
 """
 import json
 import os
@@ -25,11 +25,11 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 import experiments as ex  # noqa: E402
-from news_blackout_test import RELEASES, TF_MIN, _utc_index  # noqa: E402
+from news_blackout_study import RELEASES, TF_MIN, _utc_index  # noqa: E402
 
 UNIVERSE = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X", "USDCHF=X", "EURJPY=X",
             "GBPJPY=X", "GC=F", "ES=F", "NQ=F", "BTC-USD"]
@@ -131,7 +131,7 @@ def main():
     t = pd.DataFrame(rows)
     res = summarize(t, rng)
     by_slot = t.groupby(["tf", "mode", "slot"])["R"].agg(["size", "mean"]).reset_index()
-    res.to_json(os.path.join(HERE, ".cache", "news_positioning_test.json"), orient="records", indent=1)
+    res.to_json(os.path.join(HERE, ".cache", "news_positioning_study.json"), orient="records", indent=1)
     return res, by_slot, t
 
 

@@ -16,7 +16,7 @@ trailing beyond that, so this backtest is a true predictor of what the
 already-built live mechanism would do if extended to N legs, not a
 different (untested) exit rule.
 
-Run standalone: python3 nleg_scale_out_backtest.py
+Run standalone: python3 studies/nleg_scale_out_backtest.py
 """
 import sys
 from pathlib import Path
@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, "/Users/apple/dev/edge-pipeline")
 
 import experiments as ex

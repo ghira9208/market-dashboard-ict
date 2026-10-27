@@ -9,7 +9,7 @@ A) the small-target / wide-stop "high win rate" structure (scalp_winrate_study.p
 B) the 82 validated strategies' own trades, split by whether they were entered in quiet conditions and whether
    a release fell inside the trade.
 
-    python3 calm_waters_study.py
+    python3 studies/calm_waters_study.py
 """
 import os
 import sys
@@ -17,10 +17,10 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import scalp_winrate_study as sw  # noqa: E402
-from news_blackout_test import _utc_index, calendar_flags  # noqa: E402
+from news_blackout_study import _utc_index, calendar_flags  # noqa: E402
 
 HOLD = 8
 

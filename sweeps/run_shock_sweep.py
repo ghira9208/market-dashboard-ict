@@ -4,8 +4,8 @@ Same machinery and isolation as run_pattern_sweep.py: its OWN ledger
 (.cache/shock_sweep_trials.jsonl), so these exploratory trials never touch the main ledger's
 Benjamini-Hochberg denominator, and nothing here is promoted automatically.
 
-    python3 run_shock_sweep.py [--workers 3] [--tickers GBPUSD=X] [--tfs 5m,1h]
-    python3 ema_sweep_report.py shock_strategies shock_sweep_trials.jsonl
+    python3 sweeps/run_shock_sweep.py [--workers 3] [--tickers GBPUSD=X] [--tfs 5m,1h]
+    python3 sweeps/ema_sweep_report.py shock_strategies shock_sweep_trials.jsonl
 """
 import argparse
 import json
@@ -14,7 +14,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 LEDGER = os.path.join(HERE, ".cache", "shock_sweep_trials.jsonl")
@@ -80,7 +80,7 @@ def main():
     ap.add_argument("--tickers", default="")
     ap.add_argument("--tfs", default="5m,1h")
     args = ap.parse_args()
-    from run_ema_sweep import universe
+    from universe import universe
     tickers = [t for t in args.tickers.split(",") if t] or universe()
     tfs = [t for t in args.tfs.split(",") if t]
     print(f"{len(tickers)} tickers x {tfs} -> {LEDGER}", flush=True)

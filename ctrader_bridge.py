@@ -223,10 +223,10 @@ class CTraderBridge:
     # ------------------------------------------------------------ ticks --
     def _start_tick_recorder(self):
         """Record live bid/ask ticks (see tick_recorder.py). Only on the main bridge (port 8700) and only when
-        .cache/tick_symbols.json lists the symbols to record — the second account's bridge would just duplicate
+        config/tick_symbols.json lists the symbols to record — the second account's bridge would just duplicate
         the same quotes. Never allowed to stop the bridge from starting."""
         try:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "tick_symbols.json")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "tick_symbols.json")
             if _BRIDGE_PORT != 8700 or not os.path.exists(path):
                 return
             with open(path) as f:

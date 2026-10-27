@@ -4,7 +4,7 @@ Same machinery and same isolation rules as run_ema_sweep.py — see its docstrin
 for why this writes to its OWN ledger (.cache/pattern_sweep_trials.jsonl) instead
 of the main one, and why nothing here is promoted automatically.
 
-    python3 run_pattern_sweep.py [--workers 3] [--tickers EURUSD=X] [--tfs 5m,1h,1D]
+    python3 sweeps/run_pattern_sweep.py [--workers 3] [--tickers EURUSD=X] [--tfs 5m,1h,1D]
 """
 import argparse
 import json
@@ -13,7 +13,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 LEDGER = os.path.join(HERE, ".cache", "pattern_sweep_trials.jsonl")
@@ -81,7 +81,7 @@ def main():
     ap.add_argument("--tickers", default="")
     ap.add_argument("--tfs", default="5m,1h,1D")
     args = ap.parse_args()
-    from run_ema_sweep import universe
+    from universe import universe
     tickers = [t for t in args.tickers.split(",") if t] or universe()
     tfs = [t for t in args.tfs.split(",") if t]
     print(f"{len(tickers)} tickers x {tfs} -> {LEDGER}", flush=True)

@@ -16,7 +16,7 @@ hour (1h data). Costs are charged on the early exit like any other exit.
 The answer is judged on per-day total R, bootstrapped over days (the same news hits every combo at
 once), and the trades the rule touches are shown separately so the trade-off is visible.
 
-    python3 news_blackout_test.py
+    python3 studies/news_blackout_study.py
 """
 import functools
 import json
@@ -26,7 +26,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 MAJORS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "NZDUSD=X", "USDCAD=X", "USDCHF=X"]
@@ -143,7 +143,7 @@ def main():
             diff, lo, hi, nd = boot_diff(b, v, rng)
             res[f"{name}_minus_baseline_R"] = {"diff": diff, "ci90": [lo, hi], "days": nd}
         out[tf] = res
-    with open(os.path.join(HERE, ".cache", "news_blackout_test.json"), "w") as f:
+    with open(os.path.join(HERE, ".cache", "news_blackout_study.json"), "w") as f:
         json.dump(out, f, indent=1)
     return out
 

@@ -1,4 +1,4 @@
-"""Forward test of one lead from streak_polish_study.py: on the validated clean_* combos, entries made while
+"""Forward test of one lead from studies/streak_polish_study.py: on the validated clean_* combos, entries made while
 the EMAs are NOT yet lined up with the trade earn more R than entries made after they line up.
 
 Found on history (4,329 trades, 78 combos): not-aligned +1.71R vs aligned +1.09R, same sign in all three time
@@ -81,7 +81,7 @@ def frozen_combos():
     import experiments as ex
     import observatory as obs
     import ticker_behavior as tb
-    from streak_polish_study import FIND
+    from overlay_tools import FIND
     lb, trials, out = tb.validated_leaderboard(), ex.load_experiment_trials(), []
     for _, c in lb.iterrows():
         m = trials[(trials.ticker == c.ticker) & (trials.tf_label == c.tf_label) & (trials.label == c.best_label)]
@@ -98,7 +98,7 @@ def combo_trades(df, combo, created, cost_bps):
     """Trades one combo would have taken, entered after `created` and fully resolved, with the EMA feature.
     Returns a list of dicts (entry UTC iso, r at cost_bps, aligned)."""
     import experiments as ex
-    from streak_polish_study import FIND, _utc, ema_state
+    from overlay_tools import FIND, _utc, ema_state
     s = combo["settings"]
     touches = FIND[combo["strategy"]](df, min_streak=s["min_streak"], retr_window_bars=s["retr_window_bars"])
     ev = ex._simulate_fixed_rr(df, touches, s["rr_multiple"], s["atr_mult_stop"], s["max_bars"], cost_bps)
@@ -149,7 +149,7 @@ def advance(spec, fetch, ledger_path=LEDGER_PATH):
 
 
 def status(spec, ledger_path=LEDGER_PATH, rng=None):
-    from streak_polish_study import day_cluster_ci, strat_diff_p
+    from overlay_tools import day_cluster_ci, strat_diff_p
     rng = rng or np.random.default_rng(5)
     rows = _read_ledger(ledger_path)
     out = {"spec_sha256": spec["sha256"], "frozen_at": spec["created"], "forward_trades": len(rows)}

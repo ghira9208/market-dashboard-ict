@@ -1,4 +1,4 @@
-"""news_blackout_test.py — the window arithmetic (the simulation itself is covered in test_trade_excursion)."""
+"""news_blackout_study.py — the window arithmetic (the simulation itself is covered in test_trade_excursion)."""
 import sys
 from pathlib import Path
 
@@ -7,7 +7,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import news_blackout_test as nb
+import news_blackout_study as nb
 
 
 def _idx(start, periods, freq):

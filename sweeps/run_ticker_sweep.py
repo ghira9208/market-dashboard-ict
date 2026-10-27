@@ -1,69 +1,56 @@
-"""New-universe sweep: the 73 real, cTrader-tradeable instruments found
-this session that this project's research has never touched — confirmed
-directly (not guessed) in two steps: (1) pulled this account's real
-/symbols list off the cTrader bridge and classified it into FX crosses,
-metals, energy, and major international indices (filtering out ~420
-individual stock names that showed up in the same list); (2) tested every
-candidate against this project's own research_data.get_yf_ohlcv — 73 of
-74 came back with real, usable history (only NZDSEK=X failed). None of
-these 73 have ever been run through any _fixed_rr strategy before.
+"""One-off sweep driver: fills a real, measured coverage gap in the
+_fixed_rr research base.
 
-Same exact 27-combo settings grid and 3 canonical timeframes (1D/1h/5m)
-run_ticker_sweep.py already established for this platform's own research
-— reused here unchanged, not reinvented — against all THREE _fixed_rr
-strategies (run_ticker_sweep.py only needed two of them; clean_expansion_
-fixed_rr is included here since none of these 73 tickers have it either).
+Confirmed directly by reading .cache/experiment_trials.jsonl (not
+guessed): clean_expansion_fixed_rr has already been run across all 15
+platform-tracked tickers on 1D/1h/5m (and some 4h/1d-legacy-cased
+entries), using a 27-combo settings grid. clean_expansion_liquidity_fixed_rr
+and clean_retracement_resumption_fixed_rr were only ever run against 8
+tickers (BTC-USD, ES=F, ETH-USD, EURUSD=X, GBPUSD=X, NQ=F, RTY=F, YM=F) on
+2 timeframes (1h, 1d) — never on AUDUSD=X, USDCAD=X, USDCHF=X, USDJPY=X,
+GC=F, CL=F, SI=F, and never on 1D or 5m for ANY ticker. This script
+closes that gap using the EXACT same 27-combo grid already established
+for these strategies (reverse-engineered from the trial log's own label
+strings, not invented), against the SAME 3 canonical research timeframes
+research_stats.py already uses (1D/1h/5m — 4h isn't in the validated
+research pipeline yet, it needs 1h->4h resampling that isn't wired into
+this path).
 
-Skips any (strategy, ticker, tf_label, label) triple already in the trial
-log — safe to re-run. Appends to .cache/experiment_trials.jsonl, then
-rebuilds ticker_behavior.db so anything that survives BH-correction and
-holdout shows up on the real leaderboard automatically.
+Skips any (ticker, tf_label, exact settings) triple already present in
+the trial log — safe to re-run, won't duplicate existing trials. Appends
+new rows to the same .cache/experiment_trials.jsonl run_deep_backtest_rr
+already writes to, then rebuilds ticker_behavior.db so the dashboard
+picks up anything newly validated.
 
-Run standalone: python3 run_new_universe_sweep.py
+Run standalone: python3 sweeps/run_ticker_sweep.py
 """
 import json
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import experiments as ex
 import ticker_behavior
 import data as research_data
 
 TICKERS = [
-    # Metals / energy — real cTrader symbols confirmed, yfinance data confirmed
-    "PA=F", "PL=F", "BZ=F",
-    # Major international indices
-    "^FTSE", "^GDAXI", "^FCHI", "FTSEMIB.MI", "^IBEX", "^SSMI",
-    "^AEX", "^AXJO", "^HSI", "^STOXX50E",
-    # FX crosses this broker carries beyond the 6 already traded
-    "AUDCAD=X", "AUDCHF=X", "AUDJPY=X", "AUDNZD=X", "AUDSGD=X", "AUDZAR=X",
-    "CADCHF=X", "CADJPY=X", "CADMXN=X", "CHFJPY=X", "CHFSGD=X",
-    "EURAUD=X", "EURCAD=X", "EURCHF=X", "EURCNH=X", "EURCZK=X", "EURDKK=X",
-    "EURGBP=X", "EURHKD=X", "EURHUF=X", "EURJPY=X", "EURMXN=X", "EURNOK=X",
-    "EURNZD=X", "EURPLN=X", "EURSEK=X", "EURSGD=X", "EURTRY=X", "EURZAR=X",
-    "GBPAUD=X", "GBPCAD=X", "GBPCHF=X", "GBPDKK=X", "GBPJPY=X", "GBPNOK=X",
-    "GBPNZD=X", "GBPSEK=X", "GBPSGD=X", "GBPTRY=X", "GBPZAR=X",
-    "NOKJPY=X", "NOKSEK=X", "NZDCAD=X", "NZDCHF=X", "NZDJPY=X", "NZDSGD=X",
-    "NZDUSD=X", "SEKJPY=X", "SGDJPY=X", "USDCNH=X", "USDCZK=X", "USDDKK=X",
-    "USDHUF=X", "USDMXN=X", "USDNOK=X", "USDPLN=X", "USDSEK=X", "USDSGD=X",
-    "USDTRY=X", "USDZAR=X",
+    "GBPUSD=X", "EURUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X",
+    "ES=F", "YM=F", "NQ=F", "RTY=F", "GC=F", "SI=F", "CL=F",
+    "BTC-USD", "ETH-USD",
 ]
-assert len(TICKERS) == 73
-
 TF_FETCH = {
     "1D": dict(period="10y", interval="1d"),
     "1h": dict(period="730d", interval="1h"),
     "5m": dict(period="60d", interval="5m"),
 }
 
+# Fixed (non-swept) params per strategy, matching what's already in the
+# trial log exactly — min_streak=3 and retr_window_bars never varied
+# across any of the 1728 existing fixed_rr trials for any of the three
+# strategies; sweep_window_bars=10 likewise fixed for the liquidity variant.
 STRATEGIES = {
-    "clean_expansion_fixed_rr": {
-        "builder": ex.build_clean_expansion_fixed_rr_events,
-        "fixed": {"min_streak": 3, "retr_window_bars": 40},
-    },
     "clean_expansion_liquidity_fixed_rr": {
         "builder": ex.build_clean_expansion_liquidity_fixed_rr_events,
         "fixed": {"min_streak": 3, "retr_window_bars": 40, "sweep_window_bars": 10},
@@ -74,7 +61,9 @@ STRATEGIES = {
     },
 }
 
-# Identical grid to run_ticker_sweep.py's own — not reinvented, reused.
+# The real 27-combo grid, reverse-engineered from the trial log's own
+# settings (identical grid shape already used for these two strategies
+# AND for clean_expansion_fixed_rr) — not a new invention.
 _ATR_RR_MAXBARS = (
     [(atr, rr, 40) for atr in (0.75, 1.0, 1.5) for rr in (0.3, 0.5, 0.75, 1.0, 1.5)]
     + [(atr, rr, 60) for atr in (1.5, 2.0, 2.5) for rr in (1.5, 2.0, 2.5, 3.0)]
@@ -88,7 +77,9 @@ def _label(strategy, atr, rr, win, maxbars):
 
 
 def _already_tried():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "experiment_trials.jsonl")
+    """(strategy, ticker, normalized tf_label, label) triples already in
+    the trial log — skip these outright rather than re-running them."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "experiment_trials.jsonl")
     seen = set()
     if not os.path.exists(path):
         return seen

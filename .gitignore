@@ -31,3 +31,9 @@ research/.cache/
 # accounts) -- same real credential, just a copy, never safe to commit.
 .cache/ctrader_tokens.json
 .cache/ctrader_tokens.json.bak-*
+
+# Old copies of ledgers and databases (moved out of the repo to ~/dev/edge-pipeline/backups/research-archive)
+*.bak
+.cache/*.backup_*
+.cache/*.bak
+archive/backups/

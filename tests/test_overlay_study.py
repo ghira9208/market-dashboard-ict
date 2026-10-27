@@ -1,4 +1,4 @@
-"""overlay_tests.py — the pieces where a subtle bug would quietly make a filter
+"""overlay_study.py — the pieces where a subtle bug would quietly make a filter
 look better than it is: HTF alignment lookahead, the selection-aware hour test,
 and the within-combo permutation."""
 import sys
@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import overlay_tests as ov
+import overlay_study as ov
 
 
 def test_split_labels_are_60_20_20_in_time_order():

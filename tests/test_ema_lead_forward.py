@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ema_lead_forward as fw
-import streak_polish_study as sps
+import overlay_tools as sps
 
 SETTINGS = {"min_streak": 3, "retr_window_bars": 40, "rr_multiple": 1.0, "atr_mult_stop": 1.0, "max_bars": 40}
 COMBO = {"ticker": "TST", "tf": "1h", "strategy": "clean_expansion_fixed_rr", "settings": SETTINGS}

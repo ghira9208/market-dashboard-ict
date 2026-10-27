@@ -16,7 +16,7 @@ Rules (fixed in advance, round numbers, no tuning):
   combo      geometric mean of mayer and drawdown
   value_avg  buy whatever closes the gap to a portfolio that grows by 1.0 a week (floor 0, cap 3x)
 
-    python3 accumulation_study.py
+    python3 studies/accumulation_study.py
 """
 import json
 import os
@@ -25,7 +25,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 ASSETS = ["BTC-USD", "ETH-USD", "SOL-USD", "GC=F", "^GSPC", "^NDX"]

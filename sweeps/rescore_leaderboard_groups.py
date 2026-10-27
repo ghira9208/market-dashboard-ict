@@ -27,13 +27,13 @@ frictionless numbers, not skip past them. Appends to the same trial
 log; rebuild_db()'s own new dedup (keep the newest trial per exact
 label) means these fresh rows simply supersede the old ones.
 
-Run standalone: python3 rescore_leaderboard_groups.py
+Run standalone: python3 sweeps/rescore_leaderboard_groups.py
 """
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import experiments as ex
 import ticker_behavior

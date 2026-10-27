@@ -16,7 +16,7 @@ still has to be re-validated through the main pipeline.
 
 Resumable: re-running skips (ticker, timeframe, label) rows already logged.
 
-    python3 run_ema_sweep.py [--workers 3] [--tickers EURUSD=X,GC=F] [--tfs 1h,1D]
+    python3 sweeps/run_ema_sweep.py [--workers 3] [--tickers EURUSD=X,GC=F] [--tfs 1h,1D]
 """
 import argparse
 import json
@@ -25,11 +25,11 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 
 SWEEP_LEDGER = os.path.join(HERE, ".cache", "ema_sweep_trials.jsonl")
-TF_FETCH = {"1D": dict(period="10y", interval="1d"), "1h": dict(period="730d", interval="1h")}
+from universe import TF_FETCH, universe  # noqa: E402
 
 
 def _configure():
@@ -86,14 +86,6 @@ def sweep_ticker(args):
             except Exception as e:
                 print(f"  {ticker} {tf} {label[:40]}: {str(e)[:70]}", flush=True)
     return ticker, n
-
-
-def universe():
-    """Every ticker the main research ledger has ever scored — the real
-    researched universe, read BEFORE this process redirects its ledger."""
-    import experiments as ex
-    t = ex.load_experiment_trials()
-    return sorted(t[t["verdict"] == "SCORED"]["ticker"].unique())
 
 
 def main():
