@@ -21,6 +21,7 @@ non-negotiable guarantee brokers/etoro.py already enforces for eToro.
 """
 import json
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -785,6 +786,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, status=500)
 
 
+class _QuietServer(ThreadingHTTPServer):
+    """A caller that gives up waiting (its own timeout) closes the socket before the answer is written; the default
+    handler then prints a full traceback per request, which had grown the error log to 34 MB of identical noise.
+    Real errors are still reported."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     global _bridge
     print("Connecting to cTrader (demo)...")
@@ -807,7 +819,7 @@ def main():
         # — a caller now waits on the lock (bounded by whichever single
         # call currently holds it), not behind an entire queue of
         # sequential requests from someone else's unrelated loop.
-        ThreadingHTTPServer(("localhost", _BRIDGE_PORT), _Handler).serve_forever()
+        _QuietServer(("localhost", _BRIDGE_PORT), _Handler).serve_forever()
     except Exception as e:
         # Confirmed as the real cause of a genuine ~4-hour silent hang: a
         # network hiccup exactly like a MacBook lid-close/wake or a wifi
