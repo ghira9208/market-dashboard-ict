@@ -1,4 +1,47 @@
 {
-  "checked_at": 1790698953.2307358,
-  "decayed": []
+  "checked_at": 1792900248.08069,
+  "decayed": [
+    {
+      "ticker": "ETH-USD",
+      "tf_label": "1h",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "mean_return_holdout": 0.4783333898075268,
+      "was_mean_return_holdout": 0.4322339942276078
+    },
+    {
+      "ticker": "^FCHI",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.7067341872532071,
+      "was_mean_return_holdout": 0.7810571681239091
+    },
+    {
+      "ticker": "PL=F",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "mean_return_holdout": 1.0578390295126532,
+      "was_mean_return_holdout": 0.8969377801141808
+    },
+    {
+      "ticker": "YM=F",
+      "tf_label": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "mean_return_holdout": 0.1659999542680129,
+      "was_mean_return_holdout": 0.7113743533173795
+    },
+    {
+      "ticker": "BZ=F",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.2109610613254321,
+      "was_mean_return_holdout": 1.0347773141337089
+    },
+    {
+      "ticker": "FTSEMIB.MI",
+      "tf_label": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "mean_return_holdout": 0.6278470450906182,
+      "was_mean_return_holdout": 2.3395315127291054
+    }
+  ]
 }

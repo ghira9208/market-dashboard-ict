@@ -1,0 +1,30 @@
+ledger: 2372 trials | scored 1801 | insufficient data 571
+BH-significant on RESEARCH slice: 2 | survived (BH + holdout + same sign): 1
+holdout passed: 2.7% of scored trials (a strategy with NO edge passes ~5% by luck)
+
+BREADTH by family/setting (pooled across tickers and timeframes)
+      family                                          setting   n  pct_val_positive  median_val_R  median_train_R  holdout_pass_pct  bh_sig  survivors
+round_number  level_type=half · rr=1.5 · atr=1.5 · maxbars=60 183             30.60         -0.09           -0.11              1.64       1          1
+round_number level_type=major · rr=1.5 · atr=1.5 · maxbars=60 174             31.61         -0.09           -0.12              1.72       1          0
+round_number  level_type=half · rr=3.0 · atr=1.5 · maxbars=60 183             32.79         -0.12           -0.11              3.83       0          0
+round_number level_type=major · rr=3.0 · atr=1.5 · maxbars=60 173             32.37         -0.13           -0.14              1.16       0          0
+squeeze_bbkc       min_bars=8 · rr=1.5 · atr=1.5 · maxbars=60  54             38.89         -0.09           -0.08              0.00       0          0
+squeeze_bbkc       min_bars=4 · rr=3.0 · atr=1.5 · maxbars=60  93             36.56         -0.16           -0.10              1.08       0          0
+squeeze_bbkc       min_bars=8 · rr=3.0 · atr=1.5 · maxbars=60  54             33.33         -0.16           -0.22              1.85       0          0
+squeeze_bbkc       min_bars=4 · rr=1.5 · atr=1.5 · maxbars=60  99             34.34         -0.17           -0.09              0.00       0          0
+  squeeze_nr          width=7 · rr=1.5 · atr=1.5 · maxbars=60 197             39.09         -0.05           -0.05              3.05       0          0
+  squeeze_nr          width=4 · rr=1.5 · atr=1.5 · maxbars=60 197             39.09         -0.05           -0.03              5.08       0          0
+  squeeze_nr          width=4 · rr=3.0 · atr=1.5 · maxbars=60 197             35.53         -0.08            0.01              4.57       0          0
+  squeeze_nr          width=7 · rr=3.0 · atr=1.5 · maxbars=60 197             40.61         -0.09           -0.03              3.05       0          0
+
+SURVIVORS: 1 | of those with a positive LOCKED slice (n>=10): 1
+      family ticker tf_label                                         setting  n_train  mean_return_train  mean_return_holdout  locked_n  locked_mean_return  locked_ok
+round_number   ^VIX       1h level_type=half · rr=1.5 · atr=1.5 · maxbars=60    327.0              0.257                0.225     110.0               0.328       True
+
+Survivors per family: {'round_number': 1}
+Locked-positive per family: {'round_number': 1}
+
+COST STRESS (6 bps round trip) on locked-positive survivors
+ticker tf                                         setting       family R@2bps train/val/locked R@6bps train/val/locked  survives_stress   n
+  ^VIX 1h level_type=half · rr=1.5 · atr=1.5 · maxbars=60 round_number       +0.26/+0.22/+0.33       +0.25/+0.21/+0.32             True 546
+Survive stress on all three slices: 1 of 1

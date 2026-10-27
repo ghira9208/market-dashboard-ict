@@ -1,0 +1,32 @@
+46 tests; BH-significant (q=0.10): 5; repeat in both halves: 5
+
+     class                                             pattern  assets  n_days   mean  ci_lo  ci_hi     p  first_half  second_half    bh  repeats
+     index               V1 volatility clustering (corr |ret|)       6    3109  0.293  0.226  0.372 0.000       0.398        0.189  True     True
+        fx               V1 volatility clustering (corr |ret|)      11    2600  0.145  0.108  0.195 0.000       0.101        0.189  True     True
+metals_oil               V1 volatility clustering (corr |ret|)       5    2512  0.200  0.159  0.247 0.000       0.243        0.158  True     True
+    crypto               V1 volatility clustering (corr |ret|)       5    3648  0.234  0.194  0.276 0.000       0.334        0.133  True     True
+     index                       D2 after a >2 sd day -> today       6     372 -0.229 -0.376 -0.094 0.005      -0.391       -0.067  True     True
+    crypto C1 turn of month (last day + first 3) vs other days       5     490  0.077  0.019  0.135 0.024       0.182       -0.028 False    False
+    crypto                           D3 last week -> this week       5     520  0.061  0.008  0.115 0.050       0.107        0.015 False    False
+metals_oil                               D1 yesterday -> today       5    2512 -0.020 -0.039 -0.001 0.077      -0.021       -0.020 False    False
+        fx                       D2 after a >2 sd day -> today      11     582 -0.091 -0.197  0.008 0.134      -0.002       -0.181 False    False
+     index                         C2 Thu return vs other days       6     521 -0.047 -0.103  0.008 0.161      -0.043       -0.051 False    False
+    crypto                         C2 Thu return vs other days       5     521 -0.064 -0.143  0.013 0.172      -0.047       -0.081 False    False
+metals_oil               S4 London breakout of the Asian range       5     401  0.050 -0.011  0.113 0.178       0.003        0.097 False    False
+    crypto                       D2 after a >2 sd day -> today       5     504 -0.085 -0.205  0.033 0.238      -0.095       -0.075 False    False
+        fx               S4 London breakout of the Asian range      11     485  0.037 -0.017  0.094 0.266       0.061        0.014 False    False
+    crypto                         C2 Fri return vs other days       5     521  0.039 -0.026  0.101 0.324       0.087       -0.009 False    False
+metals_oil                         C2 Wed return vs other days       5     515  0.027 -0.021  0.074 0.350       0.023        0.031 False    False
+     index                         C2 Mon return vs other days       6     522  0.030 -0.025  0.080 0.363      -0.002        0.061 False    False
+metals_oil                       D2 after a >2 sd day -> today       5     371 -0.073 -0.215  0.068 0.386      -0.002       -0.143 False    False
+        fx                               D1 yesterday -> today      11    2600 -0.008 -0.025  0.008 0.392      -0.003       -0.014 False    False
+        fx                                     S2 London -> NY      11     522 -0.019 -0.054  0.017 0.394      -0.059        0.021 False    False
+     index C1 turn of month (last day + first 3) vs other days       6     709  0.022 -0.029  0.072 0.446       0.033        0.011 False    False
+metals_oil                      S3 first NY hour -> rest of NY       5     495 -0.019 -0.064  0.028 0.509       0.007       -0.045 False    False
+        fx                                   S1 Asia -> London      11     522 -0.015 -0.055  0.023 0.513       0.008       -0.038 False    False
+metals_oil                         C2 Thu return vs other days       5     507 -0.022 -0.075  0.032 0.520      -0.051        0.008 False    False
+     index                         C2 Tue return vs other days       6     522  0.018 -0.031  0.064 0.568       0.028        0.008 False    False
+
+fx: busiest UTC hours (share of daily movement): 14:00 6.5%, 13:00 6.0%, 15:00 6.0%, 12:00 5.6% | quietest: 21:00 2.4%, 22:00 2.5%, 04:00 3.0%
+
+crypto: busiest UTC hours (share of daily movement): 14:00 6.1%, 15:00 6.0%, 13:00 5.3%, 17:00 5.0% | quietest: 10:00 3.3%, 07:00 3.4%, 04:00 3.4%

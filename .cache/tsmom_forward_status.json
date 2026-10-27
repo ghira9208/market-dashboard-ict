@@ -1,0 +1,15 @@
+{
+  "spec_sha256": "101d66ab8755c281",
+  "realized_weeks": 1,
+  "judge_at_weeks": 104,
+  "first_decision_friday": "2026-10-16",
+  "decisions_recorded": 186,
+  "mean_r_per_week": 0.1352,
+  "info_ratio_annualised": null,
+  "pct_weeks_positive": 100.0,
+  "mean_r_per_week_at_stress_cost": 0.1327,
+  "verdict": "collecting \u2014 interim only, judged at 104 realized weeks (1 so far)",
+  "updated": "2026-10-27T14:35:52.014208+00:00",
+  "new_decisions": 0,
+  "new_realized": 0
+}

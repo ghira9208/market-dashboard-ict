@@ -1,0 +1,958 @@
+{
+  "created": "2026-10-21T11:46:41.710060+00:00",
+  "ema_fast": 20,
+  "ema_slow": 50,
+  "cost_bps": 2.0,
+  "stress_bps": 6.0,
+  "min_trades": 400,
+  "min_group": 100,
+  "alpha": 0.01,
+  "lead": "entries with EMA20/EMA50 NOT ordered in the trade direction earn more R",
+  "combos": [
+    {
+      "ticker": "AUDJPY=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDJPY=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDJPY=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDUSD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDUSD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDUSD=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 5.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDUSD=X",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDUSD=X",
+      "tf": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 9.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDUSD=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 10.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "AUDZAR=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "BTC-USD",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "BTC-USD",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 4.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "BTC-USD",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "BZ=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "BZ=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "CADJPY=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "CHFJPY=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "CHFSGD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "CL=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 4.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "ES=F",
+      "tf": "1h",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 0.75,
+        "rr_multiple": 4.5,
+        "max_bars": 40
+      }
+    },
+    {
+      "ticker": "ES=F",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 4.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "ES=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 40
+      }
+    },
+    {
+      "ticker": "ETH-USD",
+      "tf": "1D",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 6.0,
+        "max_bars": 40
+      }
+    },
+    {
+      "ticker": "ETH-USD",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "ETH-USD",
+      "tf": "1h",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "ETH-USD",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURHKD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURHKD=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURJPY=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURNZD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURUSD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURUSD=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "EURUSD=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "FTSEMIB.MI",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 5.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GBPDKK=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 1.5,
+        "max_bars": 40
+      }
+    },
+    {
+      "ticker": "GBPJPY=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GBPJPY=X",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GBPUSD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 5.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GBPUSD=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GBPUSD=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GC=F",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 8.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "GC=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NOKJPY=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NOKJPY=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NOKJPY=X",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NOKJPY=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NQ=F",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NQ=F",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NZDUSD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 7.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NZDUSD=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NZDUSD=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NZDUSD=X",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NZDUSD=X",
+      "tf": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "NZDUSD=X",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "PA=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 9.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "PA=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "PL=F",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "PL=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 10.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "PL=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 7.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "PL=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 4.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "RTY=F",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "RTY=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "SEKJPY=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 10.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "SEKJPY=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 10.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "SI=F",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 12.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "SI=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "SI=F",
+      "tf": "5m",
+      "strategy": "clean_expansion_liquidity_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "sweep_window_bars": 10,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "SI=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 4.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "USDCNH=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "USDJPY=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 60,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "USDJPY=X",
+      "tf": "1h",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.5,
+        "rr_multiple": 1.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "USDNOK=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "USDSEK=X",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "YM=F",
+      "tf": "5m",
+      "strategy": "clean_retracement_resumption_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "^FCHI",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 2.0,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "^GDAXI",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 6.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "^IBEX",
+      "tf": "1h",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 3.0,
+        "max_bars": 60
+      }
+    },
+    {
+      "ticker": "^STOXX50E",
+      "tf": "5m",
+      "strategy": "clean_expansion_fixed_rr",
+      "settings": {
+        "min_streak": 3,
+        "retr_window_bars": 40,
+        "atr_mult_stop": 1.5,
+        "rr_multiple": 2.5,
+        "max_bars": 60
+      }
+    }
+  ],
+  "sha256": "da0b58b5be6f217d"
+}

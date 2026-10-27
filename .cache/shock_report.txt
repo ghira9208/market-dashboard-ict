@@ -1,0 +1,57 @@
+ledger: 4800 trials | scored 1535 | insufficient data 3265
+BH-significant on RESEARCH slice: 24 | survived (BH + holdout + same sign): 5
+holdout passed: 3.8% of scored trials (a strategy with NO edge passes ~5% by luck)
+
+BREADTH by family/setting (pooled across tickers and timeframes)
+    family                                                                                       setting   n  pct_val_positive  median_val_R  median_train_R  holdout_pass_pct  bh_sig  survivors
+news_shock      mode=fade range_mult=6.0 quiet=True scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60  17             70.59          0.37           -0.31             11.76       0          0
+news_shock   mode=continue range_mult=6.0 quiet=True scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60   4             75.00          0.32            0.55             25.00       0          0
+news_shock      mode=fade range_mult=4.0 quiet=False scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60  30             66.67          0.23           -0.36             13.33       0          0
+news_shock      mode=fade range_mult=6.0 quiet=True scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60  17             52.94          0.18           -0.17             11.76       0          0
+news_shock  mode=continue range_mult=6.0 quiet=False scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60   7             71.43          0.14           -0.30              0.00       0          0
+news_shock      mode=fade range_mult=4.0 quiet=False scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60  32             62.50          0.14           -0.34              9.38       0          0
+news_shock  mode=continue range_mult=6.0 quiet=True scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60  16             56.25          0.13            0.16              0.00       0          0
+news_shock   mode=continue range_mult=6.0 quiet=True scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60   4             50.00          0.01            0.12              0.00       0          0
+news_shock     mode=fade range_mult=6.0 quiet=False scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60  48             50.00         -0.00           -0.08              4.17       0          0
+news_shock     mode=fade range_mult=6.0 quiet=False scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60  50             46.00         -0.01           -0.08              4.00       0          0
+news_shock mode=continue range_mult=6.0 quiet=False scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60  50             48.00         -0.02            0.09              4.00       2          0
+news_shock       mode=fade range_mult=4.0 quiet=True scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60  11             36.36         -0.03           -0.36              9.09       0          0
+news_shock mode=continue range_mult=6.0 quiet=False scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60  47             46.81         -0.04            0.18              4.26       2          0
+news_shock  mode=continue range_mult=4.0 quiet=True scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60 120             44.17         -0.04            0.02              3.33       3          1
+news_shock  mode=continue range_mult=6.0 quiet=True scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60  17             29.41         -0.04            0.15              0.00       1          0
+news_shock      mode=fade range_mult=6.0 quiet=False scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60   7             42.86         -0.04           -0.16              0.00       0          0
+news_shock      mode=fade range_mult=4.0 quiet=True scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60 122             44.26         -0.04           -0.13              4.10       0          0
+news_shock  mode=continue range_mult=4.0 quiet=True scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60 117             49.57         -0.05           -0.00              5.13       1          0
+news_shock mode=continue range_mult=4.0 quiet=False scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60 147             39.46         -0.07           -0.04              2.72       4          1
+news_shock     mode=fade range_mult=4.0 quiet=False scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60 146             41.10         -0.09           -0.10              1.37       0          0
+news_shock      mode=fade range_mult=6.0 quiet=False scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60   7             42.86         -0.09           -0.18              0.00       0          0
+news_shock      mode=fade range_mult=4.0 quiet=True scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60 120             43.33         -0.09           -0.07              2.50       1          0
+news_shock mode=continue range_mult=4.0 quiet=False scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60 145             40.69         -0.10           -0.01              3.45       3          1
+news_shock     mode=fade range_mult=4.0 quiet=False scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60 145             40.69         -0.11           -0.04              2.76       0          0
+news_shock  mode=continue range_mult=6.0 quiet=False scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60   7             42.86         -0.12           -0.25              0.00       0          0
+news_shock       mode=fade range_mult=4.0 quiet=True scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60  11             36.36         -0.15           -0.34              9.09       0          0
+news_shock       mode=fade range_mult=6.0 quiet=True scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60   4             50.00         -0.21           -0.19              0.00       0          0
+news_shock   mode=continue range_mult=4.0 quiet=True scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60  10             40.00         -0.24           -0.11             10.00       1          1
+news_shock       mode=fade range_mult=6.0 quiet=True scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60   4             25.00         -0.25           -0.11              0.00       0          0
+news_shock   mode=continue range_mult=4.0 quiet=True scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60  10             40.00         -0.26           -0.06             10.00       1          0
+news_shock  mode=continue range_mult=4.0 quiet=False scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60  32             25.00         -0.42            0.07              0.00       3          0
+news_shock  mode=continue range_mult=4.0 quiet=False scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60  31             29.03         -0.44            0.03              3.23       2          1
+
+SURVIVORS: 5 | of those with a positive LOCKED slice (n>=10): 4
+    family   ticker tf_label                                                                                       setting  n_train  mean_return_train  mean_return_holdout  locked_n  locked_mean_return  locked_ok
+news_shock     ^VIX       1h  mode=continue range_mult=4.0 quiet=True scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60     32.0              0.689                0.895      11.0               0.631       True
+news_shock     ^VIX       1h mode=continue range_mult=4.0 quiet=False scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60     49.0              0.531                0.864      17.0               0.263       True
+news_shock     ^VIX       1h mode=continue range_mult=4.0 quiet=False scheduled_only=False · rr=4.0 · atr=1.5 · maxbars=60     45.0              0.564                0.805      15.0              -0.175      False
+news_shock RUNE-USD       5m  mode=continue range_mult=4.0 quiet=False scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60    222.0              0.841                0.506      74.0               0.355       True
+news_shock RUNE-USD       5m   mode=continue range_mult=4.0 quiet=True scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60    152.0              0.471                0.310      51.0               0.132       True
+
+Survivors per family: {'news_shock': 5}
+Locked-positive per family: {'news_shock': 4}
+
+COST STRESS (6 bps round trip) on locked-positive survivors
+  ticker tf                                                                                       setting     family R@2bps train/val/locked R@6bps train/val/locked  survives_stress   n
+    ^VIX 1h  mode=continue range_mult=4.0 quiet=True scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60 news_shock       +0.69/+0.89/+0.63       +0.68/+0.89/+0.62             True  54
+    ^VIX 1h mode=continue range_mult=4.0 quiet=False scheduled_only=False · rr=2.0 · atr=1.5 · maxbars=60 news_shock       +0.53/+0.86/+0.26       +0.52/+0.86/+0.25             True  82
+RUNE-USD 5m  mode=continue range_mult=4.0 quiet=False scheduled_only=True · rr=4.0 · atr=1.5 · maxbars=60 news_shock       +0.84/+0.51/+0.36       +0.57/+0.30/+0.09             True 370
+RUNE-USD 5m   mode=continue range_mult=4.0 quiet=True scheduled_only=True · rr=2.0 · atr=1.5 · maxbars=60 news_shock       +0.47/+0.31/+0.13       +0.18/+0.11/-0.13            False 254
+Survive stress on all three slices: 3 of 4
