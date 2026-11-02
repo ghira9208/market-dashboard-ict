@@ -1,0 +1,4 @@
+{
+  "enabled": false,
+  "note": "Target widening off since 2026-10-30. Set enabled true and run ticker_behavior.rebuild_db() to restore it."
+}

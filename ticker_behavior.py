@@ -38,6 +38,23 @@ _DECAY_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".c
 LIFECYCLE_STATES = ("EXPERIMENTAL", "TRAIN_SIGNIFICANT", "HOLDOUT_VALIDATED", "PROSPECTIVE",
                      "LIVE", "DECAYED", "RETIRED")
 
+_WIDENING_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "target_widening.json")
+
+
+def widening_enabled():
+    """Whether widened-target variants (validate_target_variants.py) may count as evidence for the live leaderboard.
+    config/target_widening.json {"enabled": false} switches them off: only unwidened (1.0) trials are scored per
+    combo, so each combo trades its plain validated target or, if that variant did not survive on its own, not at all
+    (fail-closed). Absent or unreadable file = enabled, the behaviour before 2026-10-30. Switched off 2026-10-30:
+    live trades by widen factor were 1.0 -0.001R (n=207) against -0.45..-0.79R for every widened bucket. Reversible:
+    set "enabled": true and call rebuild_db() once, no bot restart (the bot reads the leaderboard fresh each cycle)."""
+    try:
+        with open(_WIDENING_CONFIG) as f:
+            return bool(json.load(f).get("enabled", True))
+    except (OSError, ValueError):
+        return True
+
+
 _AUTO_RETIRE_MIN_LOCKED_N = 10
 """The minimum locked-slice sample size rebuild_db() requires before it
 will AUTOMATICALLY retire a combo on a bad locked result (see rebuild_db's
@@ -264,6 +281,10 @@ def rebuild_db():
         subset=["ticker", "tf_label", "_effective_strategy_id"], keep="last")
 
     scored = trials[trials["verdict"] == "SCORED"].copy()
+    if not widening_enabled() and "target_widen_mult" in scored.columns:
+        # Widened variants stay in the trial log (and in the BH denominator, which ran above on the full log) but are
+        # not evidence for anything live: a combo keeps the leaderboard only through its own unwidened survivor.
+        scored = scored[scored["target_widen_mult"].fillna(1.0) <= 1.0].copy()
 
     # Both hoisted above the main loop — real, already-existing signals
     # (revalidate_combos.py's own decay check, this module's own manual-

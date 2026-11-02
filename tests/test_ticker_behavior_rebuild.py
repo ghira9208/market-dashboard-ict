@@ -307,3 +307,37 @@ def test_rebuild_db_never_mutates_the_real_db_file_when_a_write_fails(isolated_l
     assert len(ticker_behavior.validated_leaderboard()) == 1
     import os
     assert not os.path.exists(f"{ticker_behavior._DB_PATH}.tmp")  # no leftover temp file either
+
+
+def _widen_trial(path, widen, train, **fields):
+    s = _settings()
+    sid = compute_strategy_id(family="clean_expansion_fixed_rr", settings=s, target_widen_mult=widen,
+                              data_pipeline_version=ticker_behavior.research_data.DATA_PIPELINE_VERSION,
+                              detector_logic_version=ex.DETECTOR_LOGIC_VERSIONS.get("clean_expansion", 0),
+                              cost_bps=ex.DEFAULT_COST_BPS)
+    _write_trial(path, label=f"clean_expansion_fixed_rr · rr=3.0 · atr=1.5 · maxbars=60 · widen={widen}", strategy_id=sid,
+                 target_widen_mult=widen, mean_return_train=train, **fields)
+
+
+def _best(db_path):
+    c = sqlite3.connect(db_path)
+    try:
+        return c.execute("select best_target_widen_mult, validated from strategy_ticker_tf").fetchall()
+    finally:
+        c.close()
+
+
+def test_switching_widening_off_keeps_the_unwidened_survivor_and_drops_combos_that_only_survived_widened(isolated_log, tmp_path, monkeypatch):
+    cfg = tmp_path / "w.json"
+    monkeypatch.setattr(ticker_behavior, "_WIDENING_CONFIG", str(cfg))
+    _widen_trial(isolated_log, 1.0, 0.30, p_value_train=0.001)
+    _widen_trial(isolated_log, 3.0, 0.90, p_value_train=0.001)
+    cfg.write_text('{"enabled": true}')
+    ticker_behavior.rebuild_db()
+    assert _best(ticker_behavior._DB_PATH) == [(3.0, 1)]                  # the wider, higher-scoring variant wins today
+    cfg.write_text('{"enabled": false}')
+    ticker_behavior.rebuild_db()
+    assert _best(ticker_behavior._DB_PATH) == [(1.0, 1)]                  # off: the plain target is what is validated
+    assert ticker_behavior.widening_enabled() is False
+    cfg.unlink()
+    assert ticker_behavior.widening_enabled() is True                      # no file = the old behaviour

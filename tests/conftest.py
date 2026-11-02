@@ -34,3 +34,11 @@ def _clear_trial_log_cache():
     ex._load_experiment_trials_cached.clear()
     yield
     ex._load_experiment_trials_cached.clear()
+
+
+@pytest.fixture(autouse=True)
+def _widening_config_off_the_real_file(tmp_path, monkeypatch):
+    """The real config/target_widening.json switches widened variants off for the live leaderboard; tests must not depend
+    on it. Point the switch at a file that does not exist (= enabled, the module default) unless a test sets its own."""
+    import ticker_behavior
+    monkeypatch.setattr(ticker_behavior, "_WIDENING_CONFIG", str(tmp_path / "no_widening_config.json"))
